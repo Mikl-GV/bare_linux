@@ -10,6 +10,10 @@
 #include "h3_sdc.h"
 #include "version.h"
 
+/* Встроенная прошивка чипа (из fw_blob.S, инклудит fw_nic.bin). */
+extern const unsigned char fw_blob_start[];
+extern const unsigned char fw_blob_end[];
+
 /* ================= Состояние ================= */
 
 /* Экраны (состояния машины меню). */
@@ -255,9 +259,11 @@ void kmain(void)
     /* Диагностика после инициализации контроллера. */
     uart_print("  gctl=0x"); uart_print_hex(*(volatile uint32_t *)0x01C10000);
     uart_print(" ckcr=0x");  uart_print_hex(*(volatile uint32_t *)0x01C10004);
+    uart_print(" sclk=0x");  uart_print_hex(*(volatile uint32_t *)0x01C2008C);
     uart_print(" star=0x");  uart_print_hex(*(volatile uint32_t *)0x01C1003C);
     uart_print(" rst0=0x");  uart_print_hex(*(volatile uint32_t *)0x01C202C0);
     uart_print(" pg_cfg0=0x");uart_print_hex(*(volatile uint32_t *)0x01C208D8);
+    uart_print(" pg_cfg1=0x");uart_print_hex(*(volatile uint32_t *)0x01C208DC);
     uart_print(" pl_cfg=0x");uart_print_hex(*(volatile uint32_t *)0x01F02C00);
     uart_print(" pl_dat=0x");uart_print_hex(*(volatile uint32_t *)0x01F02C10);
     uart_print("\r\n");
@@ -289,6 +295,80 @@ void kmain(void)
             uart_print(" ccid1=0x");
             uart_print_hex(ccid1);
             uart_print("\r\n");
+
+            /* Чтение CIS: функция 0 поддерживает только байтовый доступ
+               (CMD52), блочный CMD53 для функции 0 не работает (FIFO пуст).
+               Поэтому тюплы CIS читаются по одному байту через CMD52. */
+            uint16_t manf = 0;
+            uint32_t cis_addr = 0;
+            int cis_rc = h3_sdio_read_cis(&manf, &cis_addr);
+            uart_print("  cis addr=0x");
+            uart_print_hex(cis_addr);
+            uart_print(" rc=");
+            uart_print_int(cis_rc);
+            if (cis_rc == 0) {
+                uart_print(" manf=0x");
+                uart_print_hex(manf);
+            }
+            uart_print("\r\n");
+
+            /* 4-bit режим: CCCR 0x07 |= 4-bit, SDC_CTYPE=1. */
+            int bw_rc = h3_sdio_set_bus_width(1);
+            uart_print("  bus4 rc=");
+            uart_print_int(bw_rc);
+            uart_print("\r\n");
+
+            /* Power-on чипа: переводим из CARDEMU в ACTIVE (PowerSeq). */
+            int pon = h3_wifi_power_on_chip();
+            uart_print("  pwon rc=");
+            uart_print_int(pon);
+            uart_print("\r\n");
+
+            /* Диагностика SDIO-local регистров (device 0): 0x100 (power status),
+               0x86 (suspend). 0x100==0xEA означает suspend активен. */
+            {
+                uint8_t sr100 = 0, sr86 = 0;
+                int r1 = h3_sdc_cmd52_read(1, 0x100, &sr100);
+                int r2 = h3_sdc_cmd52_read(1, 0x086, &sr86);
+                uart_print("  sdio100 rc=");
+                uart_print_int(r1);
+                uart_print(" v=0x");
+                uart_print_hex(sr100);
+                uart_print("  sdio86 rc=");
+                uart_print_int(r2);
+                uart_print(" v=0x");
+                uart_print_hex(sr86);
+                uart_print("\r\n");
+            }
+
+            /* Включить I/O-функцию 1 (CCCR 0x02 = 0x02). */
+            {
+                uint8_t ioen;
+                h3_sdc_cmd52_read(0, 0x02, &ioen);
+                h3_sdc_cmd52_write(0, 0x02, (uint8_t)(ioen | 0x02));
+                h3_sdc_cmd52_read(0, 0x02, &ioen);
+                uart_print("  fn1 ioen=0x");
+                uart_print_hex(ioen);
+                uart_print("\r\n");
+            }
+
+            /* Загрузка прошивки чипа (NIC firmware, встроена в fw_nic.bin). */
+            {
+                uint32_t fwlen = (uint32_t)(fw_blob_end - fw_blob_start);
+                int frc = h3_wifi_download_fw(fw_blob_start, fwlen);
+                uart_print("  fwdl rc=");
+                uart_print_int(frc);
+                uart_print(" len=0x");
+                uart_print_hex(fwlen);
+                uart_print("\r\n");
+
+                /* После FW читаем SYS_CFG ещё раз — должен стать валидным. */
+                uint32_t sy = 0;
+                h3_sdc_read_wlan_reg32(0xF0, &sy);
+                uart_print("  syscfg=0x");
+                uart_print_hex(sy);
+                uart_print("\r\n");
+            }
         }
     }
     uart_print("wifi ok\r\n");

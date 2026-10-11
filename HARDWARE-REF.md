@@ -10,7 +10,8 @@
 |---|---|---|
 | CCU | 0x01C20000 | такт/сбросы |
 | PIO (GPIO) | 0x01C20800 | порты A..H |
-| R_PIO / PRCM | 0x01F01400 | always-on, порт L |
+| R_PIO | 0x01F02C00 | always-on, порт L (WIFI_EN=PL7) |
+| PRCM | 0x01F01400 | always-on RCU (R_REG) |
 | UART0 | 0x01C28000 | PA4=TX PA5=RX, 115200 |
 | DMAC | 0x01C02000 | sunxi-DMA, канал +0x100+N*0x40 |
 | I2S0 | 0x01C22000 | звук MAX98357A |
@@ -18,7 +19,8 @@
 | GIC cpu | 0x01C82000 | banked, каждый CPU видит свои |
 | USB OHCI1 | 0x01C1B400 | |
 | USB OHCI2 | 0x01C1C400 | |
-| MMС0 (SD) | 0x01C0F000 | SD-карта |
+| MMC0 (SD) | 0x01C0F000 | SD-карта |
+| MMC1 (SDC1) | 0x01C10000 | WiFi-чип RTL8189FTV (SDIO, PG0-PG5) |
 | R_CPUCFG | 0x01F01C00 | запуск вторичных ядер |
 | SRAM A1 | 0x00000000 | трамплин CPU1..3 |
 
@@ -89,3 +91,36 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 - Отладчик: JTAGprobe (Raspberry Pi Pico, CMSIS-DAP). Прошивка — в `tools/jtag/`.
   Конфиг OpenOCD — `tools/jtag/h3_pico_jtag.cfg`, IDCODE DAP 0x5ba00477.
 - Полная проверенная инструкция — `tools/jtag/JTAG-SETUP.md`.
+
+## WiFi (RTL8189FTV на SDC1), проверено на стенде
+
+Чип RTL8189FTV (Realtek, SDIO) подключён к контроллеру SDC1 (MMC1) H3.
+
+### Питание и пины
+
+- **WIFI_EN = PL7** (R_PIO data 0x01F02C10, бит 7, активный high). Чип питается от
+  3.3 В постоянно; энубл-сигнал поднимаем на старте (power-cycle PL7).
+- **SDC1 на PG0-PG5** (function 2): PG0=CLK, PG1=CMD, PG2=D0, PG3=D1, PG4=D2, PG5=D3.
+  Настройка: `PORTG CFG0 [15:0] = 0x2222`, `CFG1 [7:0] = 0x22` (код в h3_sdc1_init).
+
+### SDIO-протокол (проверено на стенде)
+
+- CMD5 → CMD3 → CMD7 → работа через CMD52/CMD53.
+- Чистая I/O-карта: **CMD0/CMD8/ACMD41 не используются** (по спецификации SDIO).
+- 4-bit режим: CCCR 0x07 [2:0] = 0b010 + `SDC_CTYPE=1`.
+- CIS: адрес из CCCR 0x09-0x0B = 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek).
+
+### Важные особенности (из отладки)
+
+- Такт MMC1: **OLD mode** (бит30=0), НЕ MODE_NEW — иначе карта не отвечает.
+  `SDMMC1_CLK_REG` (0x01C2008C) = SCLK_GATING | SRC_OSC24M | (2<<16) | (15<<0)
+  ≈ 750 кГц, затем CKC немая делитель (DIV=1 → ~375 кГц на инициализации).
+- Для SDIO-команд CRC ответа НЕ проверяется (CMD52/CMD53).
+- Для data-команд контроллер НЕ взводит CMD_DONE — завершение ждём по
+  DATA_DONE (TRANS_COMPLETE). Без этого блочная запись/чтение «зависали».
+- SDIO-локальные регистры чипа (0x100, 0x86) лежат по device id **0**;
+  регистры WLAN IOREG (MAC 0x05, 0x06, 0xF0) — по device id **8**.
+  SDIO-адрес команды = `(device_id << 13) | (offset & mask)`.
+
+Документация по чипу и драйверу — в `tools/wifi/HARDWARE-WIFI.md`, референсный
+драйвер Linux — в `tools/wifi/rtl8189fs/` (не включается в репозиторий).

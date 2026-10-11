@@ -16,8 +16,8 @@ OBJDIR     := build
 SRC_C := main.c uart.c ports.c sys.c h3_mmu.c h3_dma.c i2s.c gic.c \
          h3_i2c_bb.c pcf8574.c display.c secure.c font8x8.c h3_sdc.c
 SRCS  := $(addprefix $(SRCDIR)/,$(SRC_C))
-ASM   := boot.s
-OBJS  := $(OBJDIR)/boot.o $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
+ASM   := boot.s fw_blob.S
+OBJS  := $(OBJDIR)/boot.o $(OBJDIR)/fw_blob.o $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 
 CFLAGS := -mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard \
           -O2 -g -Wall -Wextra -ffreestanding -fno-builtin -nostdlib \
@@ -44,7 +44,10 @@ bump:
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
-$(OBJDIR)/boot.o: $(ASM) | $(OBJDIR)
+$(OBJDIR)/boot.o: boot.s | $(OBJDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/fw_blob.o: $(SRCDIR)/fw_blob.S fw_nic.bin | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # main.c должен перекомпилироваться при изменении версии.

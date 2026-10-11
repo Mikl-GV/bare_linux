@@ -31,7 +31,23 @@
 #define SDC_RISR   0x38   /* raw interrupt status (W1C) */
 #define SDC_STAR   0x3C   /* status */
 #define SDC_FWLR   0x40   /* fifo water level */
-#define SDC_FIFO   0x80   /* data FIFO (burst access) */
+#define SDC_FUNS   0x44   /* function select (write 0xceAA для включения функций) */
+#define SDC_HWRST  0x78   /* hardware reset control */
+#define SDC_FIFO   0x200  /* data FIFO (read/write data) */
+
+/* Биты SDC_GCTL. */
+#define SDC_GCTL_SOFT_RST  (1u << 0)
+#define SDC_GCTL_FIFO_RST  (1u << 1)
+#define SDC_GCTL_DMA_RST   (1u << 2)
+#define SDC_GCTL_RESET     (SDC_GCTL_SOFT_RST | SDC_GCTL_FIFO_RST | SDC_GCTL_DMA_RST)
+#define SDC_GCTL_INT_ENB   (1u << 4)
+#define SDC_GCTL_CD_DBC    (1u << 8)
+
+/* Биты SDC_CKCR. */
+#define SDC_CKCR_CCLK_MASK   (0xFFu << 0)
+#define SDC_CKCR_CCLK_ENB    (1u << 16)
+#define SDC_CKCR_CCLK_CTRL   (1u << 17)
+#define SDC_CKCR_MASK_DATA0  (1u << 31)
 
 /* Биты SDC_STAR: состояние FIFO. */
 #define SDC_STAR_FIFO_EMPTY  (1u << 2)
@@ -43,6 +59,10 @@
 #define SDC_RISR_DATA_DONE   (1u << 3)   /* data transfer complete */
 #define SDC_RISR_RX_REQ      (1u << 5)   /* data receive request (read ready) */
 #define SDC_RISR_TX_REQ      (1u << 4)   /* data transmit request (write ready) */
+#define SDC_RISR_RESP_CRC    (1u << 6)   /* response CRC error */
+#define SDC_RISR_DATA_CRC    (1u << 7)   /* data CRC error */
+#define SDC_RISR_RESP_TO     (1u << 8)   /* response timeout */
+#define SDC_RISR_RAW_ISTA    (0x0000FDFAu) /* все ошибки ответа/данных/таймаутов */
 
 /* Биты/поля SDC_CMDR (даташит 5.3.7.7). */
 #define SDC_CMDR_START       (1u << 31)  /* START - запуск передачи команды */
@@ -88,5 +108,63 @@ int h3_sdc_cmd52_write(uint32_t func, uint32_t reg, uint8_t val);
    CMD7 (select). Должна быть выполнена до CMD52/CMD53. Возвращает 0 при
    успехе; не-0 — карта не ответила/ошибка. */
 int h3_sdio_init_chip(void);
+
+/* SDIO CMD53 — блочное чтение адресного пространства функции чипа.
+   addr — стартовый адрес, blks — число блоков по 512 байт, data — буфер.
+   Чтение в блок-режиме с автоинкрементом адреса. Возвращает 0 при успехе;
+   не-0 — ошибка. Требует завершённой инициализации SDIO (h3_sdio_init_chip). */
+int h3_sdc_cmd53_read(uint32_t func, uint32_t addr, uint32_t blks, void *data);
+
+/* SDIO CMD53 — блочная запись в адресное пространство функции чипа.
+   Используется для загрузки прошивки. Возвращает 0 при успехе; не-0 — ошибка. */
+int h3_sdc_cmd53_write(uint32_t func, uint32_t addr, uint32_t blks, const void *data);
+
+/* Прочитать CIS (Card Information Structure) чипа: CCCR 0x09-0x0B даёт адрес
+   Common CIS, затем по нему идём по CIS-туплам, читая каждый через CMD52
+   (байтовый доступ функции 0; функция 0 не поддерживает блочный CMD53).
+   Ищем TPLID_MANFID (0x20) и кладём 16-бит код производителя в *manf_id
+   (0x024C = Realtek). В *cis_addr_out кладётся адрес CIS. Возвращает 0 при
+   успехе, иначе — ошибка. Вызывается после h3_sdio_init_chip(). */
+int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out);
+
+/* Переключить шину SDIO между 1-bit (four_bit=0) и 4-bit (four_bit=1).
+   Обновляет и логический режим в CCCR 0x07, и аппаратную ширину SDC_CTYPE.
+   Возвращает 0 при успехе; не-0 — ошибка. */
+int h3_sdio_set_bus_width(int four_bit);
+
+/* Прочитать 32-бит регистр WLAN-функции (function 1) чипа через CMD52.
+   reg — ММIO-адрес регистра чипа (напр. REG_SYS_CFG=0xF0). Реальный SDIO-адрес
+   = (8<<13) | (reg & 0x7FFF) (WLAN IOREG, device id 8). Кладёт значение в *val.
+   Возвращает 0 при успехе; не-0 — ошибка. */
+int h3_sdc_read_wlan_reg32(uint32_t reg, uint32_t *val);
+
+/* Прочитать 16-бит регистр WLAN-функции (function 1) через CMD52.
+   Аналогично read_wlan_reg32, но возвращает 2 байта. */
+int h3_sdc_read_wlan_reg16(uint32_t reg, uint16_t *val);
+
+/* Специфичная для чипа последовательность включения (power-on) RTL8189FTV:
+   переводит карту из CARDEMU в ACTIVE перед загрузкой прошивки. Использует
+   CMD52 к function 1. Возвращает 0 при успехе, не-0 — ошибка (см. коды). */
+int h3_wifi_power_on_chip(void);
+
+/* Загрузить прошивку чипа через SDIO (протокол MCUFWDL).
+   fw — массив прошивки (RTL8189FTV NIC, ~0x4970 байт), size — размер.
+   Возвращает 0 при успехе; не-0 — ошибка (см. коды в h3_sdc.c). */
+int h3_wifi_download_fw(const void *fw, uint32_t size);
+
+/* Регистры чипа (hal8188freg.h). */
+#define REG_MCUFWDL_OFF      0x0080
+#define FW_8188F_START       0x1000
+#define MCUFWDL_RDY          (1u << 1)
+#define FWDL_ChkSum_rpt      (1u << 2)
+#define WINTINI_RDY          (1u << 6)
+#define RAM_DL_SEL           (1u << 7)
+
+/* Диагностика последней блочной передачи (заполняются при ошибке CMD53). */
+extern uint32_t sdc_diag_risr;
+extern uint32_t sdc_diag_sta;
+extern uint32_t sdc_diag_cmdr;
+extern uint32_t sdc_diag_cmd;
+extern uint32_t sdc_diag_arg;
 
 #endif /* H3_SDC_H */
