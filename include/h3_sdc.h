@@ -33,7 +33,42 @@
 #define SDC_FWLR   0x40   /* fifo water level */
 #define SDC_FUNS   0x44   /* function select (write 0xceAA для включения функций) */
 #define SDC_HWRST  0x78   /* hardware reset control */
+#define SDC_DMAC   0x80   /* DMA control */
+#define SDC_DLBA   0x84   /* DMA descriptor base address */
+#define SDC_IDST   0x88   /* DMA interrupt status */
+#define SDC_IDIE   0x8C   /* DMA interrupt enable */
 #define SDC_FIFO   0x200  /* data FIFO (read/write data) */
+
+/* Биты SDC_DMAC (IDMA control, sunxi-mmc). */
+#define SDC_DMAC_SWRESET   (1u << 0)   /* IDMA software reset */
+#define SDC_DMAC_FIXBURST  (1u << 1)   /* fixed burst */
+#define SDC_DMAC_IDMA_ON   (1u << 7)   /* IDMA enable */
+#define SDC_DMAC_REFETCH   (1u << 31)  /* refetch descriptors */
+
+/* Биты IDMA interrupt status/enable (IDST/IDIE). */
+#define SDXC_IDMAC_TRANSMIT_INTERRUPT  (1u << 0)
+#define SDXC_IDMAC_RECEIVE_INTERRUPT   (1u << 1)
+#define SDXC_IDMAC_FATAL_BUS_ERROR     (1u << 2)
+#define SDXC_IDMAC_DESTINATION_INVALID (1u << 4)
+#define SDXC_IDMAC_CARD_ERROR_SUM      (1u << 5)
+
+/* Биты DMA-дескриптора (config word, sunxi-mmc sunxi_idma_des.config). */
+#define DESC_OWN  (1u << 31)  /* 1=IDMA owner, 0=host */
+#define DESC_CES  (1u << 30)  /* card error summary */
+#define DESC_CH   (1u << 4)   /* chain mode */
+#define DESC_ER   (1u << 5)   /* end of ring */
+#define DESC_LD   (1u << 2)   /* last descriptor */
+#define DESC_FD   (1u << 3)   /* first descriptor */
+#define DESC_DIC  (1u << 1)   /* disable interrupt on completion */
+#define DESC_NUM(n) ((n) & 0x3)  /* descriptor number (для одиночного = 0) */
+
+/* Структура DMA-дескриптора IDMA (4 слова) — как sunxi_idma_des. */
+struct sdc_idma_desc {
+    volatile uint32_t config;
+    volatile uint32_t buf_size;
+    volatile uint32_t buf_addr;
+    volatile uint32_t next_desc;
+};
 
 /* Биты SDC_GCTL. */
 #define SDC_GCTL_SOFT_RST  (1u << 0)
@@ -42,6 +77,7 @@
 #define SDC_GCTL_RESET     (SDC_GCTL_SOFT_RST | SDC_GCTL_FIFO_RST | SDC_GCTL_DMA_RST)
 #define SDC_GCTL_INT_ENB   (1u << 4)
 #define SDC_GCTL_CD_DBC    (1u << 8)
+#define SDC_GCTL_DMA_ENB   (1u << 5)   /* DMA enable (bit 5) */
 
 /* Биты SDC_CKCR. */
 #define SDC_CKCR_CCLK_MASK   (0xFFu << 0)
@@ -62,7 +98,16 @@
 #define SDC_RISR_RESP_CRC    (1u << 6)   /* response CRC error */
 #define SDC_RISR_DATA_CRC    (1u << 7)   /* data CRC error */
 #define SDC_RISR_RESP_TO     (1u << 8)   /* response timeout */
-#define SDC_RISR_RAW_ISTA    (0x0000FDFAu) /* все ошибки ответа/данных/таймаутов */
+#define SDC_RISR_DATA_TO     (1u << 9)   /* data timeout */
+#define SDC_RISR_DATA_STAR_TO (1u << 10) /* data starvation timeout (HTO) */
+#define SDC_RISR_FIFO_UNDER  (1u << 11)  /* FIFO underrun/overflow */
+#define SDC_RISR_DATA_START_ERR (1u << 13) /* data start error */
+#define SDC_RISR_DATA_END_BIT   (1u << 15) /* data end-bit error */
+#define SDC_RISR_RAW_ISTA    (0x0000BFC2u) /* только ошибки: RESP_ERR(1) DATA_CRC(7)
+                                               RESP_CRC(6) RESP_TO(8) DATA_TO(9)
+                                               DATA_STAR_TO(10) FIFO_UNDER(11)
+                                               CMD_BUSY(12) DATA_START_ERR(13)
+                                               DATA_ENDBIT(15). БЕЗ TX_REQ/RX_REQ/DONE */
 
 /* Биты/поля SDC_CMDR (даташит 5.3.7.7). */
 #define SDC_CMDR_START       (1u << 31)  /* START - запуск передачи команды */
@@ -119,6 +164,15 @@ int h3_sdc_cmd53_read(uint32_t func, uint32_t addr, uint32_t blks, void *data);
    Используется для загрузки прошивки. Возвращает 0 при успехе; не-0 — ошибка. */
 int h3_sdc_cmd53_write(uint32_t func, uint32_t addr, uint32_t blks, const void *data);
 
+/* SDIO CMD53 — запись в byte mode (len байт). Используется для загрузки
+   прошивки по 32-бит словам (как sdio_write32 драйвера Realtek). Возвращает
+   0 при успехе; не-0 — ошибка. */
+int h3_sdc_cmd53_write_bytes(uint32_t func, uint32_t addr, uint32_t len, const void *data);
+
+/* Установить block size функции 1 (WLAN IOREG) через CCCR 0x110/0x111.
+   Обязательно перед CMD53 в block mode. Возвращает 0 при успехе. */
+int h3_sdc_set_fn1_blocksize(uint16_t blksz);
+
 /* Прочитать CIS (Card Information Structure) чипа: CCCR 0x09-0x0B даёт адрес
    Common CIS, затем по нему идём по CIS-туплам, читая каждый через CMD52
    (байтовый доступ функции 0; функция 0 не поддерживает блочный CMD53).
@@ -166,5 +220,13 @@ extern uint32_t sdc_diag_sta;
 extern uint32_t sdc_diag_cmdr;
 extern uint32_t sdc_diag_cmd;
 extern uint32_t sdc_diag_arg;
+extern int      sdc_diag_fail_blk;   /* номер блока, на котором упала загрузка FW */
+
+/* Диагностика power-on seq (заполняется при ошибке поллинга). */
+extern uint32_t sdc_diag_pseq_step;
+extern uint32_t sdc_diag_pseq_base;
+extern uint32_t sdc_diag_pseq_off;
+extern uint32_t sdc_diag_pseq_cmd;
+extern uint32_t sdc_diag_pseq_val;
 
 #endif /* H3_SDC_H */

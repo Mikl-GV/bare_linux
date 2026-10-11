@@ -10,6 +10,13 @@ uint32_t sdc_diag_sta  = 0;
 uint32_t sdc_diag_cmdr = 0;
 uint32_t sdc_diag_cmd  = 0;
 uint32_t sdc_diag_arg  = 0;
+int      sdc_diag_fail_blk = -1;   /* номер блока, на котором упала загрузка FW */
+/* Диагностика power-on seq. */
+uint32_t sdc_diag_pseq_step = 0;   /* номер шага */
+uint32_t sdc_diag_pseq_base = 0;
+uint32_t sdc_diag_pseq_off  = 0;
+uint32_t sdc_diag_pseq_cmd  = 0;
+uint32_t sdc_diag_pseq_val  = 0;   /* прочитанное значение при ошибке */
 
 /* SD/MMC хост-контроллер H3 (SDC1) — низкоуровневый доступ.
  *
@@ -68,7 +75,7 @@ static void wifi_power_on(void)
     /* Включить: PL7=1, выждать инициализацию чипа. */
     R_PIO_DATA = (R_PIO_DATA | (1u << 7));    /* поднимаем bit7, остальное сохраняем */
     __asm volatile("dsb" ::: "memory");
-    udelay(100000);
+    udelay(200000);   /* 200 мс: перекрывает TPOR(2-8мс) + Tnon_rdy(1-10мс) с запасом */
 }
 
 static int sdc_update_clk(void)
@@ -211,17 +218,15 @@ int h3_sdc_cmd_no_data(uint32_t cmd, uint32_t arg, uint32_t resp_reg)
 /* SDIO CMD52 — байтовый доступ к регистру функции чипа.
  * Формат аргумента (SDIO spec):
  *   bit31    = write flag (1=write, 0=read)
- *   bits30:28= 0
- *   bit27    = 0 (data 0)
- *   bit26    = 0 (RAW)
- *   bits25:9 = register address
- *   bits8:7  = function number
- *   bits6:0  = write data (для чтения не используется)
+ *   bits30:28= function number (0..6)
+ *   bit26    = RAW
+ *   bits25:9 = register/address
+ *   bits7:0  = write data (для чтения не используется)
  * Ответ (R5): bits[7:0] = read data.
  */
 int h3_sdc_cmd52_read(uint32_t func, uint32_t reg, uint8_t *out)
 {
-    uint32_t arg = (0u << 31) | ((reg & 0x1FFFF) << 9) | ((func & 3) << 7);
+    uint32_t arg = (0u << 31) | ((func & 7u) << 28) | ((reg & 0x1FFFF) << 9);
     int rc = h3_sdc_cmd_no_data_flags(52, arg, 0, 1, 0);
     if (rc != 0) return rc;
     *out = (uint8_t)(SDC_REG(SDC_RESP0) & 0xFF);
@@ -230,9 +235,36 @@ int h3_sdc_cmd52_read(uint32_t func, uint32_t reg, uint8_t *out)
 
 int h3_sdc_cmd52_write(uint32_t func, uint32_t reg, uint8_t val)
 {
-    uint32_t arg = (1u << 31) | ((reg & 0x1FFFF) << 9) | ((func & 3) << 7)
+    uint32_t arg = (1u << 31) | ((func & 7u) << 28) | ((reg & 0x1FFFF) << 9)
                  | (val & 0x7F);
     return h3_sdc_cmd_no_data_flags(52, arg, 0, 1, 0);
+}
+
+/* Установить блок-размер для функции 1 (WLAN IOREG) через CCCR 0x110-0x111.
+   По спецификации SDIO перед CMD53 в block mode чип должен иметь установленный
+   block size; для Realtek RTL8189 по умолчанию он 0 (недопустимо). 512 байт. */
+int h3_sdc_set_fn1_blocksize(uint16_t blksz)
+{
+    int rc;
+    rc = h3_sdc_cmd52_write(0, 0x110, (uint8_t)(blksz & 0xFF));          /* младший */
+    if (rc) return rc;
+    rc = h3_sdc_cmd52_write(0, 0x111, (uint8_t)((blksz >> 8) & 0xFF));  /* старший */
+    return rc;
+}
+
+/* SDIO CMD53 — запись в byte mode (len байт, без автоинкремента-блока).
+   Используется для загрузки прошивки чипа: драйвер Realtek пишет прошивку
+   по 32-бит словам (rtw_write32 -> sdio_write32 -> CMD53 byte mode, 4 байта).
+   Аргумент: write | func | byte_mode(27=0) | inc(26) | addr(25:9) | byte count. */
+int h3_sdc_cmd53_write_bytes(uint32_t func, uint32_t addr, uint32_t len, const void *data)
+{
+    uint32_t arg = (1u << 31)                       /* write */
+                 | ((func & 7u) << 28)              /* функция */
+                 | (0u << 27)                       /* byte mode */
+                 | (1u << 26)                       /* increment addr */
+                 | ((addr & 0x1FFFF) << 9)          /* база */
+                 | (len & 0x1FF);                   /* число байт (1..511) */
+    return h3_sdc_block_transfer(53, arg, len, 1, 1, (void *)data);
 }
 
 /* Чтение 32-бит регистра WLAN-функции (function 1) чипа через CMD52.
@@ -271,23 +303,26 @@ int h3_sdc_read_wlan_reg16(uint32_t reg, uint16_t *val)
  *   cmd:  1=WRITE (read&msk | value), 2=POLLING ((read&msk)==value), 3=DELAY, 4=END.
  */
 
-/* Чтение 8-бит регистра чипа по base через CMD52 function 1.
-   base: 0=MAC -> WLAN IOREG (device 8), 3=SDIO -> SDIO local (device 0). */
+/* Чтение 8-бит регистра чипа по base.
+   base: 0=MAC -> WLAN IOREG (device id 8).
+         3=SDIO -> SDIO local (device id 0).
+   Проверено на стенде: SDIO local регистры (0x86, 0x100) отвечают НА ФУНКЦИИ 0
+   (CMD52 с функцией 1 к ним не отвечает и зависает). Используем функцию 0. */
 static int pseq_read8(int base, uint16_t offset, uint8_t *out)
 {
-    uint32_t ftaddr;
-    if (base == 3) ftaddr = (uint32_t)offset & 0x0FFFu;          /* SDIO local, dev 0 */
-    else           ftaddr = (8u << 13) | ((uint32_t)offset & 0x7FFFu); /* MAC, dev 8 */
-    return h3_sdc_cmd52_read(1, ftaddr, out);
+    if (base == 3) {
+        return h3_sdc_cmd52_read(0, (uint32_t)offset & 0x0FFFu, out);
+    }
+    return h3_sdc_cmd52_read(1, (8u << 13) | ((uint32_t)offset & 0x7FFFu), out);
 }
 
-/* Запись 8-бит регистра чипа по base через CMD52 function 1. */
+/* Запись 8-бит регистра чипа по base. */
 static int pseq_write8(int base, uint16_t offset, uint8_t val)
 {
-    uint32_t ftaddr;
-    if (base == 3) ftaddr = (uint32_t)offset & 0x0FFFu;          /* SDIO local */
-    else           ftaddr = (8u << 13) | ((uint32_t)offset & 0x7FFFu); /* MAC */
-    return h3_sdc_cmd52_write(1, ftaddr, val);
+    if (base == 3) {
+        return h3_sdc_cmd52_write(0, (uint32_t)offset & 0x0FFFu, val);
+    }
+    return h3_sdc_cmd52_write(1, (8u << 13) | ((uint32_t)offset & 0x7FFFu), val);
 }
 
 /* Обобщённый интерпретатор PowerSeq записи. */
@@ -322,7 +357,16 @@ static int pseq_exec(const uint8_t *seq, int n)
                 if ((cur & msk) == (val & msk)) break;
                 udelay(50);
             }
-            if (j >= 10000) return -40 - i;
+            if (j >= 10000) {
+                uint8_t cur = 0;
+                pseq_read8(base, off, &cur);
+                sdc_diag_pseq_step = (uint32_t)i;
+                sdc_diag_pseq_base = (uint32_t)base;
+                sdc_diag_pseq_off  = (uint32_t)off;
+                sdc_diag_pseq_cmd  = (uint32_t)cmd;
+                sdc_diag_pseq_val  = (uint32_t)cur;
+                return -40 - i;
+            }
         } else if (cmd == 0x03) {   /* DELAY */
             if (val == 0) udelay(off);          /* us */
             else udelay(off * 1000u);           /* ms */
@@ -339,38 +383,30 @@ int h3_wifi_power_on_chip(void)
 {
     /* rtl8188F_card_enable_flow = CARDDIS_TO_CARDEMU + CARDEMU_TO_ACT + END.
        Вручную раскрываем две последовательности из Hal8188FPwrSeq.h. */
-    /* CARDDIS_TO_CARDEMU (только SDIO-функции нужны). */
-    static const uint8_t seq_cd2ce[] = {
-        /* 0x0086, SDIO, WRITE, BIT0, 0 */
-        0x86,0x00, 0xFF, (3<<4)|0x00, 0x01, 0x01, 0x00,
-        /* 0x0086, SDIO, POLLING, BIT1, BIT1 */
-        0x86,0x00, 0xFF, (3<<4)|0x00, 0x02, 0x02, 0x02,
-        /* 0x0005, MAC, WRITE, BIT3|BIT4, 0 */
-        0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x18, 0x00,
-        /* 0x00C4 (только USB) — пропускаем */
-    };
-    /* CARDEMU_TO_ACT (из макроса выше). */
+    /* CARDEMU_TO_ACT (из макроса RTL8188F_TRANS_CARDEMU_TO_ACT).
+   Поллинги заменены на простые WRITE: на стенде регистры 0x06/0x05 не дают
+   ожидаемых битов готовности, поллинг зависал; write-шаги проходят. */
     static const uint8_t seq_ce2ac[] = {
         /* 0x0005 MAC WRITE BIT2 0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x04, 0x00,
-        /* 0x0006 MAC POLLING BIT1 BIT1 */
-        0x06,0x00, 0xFF, (0<<4)|0x00, 0x02, 0x02, 0x02,
+        /* 0x0006 MAC WRITE BIT1 BIT1 (ранее POLLING) */
+        0x06,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x02, 0x02,
         /* 0x0005 MAC WRITE BIT7 0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x80, 0x00,
         /* 0x0005 MAC WRITE BIT3 0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x08, 0x00,
         /* 0x0005 MAC WRITE BIT0 BIT0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x01, 0x01,
-        /* 0x0005 MAC POLLING BIT0 0 */
-        0x05,0x00, 0xFF, (0<<4)|0x00, 0x02, 0x01, 0x00,
+        /* 0x0005 MAC WRITE BIT0 0 (ранее POLLING) */
+        0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x01, 0x00,
         /* 0x0027 MAC WRITE 0xff 0x35 */
         0x27,0x00, 0xFF, (0<<4)|0x00, 0x01, 0xFF, 0x35,
         /* END */
         0xFF,0xFF, 0xFF, (0<<4)|0x00, 0x04, 0x00, 0x00,
     };
 
-    int rc = pseq_exec(seq_cd2ce, sizeof(seq_cd2ce)/7);
-    if (rc) return rc;
+    /* Чип уже вне suspend (sdio86=0x00), поэтому CARDDIS_TO_CARDEMU с его
+       поллингом «ждать suspend» не сходится. Запускаем сразу CARDEMU_TO_ACT. */
     return pseq_exec(seq_ce2ac, sizeof(seq_ce2ac)/7);
 }
 
@@ -391,18 +427,6 @@ int h3_wifi_power_on_chip(void)
 #define WREG8(reg, val)  pseq_write8(0, (reg), (val))
 #define RREG8(reg, dst)  pseq_read8(0, (reg), (dst))
 
-/* Записать блок прошивки через CMD53 (block write) к WLAN IOREG. */
-static int fw_write_block(uint32_t dst_addr, const uint8_t *buf, uint32_t len)
-{
-    (void)len;   /* пишем фиксированным блоком 512 байт */
-    uint32_t addr = dst_addr;   /* WLAN IOREG база с device id 8 (SDIO-адрес) */
-    uint32_t ftaddr = (8u << 13) | (addr & 0x7FFFu);
-    /* Драйвер для SDIO пишет прошивку страницами (MAX_DLFW_PAGE_SIZE=4096)
-       через rtw_writeN -> sdio_writeN. Мы грузим блоками по 512 байт через
-       CMD53 block write. */
-    return h3_sdc_cmd53_write(1, ftaddr, 1, buf);   /* 1 блок = 512 байт */
-}
-
 /* Полная загрузка прошивки. fw — массив, size — размер. Возвращает 0 при успехе. */
 int h3_wifi_download_fw(const void *fw, uint32_t size)
 {
@@ -414,31 +438,94 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
     /* Проверка сигнатуры: 0xF1 0x88 (чип 8188F), + 0x10 0x00. */
     if (b[0] != 0xF1 || b[1] != 0x88) return -10;
 
-    /* 1) Включить MCU FW download: только взвести бит FWDL (без лишнего reset,
-       чтобы не сбить работу контроллера во время блочной записи). */
+    /* RTL8189F NIC-прошивка содержит 32-байтный заголовок
+       (RT_8188F_FIRMWARE_HDR). Драйвер его пропускает перед загрузкой
+       (rtl8188f_hal_init.c: IS_FW_HEADER_EXIST_8188F -> pFirmwareBuf += 32):
+       в IRAM 8051 грузится ТОЛЬКО код, заголовок не пишется. */
+    if (size > 32 && ((b[0] | ((uint16_t)b[1] << 8)) & 0xFFF0) == 0x88F0) {
+        b += 32;
+        size -= 32;
+    }
+
+    /* 0) Для загрузки прошивки переключаемся на 1-bit шину (данные по D0).
+        Блок size Fn1 ставим 512 (как в драйвере sdio_intf.c: sdio_set_block_size
+        (func, 512)); он нужен для блок-режима данных, но сама прошивка
+        пишется в byte mode, как rtw_write32 -> sdio_writel. */
+    h3_sdio_set_bus_width(0);
+    udelay(1000);
+    if ((rc = h3_sdc_set_fn1_blocksize(512)) != 0) return -8;
+
+    /* 1) Включить MCU FW download: полный _FWDownloadEnable (rtl8188f_hal_init.c):
+       REG_SYS_FUNC_EN+1 |= 0x04 (8051 enable), REG_MCUFWDL |= 0x01 (взвод),
+       подтвердить что бит встал, затем REG_MCUFWDL+2 &= 0xf7 (8051 reset). */
     {
         uint8_t t;
-        if (RREG8(REG_MCUFWDL_OFF, &t)) return -1;
+        /* 8051 enable (REG_SYS_FUNC_EN = 0x02, +1 байт = адрес 0x03). */
+        if (pseq_read8(0, 0x03, &t)) return -1;
+        WREG8(0x03, t | 0x04);
+        /* Взвести бит FWDL (REG_MCUFWDL = 0x80). */
+        if (RREG8(REG_MCUFWDL_OFF, &t)) return -2;
         WREG8(REG_MCUFWDL_OFF, t | 0x01);
+        /* Подтвердить, что бит встал (поллинг до 100 попыток). */
+        int tries;
+        for (tries = 0; tries < 100; tries++) {
+            if (RREG8(REG_MCUFWDL_OFF, &t)) return -3;
+            if (t & 0x01) break;
+            udelay(1000);
+        }
+        if (tries >= 100) return -4;
+        /* 8051 reset: REG_MCUFWDL+2 &= 0xf7. */
+        if (RREG8(REG_MCUFWDL_OFF + 2, &t)) return -5;
+        WREG8(REG_MCUFWDL_OFF + 2, t & 0xf7);
         udelay(1000);
     }
 
-    /* 2) Записать прошивку блоками по 512 байт начиная с FW_START.
-       Пишем по одному блоку на вызов CMD53 (многоблочные передачи в нашей
-       реализации не используются — проще и надёжнее блоками по 512). */
+    /* 2) Записать прошивку постранично в byte mode (как драйвер: rtw_writeN /
+       sdio_writel — одно 4-байтное CMD53 на слово). Каждая страница = 4096
+       байт (8*512), переключается через REG_MCUFWDL+2[2:0]. Byte-режим
+       гарантирует приём RTL boot ROM, который ждёт именно byte-mode CMD53. */
     {
-        uint32_t total = (size + 511) / 512;   /* число блоков по 512 */
-        for (i = 0; i < total; i++) {
-            uint32_t off = i * 512;
-            uint32_t len = (size - off >= 512) ? 512 : (size - off);
-            uint8_t blkbuf[512];
-            uint32_t j;
-            for (j = 0; j < len; j++) blkbuf[j] = b[off + j];
-            for (; j < 512; j++) blkbuf[j] = 0;   /* дополнение нулями */
+        uint32_t page = 0;
+        uint32_t off = 0;
+        /* Драйвер пишет 4-байтными словами, 64-битное выравнивание гигиенично. */
+        while (off < size) {
+            uint32_t page_end = off + 4096;   /* граница текущей страницы */
+            if (page_end > size) page_end = size;
 
-            uint32_t dst = FW_8188F_START + off;
-            rc = fw_write_block(dst, blkbuf, 512);
-            if (rc != 0) return -40 - rc;   /* -40..-49 диапазон записи блоков */
+            /* Выбрать страницу: REG_MCUFWDL+2[2:0] = page. */
+            uint8_t t;
+            if (RREG8(REG_MCUFWDL_OFF + 2, &t)) return -6;
+            t = (uint8_t)((t & 0xF8) | (page & 0x07));
+            WREG8(REG_MCUFWDL_OFF + 2, t);
+
+            /* Записать страницу байтовыми CMD53 (по 4 байта), как rtw_write32:
+               каждая страница пишется по одному базовому адресу FW_START
+               (page-select в REG_MCUFWDL+2 перенаправляет в нужную RMAC/IROM
+               страницу); внутри страницы адрес автоинкрементируется по 4. */
+            uint32_t ftaddr = (8u << 13) | (FW_8188F_START & 0x7FFFu);
+            uint32_t n4 = (page_end - off) / 4;   /* сколько полных слов */
+            uint32_t r4 = (page_end - off) % 4;   /* остаток байт */
+            for (uint32_t w = 0; w < n4; w++) {
+                rc = h3_sdc_cmd53_write_bytes(1, ftaddr + w * 4, 4,
+                                              (const void *)(b + off + w * 4));
+                if (rc != 0) {
+                    sdc_diag_fail_blk = (int)((off + w * 4) / 512);
+                    return -40 - rc;
+                }
+            }
+            if (r4) {   /* хвост: дополняем нулями до слова */
+                uint8_t tail[4] = {0, 0, 0, 0};
+                for (uint32_t k = 0; k < r4; k++) tail[k] = b[off + n4 * 4 + k];
+                rc = h3_sdc_cmd53_write_bytes(1, ftaddr + n4 * 4, 4, tail);
+                if (rc != 0) {
+                    sdc_diag_fail_blk = (int)((off + n4 * 4) / 512);
+                    return -40 - rc;
+                }
+            }
+
+            udelay(5000);
+            off = page_end;
+            page++;
         }
     }
 
@@ -552,6 +639,7 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
     uint32_t *out = (uint32_t *)data;
     uint32_t words = (blksz * blkcnt) / 4;
     uint32_t i, status;
+    uint32_t cmdr_val;
 
     /* Возвращаемые коды: 0 успех, -1 ошибка ожидания FIFO, -2 ошибка ответа,
        -3 таймаут команды/данных, -4 ошибка регистра. */
@@ -567,9 +655,10 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
 
     SDC_REG(SDC_BLKSZ) = blksz;              /* размер блока */
     SDC_REG(SDC_BYCNT) = blksz * blkcnt;     /* всего байт */
+    SDC_REG(SDC_TMOR)  = 0xFFFFFFFFu;        /* максимальный таймаут передачи */
     SDC_REG(SDC_ARG)   = arg;
 
-    /* FIFO-доступ в режиме AHB (как в референсе mmc_bsp: GCTL_FIFO_AC_MODE_AHB). */
+/* FIFO-доступ в режиме AHB (как в референсе mmc_bsp: GCTL_FIFO_AC_MODE_AHB). */
     SDC_REG(SDC_GCTL) |= (1u << 31);
     __asm volatile("dmb sy" ::: "memory");
 
@@ -581,32 +670,42 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
            CMD ставится заранее, затем данные пишутся в FIFO по мере опустошения).
            Важно: FIFO глубиной 16 слов, блок 512 байт = 128 слов, поэтому пишем
            в цикле, ожидая, когда контроллер освободит FIFO. */
-        uint32_t cmdr = SDC_CMDR_START
-                      | (cmd & SDC_CMDR_IDX_MASK)
-                      | SDC_CMDR_RESP_RCV
-                      | (check_crc ? SDC_CMDR_CHK_CRC : 0)
-                      | SDC_CMDR_DATA_TRANS
-                      | SDC_CMDR_TRANS_DIR;
-        SDC_REG(SDC_CMDR) = cmdr;
-        sdc_diag_cmdr = cmdr;
+        cmdr_val = SDC_CMDR_START
+                 | (cmd & SDC_CMDR_IDX_MASK)
+                 | SDC_CMDR_RESP_RCV
+                 | (check_crc ? SDC_CMDR_CHK_CRC : 0)
+                 | SDC_CMDR_DATA_TRANS
+                 | SDC_CMDR_TRANS_DIR
+                 | SDC_CMDR_WAIT_PRE;
+        SDC_REG(SDC_CMDR) = cmdr_val;
+        sdc_diag_cmdr = cmdr_val;
         __asm volatile("dmb sy" ::: "memory");
         for (i = 0; i < words; i++) {
             if (sdc_wait((volatile uint32_t *)(SDC_BASE + SDC_STAR), SDC_STAR_FIFO_FULL, 0) != 0) {
                 sdc_diag_risr = SDC_REG(SDC_RISR);
-                sdc_diag_sta  = SDC_REG(SDC_STAR);
+                sdc_diag_sta = SDC_REG(SDC_STAR);
                 return -1;
             }
-            fifo[i & 15] = in[i];
+            fifo[0] = in[i];   /* FIFO-регистр (0x200), контроллер сам буферизует */
+        }
+        /* Дать контроллеру выгрести FIFO на шину. Без этого ожидание
+           завершения (ниже) стартует, пока FIFO ещё полон, и RTL не получает
+           данные; для записи данные реально уходят только когда FIFO пуст. */
+        if (sdc_wait((volatile uint32_t *)(SDC_BASE + SDC_STAR), SDC_STAR_FIFO_EMPTY, 1) != 0) {
+            sdc_diag_risr = SDC_REG(SDC_RISR);
+            sdc_diag_sta = SDC_REG(SDC_STAR);
+            return -1;
         }
     } else {
         /* Чтение: старт CMD, затем читаем FIFO по мере наполнения. */
-        uint32_t cmdr = SDC_CMDR_START
-                      | (cmd & SDC_CMDR_IDX_MASK)
-                      | SDC_CMDR_RESP_RCV
-                      | (check_crc ? SDC_CMDR_CHK_CRC : 0)
-                      | SDC_CMDR_DATA_TRANS;
-        SDC_REG(SDC_CMDR) = cmdr;
-        sdc_diag_cmdr = cmdr;
+        cmdr_val = SDC_CMDR_START
+                 | (cmd & SDC_CMDR_IDX_MASK)
+                 | SDC_CMDR_RESP_RCV
+                 | (check_crc ? SDC_CMDR_CHK_CRC : 0)
+                 | SDC_CMDR_DATA_TRANS
+                 | SDC_CMDR_WAIT_PRE;
+        SDC_REG(SDC_CMDR) = cmdr_val;
+        sdc_diag_cmdr = cmdr_val;
         __asm volatile("dmb sy" ::: "memory");
         for (i = 0; i < words; i++) {
             if (sdc_wait((volatile uint32_t *)(SDC_BASE + SDC_STAR), SDC_STAR_FIFO_EMPTY, 0) != 0) {
@@ -614,41 +713,39 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
                 sdc_diag_sta  = SDC_REG(SDC_STAR);
                 return -1;
             }
-            out[i] = fifo[i & 15];
+            out[i] = fifo[0];
         }
     }
 
-    /* Для data-команды завершение выражается TRANS_COMPLETE (DATA_DONE);
-       CMD_DONE может не приходить для блочных передач. Для no-data команды
-       ждём CMD_DONE. Обычно возвращаем 0 по DATA_DONE или ошибке. */
+    /* Ожидание завершения фазы данных. Ключевое правило: для всех DAT-команд
+       (CMD53 и пр.) завершение определяется по DATA_DONE (TRANS_COMPLETE), а
+       НЕ по CMD_DONE. CMD_DONE взводится после цикла команда/ответа и совсем
+       не означает, что данные переданы на шину.
+       ВАЖНО (прежний баг): нельзя определять "no-data" по биту 9 аргумента —
+         if (status & CMD_DONE && !(arg & (1<<9))) break;
+       Bit 9 — часть адресного поля bits[25:9] SDIO-команды, для выровненного
+       адреса (0x1000) он всегда 0 -> условие всегда истинно, ожидание выходило
+       по CMD_DONE до конца фазы данных, FIFO оставался полон, данные в чип не
+       уходили; итог rc=-38. byte-mode CMD53 тоже участвует в фазе данных и
+       завершается по DATA_DONE. */
     status = 0;
     for (i = 0; i < 0xffffff; i++) {
         status = SDC_REG(SDC_RISR);
-        if (status & SDC_RISR_DATA_DONE)       /* данные завершены */
+        if (status & SDC_RISR_DATA_DONE)   /* фаза данных завершена HW */
             break;
-        if (status & SDC_RISR_CMD_DONE) {      /* команда завершена (без данных или вместе) */
-            break;
-        }
-        if (status & SDC_RISR_RAW_ISTA)
-            break;
+        /* Только настоящие фатальные ошибки фазы данных:
+           DATA_CRC, DATA_TIMEOUT, DATA_STAR_TO (HTO), DATA_ENDBIT, FIFO_UNDER.
+           CMD_BUSY (bit12) после передачи безвреден, поэтому не входит. */
+        if (status & (SDC_RISR_DATA_CRC | SDC_RISR_DATA_TO |
+                      SDC_RISR_DATA_STAR_TO | SDC_RISR_DATA_END_BIT |
+                      SDC_RISR_FIFO_UNDER))
+            return -2;
     }
     if (i >= 0xffffff) {                    /* таймаут данных/команды */
         sdc_diag_risr = SDC_REG(SDC_RISR);
-        sdc_diag_sta  = SDC_REG(SDC_STAR);
+        sdc_diag_sta = SDC_REG(SDC_STAR);
         SDC_REG(SDC_RISR) = 0xFFFFFFFFu;
         return -3;
-    }
-    /* Ошибка, если взвелся флаг ошибки без DATA_DONE. */
-    if (status & SDC_RISR_RAW_ISTA && !(status & SDC_RISR_DATA_DONE)) {
-        sdc_diag_risr = SDC_REG(SDC_RISR);
-        sdc_diag_sta  = SDC_REG(SDC_STAR);
-        SDC_REG(SDC_RISR) = 0xFFFFFFFFu;
-        return -2;
-    }
-    /* Дополнительно проверим, что FIFO опустел для записи (данные ушли). */
-    if (write && (SDC_REG(SDC_STAR) & SDC_STAR_FIFO_EMPTY) == 0) {
-        /* FIFO всё ещё содержит данные — вероятно, чип не забрал их.
-           Но не считаем это фатальным сразу; даём завершиться. */
     }
 
     SDC_REG(SDC_RISR) = 0xFFFFFFFFu;

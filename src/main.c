@@ -322,14 +322,24 @@ void kmain(void)
             int pon = h3_wifi_power_on_chip();
             uart_print("  pwon rc=");
             uart_print_int(pon);
+            if (pon != 0) {
+                uart_print(" step=");
+                uart_print_int((int)sdc_diag_pseq_step);
+                uart_print(" base=");
+                uart_print_int((int)sdc_diag_pseq_base);
+                uart_print(" off=0x");
+                uart_print_hex((uint32_t)sdc_diag_pseq_off);
+                uart_print(" val=0x");
+                uart_print_hex((uint32_t)sdc_diag_pseq_val);
+            }
             uart_print("\r\n");
 
             /* Диагностика SDIO-local регистров (device 0): 0x100 (power status),
                0x86 (suspend). 0x100==0xEA означает suspend активен. */
             {
                 uint8_t sr100 = 0, sr86 = 0;
-                int r1 = h3_sdc_cmd52_read(1, 0x100, &sr100);
-                int r2 = h3_sdc_cmd52_read(1, 0x086, &sr86);
+                int r1 = h3_sdc_cmd52_read(0, 0x100, &sr100);   /* SDIO local = функция 0 */
+                int r2 = h3_sdc_cmd52_read(0, 0x086, &sr86);
                 uart_print("  sdio100 rc=");
                 uart_print_int(r1);
                 uart_print(" v=0x");
@@ -338,6 +348,15 @@ void kmain(void)
                 uart_print_int(r2);
                 uart_print(" v=0x");
                 uart_print_hex(sr86);
+                uart_print("\r\n");
+            }
+
+            /* Проверка чтения SYS_CFG (0xF0) после фикса адресации CMD52. */
+            {
+                uint32_t sy = 0;
+                h3_sdc_read_wlan_reg32(0xF0, &sy);
+                uart_print("  syscfg=0x");
+                uart_print_hex(sy);
                 uart_print("\r\n");
             }
 
@@ -360,14 +379,48 @@ void kmain(void)
                 uart_print_int(frc);
                 uart_print(" len=0x");
                 uart_print_hex(fwlen);
+                if (frc != 0) {
+                    uart_print(" blk=");
+                    uart_print_int(sdc_diag_fail_blk);
+                    uart_print(" cmd=");
+                    uart_print_hex(sdc_diag_cmd);
+                    uart_print(" arg=0x");
+                    uart_print_hex(sdc_diag_arg);
+                    uart_print(" cmdr=0x");
+                    uart_print_hex(sdc_diag_cmdr);
+                    uart_print(" risr=");
+                    uart_print_hex(sdc_diag_risr);
+                    uart_print(" sta=");
+                    uart_print_hex(sdc_diag_sta);
+                } else {
+                    /* После FW читаем SYS_CFG ещё раз — должен стать валидным. */
+                    uint32_t sy = 0;
+                    h3_sdc_read_wlan_reg32(0xF0, &sy);
+                    uart_print(" syscfg=0x");
+                    uart_print_hex(sy);
+                }
                 uart_print("\r\n");
 
-                /* После FW читаем SYS_CFG ещё раз — должен стать валидным. */
-                uint32_t sy = 0;
-                h3_sdc_read_wlan_reg32(0xF0, &sy);
-                uart_print("  syscfg=0x");
-                uart_print_hex(sy);
-                uart_print("\r\n");
+                /* Диагностика доступа к WLAN IOREG: запись-чтение 0x80 (0x55).
+                   Если вернётся 0x55 — запись работает, 0xEA был дефолтом;
+                   если 0xEA — CMD52 к функции 1 не пишет. */
+                {
+                    uint8_t wbyte = 0x55, rbyte = 0;
+                    h3_sdc_cmd52_write(1, (8u<<13)|(REG_MCUFWDL_OFF&0x7FFFu), wbyte);
+                    h3_sdc_cmd52_read(1, (8u<<13)|(REG_MCUFWDL_OFF&0x7FFFu), &rbyte);
+                    uint8_t bs_l, bs_h, rs;
+                    h3_sdc_cmd52_read(0, 0x110, &bs_l);
+                    h3_sdc_cmd52_read(0, 0x111, &bs_h);
+                    h3_sdc_cmd52_read(1, (8u<<13)|(0x03u&0x7FFFu), &rs);
+                    uart_print("  w80r=0x");
+                    uart_print_hex(rbyte);
+                    uart_print(" bs=0x");
+                    uart_print_hex(bs_h);
+                    uart_print_hex(bs_l);
+                    uart_print(" syse=0x");
+                    uart_print_hex(rs);
+                    uart_print("\r\n");
+                }
             }
         }
     }
