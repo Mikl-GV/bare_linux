@@ -392,6 +392,10 @@ void kmain(void)
                     uart_print_hex(sdc_diag_risr);
                     uart_print(" sta=");
                     uart_print_hex(sdc_diag_sta);
+                    if (frc == -33) {
+                        uart_print(" mcufwdl=0x");
+                        uart_print_hex((uint32_t)sdc_diag_fw_mcufwdl);
+                    }
                 } else {
                     /* После FW читаем SYS_CFG ещё раз — должен стать валидным. */
                     uint32_t sy = 0;

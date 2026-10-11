@@ -10,8 +10,8 @@
  * НЕ РЕДАКТИРОВАТЬ ЧИСЛО ВРУЧНУЮ — оно обновляется скриптом
  * tools/scripts/bump_version.sh при каждом make.
  */
-#define FW_VERSION_MINOR 97
+#define FW_VERSION_MINOR 99
 
-#define FW_VERSION_STR  "W.097"
+#define FW_VERSION_STR  "W.099"
 
 #endif /* VERSION_H */

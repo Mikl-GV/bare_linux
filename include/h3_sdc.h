@@ -45,6 +45,12 @@
 #define SDC_DMAC_IDMA_ON   (1u << 7)   /* IDMA enable */
 #define SDC_DMAC_REFETCH   (1u << 31)  /* refetch descriptors */
 
+/* Индексы слов дескриптора IDMA (4 слова по 4 байта). */
+#define SDC_DESC_CONFIG  0
+#define SDC_DESC_BUFSIZE 1
+#define SDC_DESC_BUFADDR 2
+#define SDC_DESC_NEXT    3
+
 /* Биты IDMA interrupt status/enable (IDST/IDIE). */
 #define SDXC_IDMAC_TRANSMIT_INTERRUPT  (1u << 0)
 #define SDXC_IDMAC_RECEIVE_INTERRUPT   (1u << 1)
@@ -228,5 +234,14 @@ extern uint32_t sdc_diag_pseq_base;
 extern uint32_t sdc_diag_pseq_off;
 extern uint32_t sdc_diag_pseq_cmd;
 extern uint32_t sdc_diag_pseq_val;
+
+/* Диагностика IDMA-передач. */
+extern uint32_t sdc_diag_idst;
+extern uint32_t sdc_diag_dmac;
+extern uint32_t sdc_diag_idma_used;
+extern uint32_t sdc_diag_pio_used;
+
+/* Значение REG_MCUFWDL при падении FreeToGo (-33). */
+extern uint32_t sdc_diag_fw_mcufwdl;
 
 #endif /* H3_SDC_H */

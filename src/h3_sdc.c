@@ -17,6 +17,12 @@ uint32_t sdc_diag_pseq_base = 0;
 uint32_t sdc_diag_pseq_off  = 0;
 uint32_t sdc_diag_pseq_cmd  = 0;
 uint32_t sdc_diag_pseq_val  = 0;   /* прочитанное значение при ошибке */
+/* Диагностика IDMA. */
+uint32_t sdc_diag_idst = 0;   /* IDMA статус при ошибке */
+uint32_t sdc_diag_dmac = 0;   /* DMAC при ошибке */
+uint32_t sdc_diag_idma_used = 0;   /* счётчик: сколько передач через IDMA */
+uint32_t sdc_diag_pio_used  = 0;   /* счётчик: сколько через PIO */
+uint32_t sdc_diag_fw_mcufwdl = 0;  /* REG_MCUFWDL при падении FreeToGo */
 
 /* SD/MMC хост-контроллер H3 (SDC1) — низкоуровневый доступ.
  *
@@ -427,7 +433,15 @@ int h3_wifi_power_on_chip(void)
 #define WREG8(reg, val)  pseq_write8(0, (reg), (val))
 #define RREG8(reg, dst)  pseq_read8(0, (reg), (dst))
 
-/* Полная загрузка прошивки. fw — массив, size — размер. Возвращает 0 при успехе. */
+/* Полная загрузка прошивки. fw — массив, size — размер. Возвращает 0 при успехе.
+ * Код повторяет rtl8188f_FirmwareDownload (rtl8188f_hal_init.c): порядок:
+ *   1) _FWDownloadEnable(TRUE): 0x03|=0x04, 0x80|=0x01, поллинг, 0x82&=0xf7;
+ *   2) взвести FWDL_ChkSum_rpt (0x80|=BIT2) — ДО записи FW (стр.1251);
+ *   3) записать прошивку постранично byte-mode CMD53 (по 4 байта);
+ *   4) _FWDownloadEnable(FALSE): 0x80 &= ~BIT0 (снять FWDL);
+ *   5) _FWFreeToGo: 0x80 |= MCUFWDL_RDY(BIT1), &= ~WINTINI_RDY(BIT6),
+ *      полный _8051Reset8188 (сначала 0x82&=0xf7, потом reset 8051),
+ *      поллинг WINTINI_RDY|FWDL_ChkSum_rpt|MCUFWDL_RDY|RAM_DL_SEL (BIT7). */
 int h3_wifi_download_fw(const void *fw, uint32_t size)
 {
     const uint8_t *b = (const uint8_t *)fw;
@@ -480,7 +494,15 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
         udelay(1000);
     }
 
-    /* 2) Записать прошивку постранично в byte mode (как драйвер: rtw_writeN /
+    /* 2) Взвести FWDL_ChkSum_rpt (0x80 |= BIT2) ДО записи FW — как драйвер
+       (rtl8188f_hal_init.c:1251). Нужен для чексуммы при загрузке. */
+    {
+        uint8_t t;
+        if (RREG8(REG_MCUFWDL_OFF, &t)) return -7;
+        WREG8(REG_MCUFWDL_OFF, (uint8_t)(t | FWDL_ChkSum_rpt));
+    }
+
+    /* 3) Записать прошивку постранично в byte mode (как драйвер: rtw_writeN /
        sdio_writel — одно 4-байтное CMD53 на слово). Каждая страница = 4096
        байт (8*512), переключается через REG_MCUFWDL+2[2:0]. Byte-режим
        гарантирует приём RTL boot ROM, который ждёт именно byte-mode CMD53. */
@@ -529,7 +551,18 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
         }
     }
 
-    /* 3) FreeToGo: включить RAM-DL и сигналы готовности. */
+    /* 4) _FWDownloadEnable(FALSE): снять FWDL (0x80 &= ~BIT0) до старта FW. */
+    {
+        uint8_t t;
+        if (RREG8(REG_MCUFWDL_OFF, &t)) return -40;
+        WREG8(REG_MCUFWDL_OFF, (uint8_t)(t & 0xFE));
+    }
+
+    /* 5) FreeToGo (rtl8188f_hal_init.c _FWFreeToGo):
+       0x80 |= MCUFWDL_RDY(BIT1); 0x80 &= ~WINTINI_RDY(BIT6);
+       полный _8051Reset8188: REG_RSV_CTRL+1 (0x1D) bit0 снять->взвести,
+       REG_SYS_FUNC_EN+1 (0x03) bit2 снять->взвести;
+       поллинг MCUFWDL_RDY|FWDL_ChkSum_rpt|WINTINI_RDY|RAM_DL_SEL (BIT7). */
     {
         uint8_t t;
         if (RREG8(REG_MCUFWDL_OFF, &t)) return -30;
@@ -537,19 +570,36 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
         t &= (uint8_t)~WINTINI_RDY; /* bit6 сброшен */
         WREG8(REG_MCUFWDL_OFF, t);
 
-        /* 8051 reset (не сбрасываем FWDL бит, только CPU). */
-        if (RREG8(REG_MCUFWDL_OFF + 2, &t)) return -31;
-        WREG8(REG_MCUFWDL_OFF + 2, t & 0xf7);
+        /* Полный reset 8051 — как драйвер _8051Reset8188: */
+        /*   io_rst: REG_RSV_CTRL+1 &= ~BIT0, затем |= BIT0 (0x1D) */
+        if (pseq_read8(0, 0x1D, &t)) return -31;
+        WREG8(0x1D, (uint8_t)(t & 0xFE));
+        /*   cpu_rst: REG_SYS_FUNC_EN+1 (0x03) &= ~BIT2 */
+        if (pseq_read8(0, 0x03, &t)) return -32;
+        WREG8(0x03, (uint8_t)(t & 0xFB));
+        /*   io_rst again |= BIT0 */
+        if (pseq_read8(0, 0x1D, &t)) return -33;
+        WREG8(0x1D, (uint8_t)(t | 0x01));
+        /*   cpu_rst |= BIT2 */
+        if (pseq_read8(0, 0x03, &t)) return -34;
+        WREG8(0x03, (uint8_t)(t | 0x04));
+        udelay(1000);
 
-        /* Поллить FW ready: WINTINI_RDY|FWDL_ChkSum_rpt|MCUFWDL_RDY. */
-        uint32_t want = WINTINI_RDY | FWDL_ChkSum_rpt | MCUFWDL_RDY;
+        /* Поллить FW ready. want-маск — как драйвер (value_expected):
+           MCUFWDL_RDY | FWDL_ChkSum_rpt | WINTINI_RDY | RAM_DL_SEL. */
+        uint32_t want = MCUFWDL_RDY | FWDL_ChkSum_rpt | WINTINI_RDY | RAM_DL_SEL;
         for (i = 0; i < 100000; i++) {
             uint8_t v;
-            if (RREG8(REG_MCUFWDL_OFF, &v)) return -32;
+            if (RREG8(REG_MCUFWDL_OFF, &v)) return -35;
             if ((v & want) == want) break;
             udelay(100);
         }
-        if (i >= 100000) return -33;   /* FW не поднялся */
+        if (i >= 100000) {   /* FW не поднялся */
+            uint8_t v = 0;
+            RREG8(REG_MCUFWDL_OFF, &v);
+            sdc_diag_fw_mcufwdl = v;
+            return -33;
+        }
         return 0;
     }
 }
