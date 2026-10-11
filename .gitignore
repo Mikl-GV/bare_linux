@@ -1,0 +1,37 @@
+# Референсные репозитории (read-only клоны) — не включаем в наш репо
+ref/
+
+# Локальный конфиг рабочей среды
+.gigatool/
+
+# Сборка
+build/
+*.o
+*.elf
+*.bin
+
+# Инструменты (собираемые/загружаемые) — держим в репо, но тяжёлые бинарники исключаем
+tools/fel/src/sunxi-tools/sunxi-fel.exe
+tools/fel/spl/spl.bin
+tools/fel/spl/u-boot*.deb
+tools/fel/spl/*.tar.xz
+tools/fel/spl/debian-binary
+tools/fel/spl/control.tar.xz
+tools/fel/spl/data.tar.xz
+
+# Референсный Linux-драйвер rtl8189fs — чужой код, в репо проекта не включаем
+tools/wifi/rtl8189fs/
+
+# Исходники sunxi-tools (референс) — не наш код
+tools/fel/src/sunxi-tools/
+
+# Временные файлы
+*.tmp
+*.log
+*.bak
+*~
+
+# ОС
+.DS_Store
+Thumbs.db
+desktop.ini
