@@ -175,6 +175,15 @@ int h3_sdc_cmd53_write(uint32_t func, uint32_t addr, uint32_t blks, const void *
    0 при успехе; не-0 — ошибка. */
 int h3_sdc_cmd53_write_bytes(uint32_t func, uint32_t addr, uint32_t len, const void *data);
 
+/* SDIO CMD53 — чтение в byte mode (len байт). Аналог sdio_readN драйвера:
+   читает REG_MACID 0x610 и прочие регистры >= 0x100 (CMD52 для них не работает). */
+int h3_sdc_cmd53_read_bytes(uint32_t func, uint32_t addr, uint32_t len, void *data);
+
+/* SDIO CMD53 — byte mode БЕЗ инкремента адреса (increment=0). Для регистров,
+   где инкремент на границе 4 байт глючит (REG_MACID 0x610/0x614). */
+int h3_sdc_cmd53_write_bytes_noinc(uint32_t func, uint32_t addr, uint32_t len, const void *data);
+int h3_sdc_cmd53_read_bytes_noinc(uint32_t func, uint32_t addr, uint32_t len, void *data);
+
 /* Установить block size функции 1 (WLAN IOREG) через CCCR 0x110/0x111.
    Обязательно перед CMD53 в block mode. Возвращает 0 при успехе. */
 int h3_sdc_set_fn1_blocksize(uint16_t blksz);
@@ -183,9 +192,9 @@ int h3_sdc_set_fn1_blocksize(uint16_t blksz);
    Common CIS, затем по нему идём по CIS-туплам, читая каждый через CMD52
    (байтовый доступ функции 0; функция 0 не поддерживает блочный CMD53).
    Ищем TPLID_MANFID (0x20) и кладём 16-бит код производителя в *manf_id
-   (0x024C = Realtek). В *cis_addr_out кладётся адрес CIS. Возвращает 0 при
-   успехе, иначе — ошибка. Вызывается после h3_sdio_init_chip(). */
-int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out);
+   (0x024C = Realtek) и Card Info (PID) в *card_id (RTL8189FTV = 0xF179).
+   Возвращает 0 при успехе, иначе — ошибка. Вызывается после h3_sdio_init_chip(). */
+int h3_sdio_read_chip_id(uint16_t *manf_id, uint16_t *card_id);
 
 /* Переключить шину SDIO между 1-bit (four_bit=0) и 4-bit (four_bit=1).
    Обновляет и логический режим в CCCR 0x07, и аппаратную ширину SDC_CTYPE.
@@ -211,6 +220,10 @@ int h3_wifi_power_on_chip(void);
    fw — массив прошивки (RTL8189FTV NIC, ~0x4970 байт), size — размер.
    Возвращает 0 при успехе; не-0 — ошибка (см. коды в h3_sdc.c). */
 int h3_wifi_download_fw(const void *fw, uint32_t size);
+
+/* Прочитать заводской MAC из eFuse чипа (адрес 0x11A, 6 байт).
+   Возвращает 0 при успехе (mac заполнен), -1 при недоступности eFuse. */
+int h3_wifi_efuse_read_mac(uint8_t mac[6]);
 
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080

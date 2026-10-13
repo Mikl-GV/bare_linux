@@ -103,12 +103,24 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 - **SDC1 на PG0-PG5** (function 2): PG0=CLK, PG1=CMD, PG2=D0, PG3=D1, PG4=D2, PG5=D3.
   Настройка: `PORTG CFG0 [15:0] = 0x2222`, `CFG1 [7:0] = 0x22` (код в h3_sdc1_init).
 
-### SDIO-протокол (проверено на стенде)
+### SDIO-протокол (проверено на стенде, рабочая точка W.118)
 
-- CMD5 → CMD3 → CMD7 → работа через CMD52/CMD53.
+- Порядок инициализации чипа (строго, подтверждён на стенде):
+  `CMD5 (ждём C=1) → CMD3 (RCA) → CMD7 (select) → CMD52 вкл. Fn1 (CCCR 0x02) →
+  CMD53 загрузка FW (byte-mode по 4 байта, адрес (8<<13)|0x1000) → eFuse →
+  программный MAC в REG_MACID 0x610-0x615`.
+  PowerSeq CARDEMU→ACTIVE (`h3_wifi_power_on_chip`) выполняется **ДО включения
+  Fn1** — без него CMD53-write к функции 1 срывается (rc=-2, risr=0).
 - Чистая I/O-карта: **CMD0/CMD8/ACMD41 не используются** (по спецификации SDIO).
-- 4-bit режим: CCCR 0x07 [2:0] = 0b010 + `SDC_CTYPE=1`.
-- CIS: адрес из CCCR 0x09-0x0B = 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek).
+- Рабочая ширина на этом этапе — **1-bit** (перед FW принудительно ставится 1-bit).
+  4-bit: CCCR 0x07 [2:0] = 0b01 + `SDC_CTYPE=1` (по SDIO-спецификации); на стенде
+  не используется до подтверждённого RX.
+- CIS: адрес из CCCR 0x09-0x0B = 0x1000, тюпл 0x20 → Manufacturer 0x024C,
+  Card/PID 0xF179 (RTL8189FTV).
+- ID чипа печатается как `chip_id manf=0x024C card=0xF179`.
+- MAC: eFuse по 0x11A на Orange Pi Lite пуст (FF) → задаётся программно
+  (локально-администрируемый 02:00:00:XX:XX:XX) в REG_MACID 0x610-0x615
+  через CMD53 без инкремента (0x610 len=4, 0x614 len=2).
 
 ### Важные особенности (из отладки)
 

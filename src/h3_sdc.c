@@ -3,6 +3,7 @@
 #include "h3_ccu.h"
 #include "ports.h"
 #include "sys.h"
+#include "uart.h"
 
 /* Диагностика последней блочной передачи: заполняется при ошибке. */
 uint32_t sdc_diag_risr = 0;
@@ -115,8 +116,8 @@ void h3_sdc1_init(void)
 
     /* 3) Модульный такт MMC1: OSC24M, OLD mode (как в boot0 для 400кГц).
           SDMMC1_CLK = 0x0002000f (N=2, M=16) + SCLK_GATING.
-          SCLK = OSC24M / N / M = 24M/2/16 ~= 750 кГц (для init).
-          Затем делитель в CKC даст нужный CCLK. */
+          SCLK = OSC24M / N / M = 24M/2/16 ~= 750 кГц.
+          Затем делитель в CKC даст нужный CCLK (~375 кГц, как SD-init). */
     H3_CCU_SDMMC1_CLK = H3_SDMMC1_SCLK_GATE
                       | H3_SDMMC1_CLK_SRC_OSC24M
                       | (2u << 16)   /* N=2 */
@@ -242,7 +243,7 @@ int h3_sdc_cmd52_read(uint32_t func, uint32_t reg, uint8_t *out)
 int h3_sdc_cmd52_write(uint32_t func, uint32_t reg, uint8_t val)
 {
     uint32_t arg = (1u << 31) | ((func & 7u) << 28) | ((reg & 0x1FFFF) << 9)
-                 | (val & 0x7F);
+                 | (val & 0xFF);
     return h3_sdc_cmd_no_data_flags(52, arg, 0, 1, 0);
 }
 
@@ -271,6 +272,46 @@ int h3_sdc_cmd53_write_bytes(uint32_t func, uint32_t addr, uint32_t len, const v
                  | ((addr & 0x1FFFF) << 9)          /* база */
                  | (len & 0x1FF);                   /* число байт (1..511) */
     return h3_sdc_block_transfer(53, arg, len, 1, 1, (void *)data);
+}
+
+/* SDIO CMD53 — чтение в byte mode (len байт). Зеркальная write_bytes:
+   для регистров WLAN IOREG >= 0x100 (REG_MACID 0x610 и т.д.), куда
+   CMD52 не ходит. */
+int h3_sdc_cmd53_read_bytes(uint32_t func, uint32_t addr, uint32_t len, void *data)
+{
+    uint32_t arg = (0u << 31)                       /* read */
+                 | ((func & 7u) << 28)              /* функция */
+                 | (0u << 27)                       /* byte mode */
+                 | (1u << 26)                       /* increment addr */
+                 | ((addr & 0x1FFFF) << 9)          /* база */
+                 | (len & 0x1FF);                   /* число байт (1..511) */
+    return h3_sdc_block_transfer(53, arg, len, 1, 0, data);
+}
+
+/* SDIO CMD53 — запись в byte mode БЕЗ инкремента адреса (inc=0).
+   Используется для регистров, где аппаратный инкремент на границе
+   4 байт глючит (REG_MACID: 0x610 и 0x614) — каждый байт по явному адресу. */
+int h3_sdc_cmd53_write_bytes_noinc(uint32_t func, uint32_t addr, uint32_t len, const void *data)
+{
+    uint32_t arg = (1u << 31)                       /* write */
+                 | ((func & 7u) << 28)              /* функция */
+                 | (0u << 27)                       /* byte mode */
+                 | (0u << 26)                       /* НЕ increment */
+                 | ((addr & 0x1FFFF) << 9)          /* база */
+                 | (len & 0x1FF);                   /* число байт (1..511) */
+    return h3_sdc_block_transfer(53, arg, len, 1, 1, (void *)data);
+}
+
+/* SDIO CMD53 — чтение в byte mode БЕЗ инкремента адреса (inc=0). */
+int h3_sdc_cmd53_read_bytes_noinc(uint32_t func, uint32_t addr, uint32_t len, void *data)
+{
+    uint32_t arg = (0u << 31)                       /* read */
+                 | ((func & 7u) << 28)              /* функция */
+                 | (0u << 27)                       /* byte mode */
+                 | (0u << 26)                       /* НЕ increment */
+                 | ((addr & 0x1FFFF) << 9)          /* база */
+                 | (len & 0x1FF);                   /* число байт (1..511) */
+    return h3_sdc_block_transfer(53, arg, len, 1, 0, data);
 }
 
 /* Чтение 32-бит регистра WLAN-функции (function 1) чипа через CMD52.
@@ -348,6 +389,20 @@ static int pseq_exec(const uint8_t *seq, int n)
 
         (void)cut; (void)fab_if;   /* в нашем случае CUT_ALL, всё подходит */
 
+        uart_print("  pseq#");
+        uart_print_int(i);
+        uart_print(" b=");
+        uart_print_int(base);
+        uart_print(" o=0x");
+        uart_print_hex((uint32_t)off);
+        uart_print(" c=");
+        uart_print_int(cmd);
+        uart_print(" m=0x");
+        uart_print_hex((uint32_t)msk);
+        uart_print(" v=0x");
+        uart_print_hex((uint32_t)val);
+        uart_print("\r\n");
+
         if (cmd == 0x01) {          /* WRITE: read&msk | value */
             uint8_t cur = 0;
             int rc = pseq_read8(base, off, &cur);
@@ -387,6 +442,7 @@ static int pseq_exec(const uint8_t *seq, int n)
 /* Полный power-on чипа: тянет карту из CARDEMU в ACTIVE. */
 int h3_wifi_power_on_chip(void)
 {
+    uart_print("  pwon: CARDEMU->ACTIVE start\r\n");
     /* rtl8188F_card_enable_flow = CARDDIS_TO_CARDEMU + CARDEMU_TO_ACT + END.
        Вручную раскрываем две последовательности из Hal8188FPwrSeq.h. */
     /* CARDEMU_TO_ACT (из макроса RTL8188F_TRANS_CARDEMU_TO_ACT).
@@ -395,7 +451,7 @@ int h3_wifi_power_on_chip(void)
     static const uint8_t seq_ce2ac[] = {
         /* 0x0005 MAC WRITE BIT2 0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x04, 0x00,
-        /* 0x0006 MAC WRITE BIT1 BIT1 (ранее POLLING) */
+        /* 0x0006 MAC WRITE BIT1 BIT1 */
         0x06,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x02, 0x02,
         /* 0x0005 MAC WRITE BIT7 0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x80, 0x00,
@@ -403,7 +459,7 @@ int h3_wifi_power_on_chip(void)
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x08, 0x00,
         /* 0x0005 MAC WRITE BIT0 BIT0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x01, 0x01,
-        /* 0x0005 MAC WRITE BIT0 0 (ранее POLLING) */
+        /* 0x0005 MAC WRITE BIT0 0 */
         0x05,0x00, 0xFF, (0<<4)|0x00, 0x01, 0x01, 0x00,
         /* 0x0027 MAC WRITE 0xff 0x35 */
         0x27,0x00, 0xFF, (0<<4)|0x00, 0x01, 0xFF, 0x35,
@@ -413,7 +469,60 @@ int h3_wifi_power_on_chip(void)
 
     /* Чип уже вне suspend (sdio86=0x00), поэтому CARDDIS_TO_CARDEMU с его
        поллингом «ждать suspend» не сходится. Запускаем сразу CARDEMU_TO_ACT. */
-    return pseq_exec(seq_ce2ac, sizeof(seq_ce2ac)/7);
+    {
+        int rp = pseq_exec(seq_ce2ac, sizeof(seq_ce2ac)/7);
+        uart_print("  pwon rc=");
+        uart_print_int(rp);
+        uart_print("\r\n");
+        return rp;
+    }
+}
+
+/* ---- Чтение eFuse (заводская калибровка / MAC) ----
+ * Протокол 8188F (rtw_efuse.c): включить EFUSE-контроллер (0xCF=0x69),
+ * затем для каждого байта: адрес [7:0] в 0x31, [9:8] в 0x32[1:0],
+ * триггер чтения 0x33[7]=0, поллить 0x33[7]=1, данные в 0x30.
+ * Возвращает 0 при успехе (buf заполнен), -1 при недоступности. */
+int h3_wifi_efuse_read_mac(uint8_t mac[6])
+{
+    int byte_off;
+    /* 1) Включить EFUSE-контроллер (EFUSE_ACCESS_ON). */
+    if (h3_sdc_cmd52_write(1, (8u << 13) | 0x00CF, 0x69)) {
+        uart_print("  efuse: ACCESS_ON FAIL (CF)\r\n");
+        return -1;
+    }
+    udelay(10);
+
+    /* 2) MAC лежит по адресу 0x11A..0x11F внутри карты EFUSE. */
+    for (byte_off = 0; byte_off < 6; byte_off++) {
+        uint16_t addr = (uint16_t)(0x11A + byte_off);
+        uint8_t v, a8, a9;
+        /* Адрес [7:0] в 0x31. */
+        if (h3_sdc_cmd52_write(1, (8u << 13) | 0x0031, (uint8_t)(addr & 0xFF))) return -1;
+        /* Адрес [9:8] в 0x32[1:0], остальное не трогаем. */
+        if (h3_sdc_cmd52_read(1, (8u << 13) | 0x0032, &a8)) return -1;
+        a8 = (uint8_t)((a8 & 0xFC) | ((addr >> 8) & 0x03));
+        if (h3_sdc_cmd52_write(1, (8u << 13) | 0x0032, a8)) return -1;
+        /* Триггер: 0x33[7] = 0 (start read). */
+        if (h3_sdc_cmd52_read(1, (8u << 13) | 0x0033, &a9)) return -1;
+        if (h3_sdc_cmd52_write(1, (8u << 13) | 0x0033, (uint8_t)(a9 & 0x7F))) return -1;
+        /* Поллить готовность: 0x33[7] = 1. */
+        int t;
+        for (t = 0; t < 10000; t++) {
+            if (h3_sdc_cmd52_read(1, (8u << 13) | 0x0033, &a9)) return -1;
+            if (a9 & 0x80) break;
+        }
+        if (t >= 10000) {
+            uart_print("  efuse: READ TIMEOUT @0x");
+            uart_print_hex((uint32_t)addr);
+            uart_print("\r\n");
+            return -1;
+        }
+        /* Данные в 0x30. */
+        if (h3_sdc_cmd52_read(1, (8u << 13) | 0x0030, &v)) return -1;
+        mac[byte_off] = v;
+    }
+    return 0;
 }
 
 /* ---- Загрузка прошивки чипа RTL8189FTV (реализация rtl8188f_FirmwareDownload) ----
@@ -450,7 +559,18 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
 
     if (size < 4) return -9;
     /* Проверка сигнатуры: 0xF1 0x88 (чип 8188F), + 0x10 0x00. */
-    if (b[0] != 0xF1 || b[1] != 0x88) return -10;
+    if (b[0] != 0xF1 || b[1] != 0x88) {
+        uart_print("  fwdl: BAD SIG 0x");
+        uart_print_hex((uint32_t)b[1]);
+        uart_print_hex((uint32_t)b[0]);
+        uart_print("\r\n");
+        return -10;
+    }
+    uart_print("  fwdl: sig OK, size=0x");
+    uart_print_hex(size);
+    uart_print(" (raw=0x");
+    uart_print_hex((uint32_t)(b[0] | ((uint16_t)b[1] << 8)));
+    uart_print(")\r\n");
 
     /* RTL8189F NIC-прошивка содержит 32-байтный заголовок
        (RT_8188F_FIRMWARE_HDR). Драйвер его пропускает перед загрузкой
@@ -467,7 +587,13 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
         пишется в byte mode, как rtw_write32 -> sdio_writel. */
     h3_sdio_set_bus_width(0);
     udelay(1000);
-    if ((rc = h3_sdc_set_fn1_blocksize(512)) != 0) return -8;
+    if ((rc = h3_sdc_set_fn1_blocksize(512)) != 0) {
+        uart_print("  fwdl: fn1_blksz rc=");
+        uart_print_int(rc);
+        uart_print("\r\n");
+        return -8;
+    }
+    uart_print("  fwdl: fn1 blksz=512 ok, bus 1-bit\r\n");
 
     /* 1) Включить MCU FW download: полный _FWDownloadEnable (rtl8188f_hal_init.c):
        REG_SYS_FUNC_EN+1 |= 0x04 (8051 enable), REG_MCUFWDL |= 0x01 (взвод),
@@ -520,6 +646,14 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
             t = (uint8_t)((t & 0xF8) | (page & 0x07));
             WREG8(REG_MCUFWDL_OFF + 2, t);
 
+            uart_print("  fwdl page=");
+            uart_print_int((int)page);
+            uart_print(" off=0x");
+            uart_print_hex(off);
+            uart_print(" len=0x");
+            uart_print_hex(page_end - off);
+            uart_print("\r\n");
+
             /* Записать страницу байтовыми CMD53 (по 4 байта), как rtw_write32:
                каждая страница пишется по одному базовому адресу FW_START
                (page-select в REG_MCUFWDL+2 перенаправляет в нужную RMAC/IROM
@@ -532,6 +666,11 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
                                               (const void *)(b + off + w * 4));
                 if (rc != 0) {
                     sdc_diag_fail_blk = (int)((off + w * 4) / 512);
+                    uart_print("  fwdl CMD53W FAIL rc=");
+                    uart_print_int(rc);
+                    uart_print(" w=");
+                    uart_print_int((int)w);
+                    uart_print("\r\n");
                     return -40 - rc;
                 }
             }
@@ -541,6 +680,9 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
                 rc = h3_sdc_cmd53_write_bytes(1, ftaddr + n4 * 4, 4, tail);
                 if (rc != 0) {
                     sdc_diag_fail_blk = (int)((off + n4 * 4) / 512);
+                    uart_print("  fwdl CMD53W tail FAIL rc=");
+                    uart_print_int(rc);
+                    uart_print("\r\n");
                     return -40 - rc;
                 }
             }
@@ -556,6 +698,9 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
         uint8_t t;
         if (RREG8(REG_MCUFWDL_OFF, &t)) return -40;
         WREG8(REG_MCUFWDL_OFF, (uint8_t)(t & 0xFE));
+        uart_print("  fwdl: FWDL off, mcufwdl=0x");
+        uart_print_hex((uint32_t)t);
+        uart_print("\r\n");
     }
 
     /* 5) FreeToGo (rtl8188f_hal_init.c _FWFreeToGo):
@@ -598,8 +743,12 @@ int h3_wifi_download_fw(const void *fw, uint32_t size)
             uint8_t v = 0;
             RREG8(REG_MCUFWDL_OFF, &v);
             sdc_diag_fw_mcufwdl = v;
+            uart_print("  fwdl: FreeToGo TIMEOUT mcufwdl=0x");
+            uart_print_hex((uint32_t)v);
+            uart_print("\r\n");
             return -33;
         }
+        uart_print("  fwdl: FW READY, want-маска выставлена\r\n");
         return 0;
     }
 }
@@ -661,8 +810,20 @@ int h3_sdio_init_chip(void)
     for (tries = 0; tries < 100; tries++) {
         uint32_t ocr_arg = (0x7u << 21);   /* запрос 3.0-3.6V */
         rc = h3_sdc_cmd_no_data_flags(5, ocr_arg, 0, 1, 0);
-        if (rc != 0) return rc;
+        if (rc != 0) {
+            uart_print("  CMD5 rc=");
+            uart_print_int(rc);
+            uart_print("\r\n");
+            return rc;
+        }
         uint32_t resp = SDC_REG(SDC_RESP0);
+        uart_print("  CMD5 R4=0x");
+        uart_print_hex(resp);
+        uart_print(" C=");
+        uart_print_int((int)((resp >> 31) & 1u));
+        uart_print(" vol=");
+        uart_print_hex((resp >> 21) & 0x7u);
+        uart_print("\r\n");
         if (resp & (1u << 31))   /* C=1 - карта готова */
             break;
         udelay(10000);
@@ -673,9 +834,15 @@ int h3_sdio_init_chip(void)
     rc = h3_sdc_cmd_no_data_flags(3, 0, 0, 1, 0);
     if (rc != 0) return -4;
     rca = (SDC_REG(SDC_RESP0) >> 16) & 0xFFFF;
+    uart_print("  CMD3 RCA=0x");
+    uart_print_hex(rca);
+    uart_print("\r\n");
 
     /* 4) CMD7 (SELECT_CARD): выбрать карту. */
     rc = h3_sdc_cmd_no_data_flags(7, rca << 16, 0, 1, 0);
+    uart_print("  CMD7 select rc=");
+    uart_print_int(rc);
+    uart_print("\r\n");
     if (rc != 0) return -6;
 
     return 0;
@@ -688,6 +855,7 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
     const uint32_t *in  = (const uint32_t *)data;
     uint32_t *out = (uint32_t *)data;
     uint32_t words = (blksz * blkcnt) / 4;
+    uint32_t rem   = (blksz * blkcnt) % 4;
     uint32_t i, status;
     uint32_t cmdr_val;
 
@@ -738,6 +906,20 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
             }
             fifo[0] = in[i];   /* FIFO-регистр (0x200), контроллер сам буферизует */
         }
+        /* Хвост (total не кратен 4): собрать последнее слово из остатка байт
+           (старшие байты нулевые) и записать — BYCNT требует все total байт. */
+        if (rem) {
+            const uint8_t *ib = (const uint8_t *)data;
+            uint32_t w = 0;
+            for (i = 0; i < rem; i++)
+                w |= ((uint32_t)ib[words * 4 + i]) << (8 * i);
+            if (sdc_wait((volatile uint32_t *)(SDC_BASE + SDC_STAR), SDC_STAR_FIFO_FULL, 0) != 0) {
+                sdc_diag_risr = SDC_REG(SDC_RISR);
+                sdc_diag_sta = SDC_REG(SDC_STAR);
+                return -1;
+            }
+            fifo[0] = w;
+        }
         /* Дать контроллеру выгрести FIFO на шину. Без этого ожидание
            завершения (ниже) стартует, пока FIFO ещё полон, и RTL не получает
            данные; для записи данные реально уходят только когда FIFO пуст. */
@@ -765,19 +947,28 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
             }
             out[i] = fifo[0];
         }
+        /* Хвост (total не кратен 4): данные приходят словом (4 байта) в FIFO —
+           дожидаемся его и берём младшие rem байт. Для len<4 без ожидания
+           FIFO ещё пуст в момент проверки, и хвост терялся (нули). */
+        if (rem) {
+            if (sdc_wait((volatile uint32_t *)(SDC_BASE + SDC_STAR), SDC_STAR_FIFO_EMPTY, 0) != 0) {
+                sdc_diag_risr = SDC_REG(SDC_RISR);
+                sdc_diag_sta  = SDC_REG(SDC_STAR);
+                return -1;
+            }
+            uint32_t w = fifo[0];
+            uint8_t *ob = (uint8_t *)data;
+            for (i = 0; i < rem; i++)
+                ob[words * 4 + i] = (uint8_t)((w >> (8 * i)) & 0xFF);
+        }
     }
 
-    /* Ожидание завершения фазы данных. Ключевое правило: для всех DAT-команд
-       (CMD53 и пр.) завершение определяется по DATA_DONE (TRANS_COMPLETE), а
-       НЕ по CMD_DONE. CMD_DONE взводится после цикла команда/ответа и совсем
-       не означает, что данные переданы на шину.
-       ВАЖНО (прежний баг): нельзя определять "no-data" по биту 9 аргумента —
-         if (status & CMD_DONE && !(arg & (1<<9))) break;
-       Bit 9 — часть адресного поля bits[25:9] SDIO-команды, для выровненного
-       адреса (0x1000) он всегда 0 -> условие всегда истинно, ожидание выходило
-       по CMD_DONE до конца фазы данных, FIFO оставался полон, данные в чип не
-       уходили; итог rc=-38. byte-mode CMD53 тоже участвует в фазе данных и
-       завершается по DATA_DONE. */
+    /* Ожидание завершения фазы данных. Для всех DAT-команд (CMD53 и пр.)
+       завершение определяется по DATA_DONE (TRANS_COMPLETE), а НЕ по CMD_DONE:
+       CMD_DONE взводится после цикла команда/ответа и не означает, что данные
+       переданы на шину. Проверять "no-data" по биту 9 аргумента нельзя — это
+       часть адресного поля bits[25:9] SDIO-команды; byte-mode CMD53 тоже
+       участвует в фазе данных и завершается по DATA_DONE. */
     status = 0;
     for (i = 0; i < 0xffffff; i++) {
         status = SDC_REG(SDC_RISR);
@@ -816,7 +1007,10 @@ int h3_sdc_block_transfer(uint32_t cmd, uint32_t arg, uint32_t blksz,
  *
  * Возвращает 0 при успехе и кладёт в *manf_id 16-бит код производителя;
  * не-0 — ошибка. В *cis_addr_out кладётся адрес CIS. */
-int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out)
+/* Чтение ID чипа из CIS: Manufacturer ID + Card Info (PID).
+ * Нужны для отладки: Realtek RTL8189FTV = manf 0x024C, card 0xF179.
+ * Возвращает 0 при успехе (id0=manf, id1=card), -5 если MANFID-тупл не найден. */
+int h3_sdio_read_chip_id(uint16_t *manf_id, uint16_t *card_id)
 {
     int rc;
     uint8_t v;
@@ -825,8 +1019,7 @@ int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out)
 
     /* Чтение байта из CIS по CMD52. */
     int rd8(uint32_t a, uint8_t *o) {
-        int e = h3_sdc_cmd52_read(0, a & 0x1FFFF, o);
-        return e;
+        return h3_sdc_cmd52_read(0, a & 0x1FFFF, o);
     }
 
     /* CCCR 0x09-0x0B: адрес Common CIS (LSB сперва). */
@@ -834,12 +1027,10 @@ int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out)
     if ((rc = rd8(0x0A, &b1)) != 0) return rc;
     if ((rc = rd8(0x0B, &v))  != 0) return rc;
     uint32_t cis_addr = (uint32_t)v << 16 | (uint32_t)b1 << 8 | b0;
-    if (cis_addr_out) *cis_addr_out = cis_addr;
-
     if (cis_addr == 0) return -5;   /* CIS не задан */
 
     /* Идём по тюплам (лимит 64 тюпла / 512 байт для защиты). */
-    uint16_t manf = 0;
+    uint16_t manf = 0, card = 0;
     int found = 0;
     addr = cis_addr;
     int guard;
@@ -859,11 +1050,14 @@ int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out)
             addr++;
             len = l1;
         }
-        if (id == 0x20) {               /* TPLID_MANFID */
-            uint8_t m0, m1;
-            if ((rc = rd8(addr, &m0)) != 0) return rc;
+        if (id == 0x20) {               /* TPLID_MANFID: 4 байта = manf(2) + card(2) */
+            uint8_t m0, m1, c0, c1;
+            if ((rc = rd8(addr,     &m0)) != 0) return rc;
             if ((rc = rd8(addr + 1, &m1)) != 0) return rc;
+            if ((rc = rd8(addr + 2, &c0)) != 0) return rc;
+            if ((rc = rd8(addr + 3, &c1)) != 0) return rc;
             manf = (uint16_t)(m1 << 8 | m0);
+            card = (uint16_t)(c1 << 8 | c0);
             found = 1;
             break;
         }
@@ -872,16 +1066,18 @@ int h3_sdio_read_cis(uint16_t *manf_id, uint32_t *cis_addr_out)
     }
 
     if (manf_id) *manf_id = manf;
+    if (card_id) *card_id = card;
     return found ? 0 : -5;
 }
 
-/* Переключение шины SDIO в 4-bit режим.
+/* Переключение шины SDIO: 1-bit (four_bit=0) или 4-bit (four_bit=1).
  *
- * 1) CCCR offset 0x07 (Bus Interface Control) → биты [6:0] = 0b100 (4-bit).
+ * 1) CCCR offset 0x07 (Card Bus Width [2:0]) по SDIO-спецификации:
+ *    0b00 = 1-bit, 0b01 = 4-bit, 0b10 = 8-bit (Linux mmc/sdio.c).
  * 2) Аппаратно: SDC_CTYPE (0x0C) = 1 — шина 4-bit.
  *
- * Примечание: данные-пины PG4/PG5 уже настроены на function 2 в
- * h3_sdc1_init(); должен работать и 4-bit вариант.
+ * В рабочей цепочке W.116 4-bit не используется: перед загрузкой прошивки
+ * шина принудительно ставится в 1-bit (h3_wifi_download_fw).
  * Возвращает 0 при успехе; не-0 — ошибка. */
 int h3_sdio_set_bus_width(int four_bit)
 {
@@ -890,8 +1086,8 @@ int h3_sdio_set_bus_width(int four_bit)
 
     if ((rc = h3_sdc_cmd52_read(0, 0x07, &v)) != 0) return rc;
     /* Сохранить прочие биты (высокоскоростной режим и пр.), обновить только
-       поле ширины [2:0]: 0=1-bit, 2=4-bit. */
-    uint8_t nv = (uint8_t)((v & ~0x07u) | (four_bit ? 0x02u : 0x00u));
+       поле ширины [2:0]: 0b00=1-bit, 0b01=4-bit. */
+    uint8_t nv = (uint8_t)((v & ~0x07u) | (four_bit ? 0x01u : 0x00u));
     if ((rc = h3_sdc_cmd52_write(0, 0x07, nv)) != 0) return rc;
 
     /* Аппаратная ширина шины контроллера: 0=1-bit, 1=4-bit. */

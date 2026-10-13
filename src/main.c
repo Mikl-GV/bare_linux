@@ -64,6 +64,14 @@ static int led_state = 0;
    sdio_init). Используется для значка на главном экране. */
 int wifi_active = 0;
 
+/* Печать байта как %02X (две hex-цифры). */
+static void print_u8_hex(uint8_t v)
+{
+    static const char hexd[] = "0123456789ABCDEF";
+    uart_putc(hexd[(v >> 4) & 0xF]);
+    uart_putc(hexd[v & 0xF]);
+}
+
 static void led_heartbeat(void)
 {
     uint32_t now = micros();
@@ -296,71 +304,44 @@ void kmain(void)
             uart_print_hex(ccid1);
             uart_print("\r\n");
 
-            /* Чтение CIS: функция 0 поддерживает только байтовый доступ
-               (CMD52), блочный CMD53 для функции 0 не работает (FIFO пуст).
-               Поэтому тюплы CIS читаются по одному байту через CMD52. */
-            uint16_t manf = 0;
-            uint32_t cis_addr = 0;
-            int cis_rc = h3_sdio_read_cis(&manf, &cis_addr);
-            uart_print("  cis addr=0x");
-            uart_print_hex(cis_addr);
-            uart_print(" rc=");
-            uart_print_int(cis_rc);
-            if (cis_rc == 0) {
-                uart_print(" manf=0x");
-                uart_print_hex(manf);
-            }
-            uart_print("\r\n");
-
-            /* 4-bit режим: CCCR 0x07 |= 4-bit, SDC_CTYPE=1. */
-            int bw_rc = h3_sdio_set_bus_width(1);
-            uart_print("  bus4 rc=");
-            uart_print_int(bw_rc);
-            uart_print("\r\n");
-
-            /* Power-on чипа: переводим из CARDEMU в ACTIVE (PowerSeq). */
-            int pon = h3_wifi_power_on_chip();
-            uart_print("  pwon rc=");
-            uart_print_int(pon);
-            if (pon != 0) {
-                uart_print(" step=");
-                uart_print_int((int)sdc_diag_pseq_step);
-                uart_print(" base=");
-                uart_print_int((int)sdc_diag_pseq_base);
-                uart_print(" off=0x");
-                uart_print_hex((uint32_t)sdc_diag_pseq_off);
-                uart_print(" val=0x");
-                uart_print_hex((uint32_t)sdc_diag_pseq_val);
-            }
-            uart_print("\r\n");
-
-            /* Диагностика SDIO-local регистров (device 0): 0x100 (power status),
-               0x86 (suspend). 0x100==0xEA означает suspend активен. */
+            /* ID чипа из CIS: manf (0x024C Realtek) + card PID (0xF179 8189F). */
             {
-                uint8_t sr100 = 0, sr86 = 0;
-                int r1 = h3_sdc_cmd52_read(0, 0x100, &sr100);   /* SDIO local = функция 0 */
-                int r2 = h3_sdc_cmd52_read(0, 0x086, &sr86);
-                uart_print("  sdio100 rc=");
-                uart_print_int(r1);
-                uart_print(" v=0x");
-                uart_print_hex(sr100);
-                uart_print("  sdio86 rc=");
-                uart_print_int(r2);
-                uart_print(" v=0x");
-                uart_print_hex(sr86);
+                uint16_t manf = 0, card = 0;
+                int id_rc = h3_sdio_read_chip_id(&manf, &card);
+                uart_print("  chip_id rc=");
+                uart_print_int(id_rc);
+                if (id_rc == 0) {
+                    uart_print(" manf=0x");
+                    uart_print_hex(manf);
+                    uart_print(" card=0x");
+                    uart_print_hex(card);
+                }
                 uart_print("\r\n");
             }
 
-            /* Проверка чтения SYS_CFG (0xF0) после фикса адресации CMD52. */
+            /* Power-on чипа: перевести из CARDEMU в ACTIVE (PowerSeq CARDEMU_TO_ACT).
+               Выполняется ДО включения Function 1 (в драйвере Linux 8189fs это
+               _InitPowerOn в rtl8188fs_hal_init, идёт до sdio_enable_func).
+               Без CARDEMU→ACTIVE CMD53-write к функции 1 срывается (rc=-2,
+               risr=0) — подтверждено на стенде. */
             {
-                uint32_t sy = 0;
-                h3_sdc_read_wlan_reg32(0xF0, &sy);
-                uart_print("  syscfg=0x");
-                uart_print_hex(sy);
+                int pon = h3_wifi_power_on_chip();
+                uart_print("  pwon rc=");
+                uart_print_int(pon);
+                if (pon != 0) {
+                    uart_print(" step=");
+                    uart_print_int((int)sdc_diag_pseq_step);
+                    uart_print(" base=");
+                    uart_print_int((int)sdc_diag_pseq_base);
+                    uart_print(" off=0x");
+                    uart_print_hex((uint32_t)sdc_diag_pseq_off);
+                    uart_print(" val=0x");
+                    uart_print_hex((uint32_t)sdc_diag_pseq_val);
+                }
                 uart_print("\r\n");
             }
 
-            /* Включить I/O-функцию 1 (CCCR 0x02 = 0x02). */
+            /* Этап 3: включить I/O-функцию 1 (CCCR 0x02, бит IOEx=0x02). */
             {
                 uint8_t ioen;
                 h3_sdc_cmd52_read(0, 0x02, &ioen);
@@ -371,7 +352,7 @@ void kmain(void)
                 uart_print("\r\n");
             }
 
-            /* Загрузка прошивки чипа (NIC firmware, встроена в fw_nic.bin). */
+            /* Этап 4: загрузка прошивки чипа (NIC firmware, встроена в fw_nic.bin). */
             {
                 uint32_t fwlen = (uint32_t)(fw_blob_end - fw_blob_start);
                 int frc = h3_wifi_download_fw(fw_blob_start, fwlen);
@@ -397,34 +378,75 @@ void kmain(void)
                         uart_print_hex((uint32_t)sdc_diag_fw_mcufwdl);
                     }
                 } else {
-                    /* После FW читаем SYS_CFG ещё раз — должен стать валидным. */
-                    uint32_t sy = 0;
-                    h3_sdc_read_wlan_reg32(0xF0, &sy);
-                    uart_print(" syscfg=0x");
-                    uart_print_hex(sy);
+                    /* Этап 5: сразу после FW читаем eFuse (заводской MAC, 0x11A).
+                       На Orange Pi Lite eFuse пуст (FF:..) — тогда MAC задаём
+                       программно (как драйвер 8189fs) и пишем в REG_MACID. */
+                    uint8_t mac[6];
+                    int erc = h3_wifi_efuse_read_mac(mac);
+                    uart_print("  efuse rc=");
+                    uart_print_int(erc);
+                    if (erc == 0) {
+                        int valid = 1;
+                        for (int k = 0; k < 6; k++)
+                            if (mac[k] == 0xFF || mac[k] == 0x00) { valid = 0; break; }
+                        if (!valid) {
+                            /* eFuse пуст — генерируем локально-администрируемый MAC.
+                               Префикс 02:00:00 + младшие байты таймера (уник.). */
+                            uint32_t t = micros();
+                            mac[0] = 0x02; mac[1] = 0x00; mac[2] = 0x00;
+                            mac[3] = (uint8_t)(t >> 16);
+                            mac[4] = (uint8_t)(t >> 8);
+                            mac[5] = (uint8_t)(t);
+                        }
+                    }
+                    uart_print(" mac=");
+                    for (int k = 0; k < 6; k++) {
+                        print_u8_hex(mac[k]);
+                        if (k < 5) uart_print(":");
+                    }
+                    uart_print("\r\n");
+
+                    /* Запись MAC в REG_MACID (0x610-0x615) двумя CMD53 без инкремента:
+                       0x610 (4 байта) + 0x614 (2 байта), как 32-битные регистры. */
+                    {
+                        uint32_t lo = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8)
+                                    | ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+                        uint32_t hi = (uint32_t)mac[4] | ((uint32_t)mac[5] << 8);
+                        uint32_t base = (8u << 13) | (0x610u & 0x7FFFu);
+                        int wk = 0;
+                        if (h3_sdc_cmd53_write_bytes_noinc(1, base, 4, &lo) != 0) wk = -1;
+                        if (h3_sdc_cmd53_write_bytes_noinc(1, base + 4, 2, &hi) != 0) wk = -1;
+                        uart_print("  mac_set=");
+                        uart_print(wk == 0 ? "OK" : "FAIL");
+                        uart_print("\r\n");
+                    }
+
+                    /* Пауза, затем чтение REG_MACID обратно двумя CMD53 (inc=0). */
+                    udelay(10000);
+                    {
+                        uint32_t re_lo = 0, re_hi = 0;
+                        uint32_t base = (8u << 13) | (0x610u & 0x7FFFu);
+                        int rrc = 0;
+                        if (h3_sdc_cmd53_read_bytes_noinc(1, base, 4, &re_lo) != 0) rrc = -1;
+                        if (h3_sdc_cmd53_read_bytes_noinc(1, base + 4, 2, &re_hi) != 0) rrc = -1;
+                        uart_print("  macid_re=");
+                        if (rrc == 0) {
+                            print_u8_hex((uint8_t)(re_lo & 0xFF));
+                            uart_print(":");
+                            print_u8_hex((uint8_t)((re_lo >> 8) & 0xFF));
+                            uart_print(":");
+                            print_u8_hex((uint8_t)((re_lo >> 16) & 0xFF));
+                            uart_print(":");
+                            print_u8_hex((uint8_t)((re_lo >> 24) & 0xFF));
+                            uart_print(":");
+                            print_u8_hex((uint8_t)(re_hi & 0xFF));
+                            uart_print(":");
+                            print_u8_hex((uint8_t)((re_hi >> 8) & 0xFF));
+                        } else uart_print("FAIL");
+                        uart_print("\r\n");
+                    }
                 }
                 uart_print("\r\n");
-
-                /* Диагностика доступа к WLAN IOREG: запись-чтение 0x80 (0x55).
-                   Если вернётся 0x55 — запись работает, 0xEA был дефолтом;
-                   если 0xEA — CMD52 к функции 1 не пишет. */
-                {
-                    uint8_t wbyte = 0x55, rbyte = 0;
-                    h3_sdc_cmd52_write(1, (8u<<13)|(REG_MCUFWDL_OFF&0x7FFFu), wbyte);
-                    h3_sdc_cmd52_read(1, (8u<<13)|(REG_MCUFWDL_OFF&0x7FFFu), &rbyte);
-                    uint8_t bs_l, bs_h, rs;
-                    h3_sdc_cmd52_read(0, 0x110, &bs_l);
-                    h3_sdc_cmd52_read(0, 0x111, &bs_h);
-                    h3_sdc_cmd52_read(1, (8u<<13)|(0x03u&0x7FFFu), &rs);
-                    uart_print("  w80r=0x");
-                    uart_print_hex(rbyte);
-                    uart_print(" bs=0x");
-                    uart_print_hex(bs_h);
-                    uart_print_hex(bs_l);
-                    uart_print(" syse=0x");
-                    uart_print_hex(rs);
-                    uart_print("\r\n");
-                }
             }
         }
     }

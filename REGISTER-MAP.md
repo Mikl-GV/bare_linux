@@ -2,7 +2,7 @@
 
 > Снимки значений, проверенные на стенде (FEL-загрузка, наша прошивка).
 > Это рабочий справочник для отладки; подробные выводы — в H3-BAREMETAL-GUIDE.md
-> и KNOWLEDGE.md. Ревизия: 2026-10-11 (этап WiFi).
+> и KNOWLEDGE.md. Ревизия: 2026-10-13 (этап WiFi, рабочая точка W.118).
 
 ## I2S0 (0x01C22000) — эталон (работает)
 
@@ -76,15 +76,28 @@ pin: pl_before=0x400, pl_after=0x480 (WIFI_EN PL7 поднят)
 pg_cfg0=0x77772222, pg_cfg1=0x00777722 (PG0-5 = function 2 = SDC1)
 ```
 
-## Фактические значения из UART-лога (W.040, работает)
+## Фактические значения из UART-лога (W.118, работает — полный init чипа)
 
 ```
 sdio_init rc=0
 ccid0=0x32 ccid1=0x02
-cis addr=0x1000 rc=0 manf=0x024C   <- Realtek подтверждён
-bus4 rc=0
-pwon rc=0
-sdio100 v=0x07  sdio86 v=0x00      <- чип проснулся (не 0xEA)
-fn1 ioen=0x02                       <- функция 1 включена
-fn1 c53w rc=0                       <- блочная запись CMD53 работает
+chip_id rc=0 manf=0x024C card=0xF179    <- RTL8189FTV подтверждён
+pwon rc=0                                <- PowerSeq CARDEMU→ACTIVE
+fn1 ioen=0x02                            <- функция 1 включена
+fwdl rc=0 len=0x4972                     <- загрузка прошивки OK, FW READY
+efuse rc=0 mac=FF:FF:FF:FF:FF:FF         <- eFuse пуст (Orange Pi Lite)
+mac_set=OK macid_re=02:00:00:54:46:85    <- программный MAC записан и подтверждён
+```
+
+Ключевые регистры SDC1 во время работы (1-bit, ~375 кГц init):
+```
+0x00 GCTL  = 0x20000110   <- INT_ENB(4) CD_DBC(8) + AHB FIFO (bit31) при передаче
+0x04 CKC   = 0x00030001   <- CCLK_ENB(16) CCLK_CTRL(17) DIV=1
+0x08 TMOR  = 0xFFFFFFFF   <- ставится на каждую передачу (макс. таймаут)
+0x0C CTYPE = 0x00000000   <- 1-bit (4-bit пока не используется)
+0x18 CMDR  = 0x80002675   <- CMD53 write: START|idx|RESP|DATA_TRANS|TRANS_DIR|WAIT_PRE
+0x38 RISR  = 0x00000004   <- CMD_DONE (для data-команд ждём DATA_DONE/bit3)
+0x3C STA   = 0x0001AD06   <- FIFO/статус
+0x44 FUNS  = 0x0000CEAA   <- включить функции контроллера
+0x200 FIFO = PIO-доступ
 ```

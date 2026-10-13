@@ -10,7 +10,7 @@ $FEL  = Join-Path $PSScriptRoot "bin\sunxi-fel.exe"
 $Bin  = Join-Path $Root "h3_bare.bin"
 $Spl  = Join-Path $PSScriptRoot "spl\spl.bin"
 $Log  = Join-Path $Root "uart_capture.txt"
-$COM  = "COM10"
+$COM  = "COM12"
 $Baud = 115200
 
 Write-Host "== Prapare RAM =="
