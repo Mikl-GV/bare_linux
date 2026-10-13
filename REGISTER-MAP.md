@@ -2,7 +2,7 @@
 
 > Снимки значений, проверенные на стенде (FEL-загрузка, наша прошивка).
 > Это рабочий справочник для отладки; подробные выводы — в H3-BAREMETAL-GUIDE.md
-> и KNOWLEDGE.md. Ревизия: 2026-10-13 (этап WiFi, рабочая точка W.118).
+> и KNOWLEDGE.md. Ревизия: 2026-10-13 (этап WiFi, рабочая точка W.136).
 
 ## I2S0 (0x01C22000) — эталон (работает)
 
@@ -76,7 +76,7 @@ pin: pl_before=0x400, pl_after=0x480 (WIFI_EN PL7 поднят)
 pg_cfg0=0x77772222, pg_cfg1=0x00777722 (PG0-5 = function 2 = SDC1)
 ```
 
-## Фактические значения из UART-лога (W.118, работает — полный init чипа)
+## Фактические значения из UART-лога (W.136, работает — полный init + RF LCK)
 
 ```
 sdio_init rc=0
@@ -86,7 +86,13 @@ pwon rc=0                                <- PowerSeq CARDEMU→ACTIVE
 fn1 ioen=0x02                            <- функция 1 включена
 fwdl rc=0 len=0x4972                     <- загрузка прошивки OK, FW READY
 efuse rc=0 mac=FF:FF:FF:FF:FF:FF         <- eFuse пуст (Orange Pi Lite)
-mac_set=OK macid_re=02:00:00:54:46:85    <- программный MAC записан и подтверждён
+mac_set=OK macid_re=02:00:00:54:46:98    <- программный MAC записан и подтверждён
+lck: sf_pre=0xFC00 sf8=0x17              <- BB/RF enable применился
+lck: bb_config loaded (209 regs)         <- полный BB-конфиг (LSSI-интерфейс)
+lck: lssi_8A0raw=0x00100000              <- LSSI readback ожил
+lck: chnlbw_pre=0x400 set=0x401          <- канал 1 через LSSI (дефолт полоса 0x400)
+lck: chnlbw_trig=0x8401 done=0x8401      <- LCK отработал (бит15 остаётся — норма)
+lck: done
 ```
 
 Ключевые регистры SDC1 во время работы (1-bit, ~375 кГц init):
@@ -100,4 +106,18 @@ mac_set=OK macid_re=02:00:00:54:46:85    <- программный MAC запи�
 0x3C STA   = 0x0001AD06   <- FIFO/статус
 0x44 FUNS  = 0x0000CEAA   <- включить функции контроллера
 0x200 FIFO = PIO-доступ
+```
+
+RF/BB-регистры чипа (WLAN IOREG, Path A), задействованные в LCK:
+```
+0x0100 REG_CR     = 0x0000063F  <- HCI_DMA|TXDMA|RXDMA|PROTOCOL|SCHEDULE|MAC_EN|RF_EN
+0x0002 SYS_FUNC_EN= 0x0000FC17  <- BB/RF питание (BIT13) + BB из сброса (0x17)
+0x001F REG_RF_CTRL= 0x07        <- RF_EN|RF_RSTB|RF_SDMRSTB
+0x0E30 BB rTx_IQK_Tone_A = 0x18008C1C  <- запись-чтение работает (BB жив)
+0x0820 BB HSSI-para1   = 0x01000100  <- LSSI длина данных (из BB-конфига)
+0x0824 BB HSSI-para2   = 0x00390204  <- LSSI адрес/edge (из BB-конфига)
+0x08A0 BB LSSI readback(Path A)      <- данные RF-регистра (readback)
+RF 0x18 RF_CHNLBW = 0x400 (дефолт полоса) / 0x401 (канал 1) / 0x8401 (LCK trig)
+RF 0x01 = 0x780   <- RF power-on
+RF 0xB0 = 0xDFBF0 (LDO ON) / 0xDFFF0 (LDO OFF)
 ```

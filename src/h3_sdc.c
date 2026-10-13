@@ -4,6 +4,8 @@
 #include "ports.h"
 #include "sys.h"
 #include "uart.h"
+#include "bb_phy_reg.h"
+#include "rf_radioa.h"
 
 /* Диагностика последней блочной передачи: заполняется при ошибке. */
 uint32_t sdc_diag_risr = 0;
@@ -314,32 +316,102 @@ int h3_sdc_cmd53_read_bytes_noinc(uint32_t func, uint32_t addr, uint32_t len, vo
     return h3_sdc_block_transfer(53, arg, len, 1, 0, data);
 }
 
-/* Чтение 32-бит регистра WLAN-функции (function 1) чипа через CMD52.
-   Realtek отображает ММIO-регистры чипа в «WLAN IOREG»: SDIO-адрес =
-   (device_id 8 << 13) | (reg & 0x7FFF). Повторяем sdio_read32() драйвера:
-   3 байта через CMD52 (младший первым). */
+/* Чтение 32-бит регистра WLAN-функции (function 1) чипа.
+   Realtek отображает ММIO-регистры в «WLAN IOREG»: SDIO-адрес =
+   (device_id 8 << 13) | (reg & 0x7FFF). Для reg < 0x100 — CMD52 (байты,
+   младший первым); для reg >= 0x100 — CMD53 byte-mode (sdio_read32) —
+   CMD52 к старшим адресам не ходит (доказано на стенде). */
 int h3_sdc_read_wlan_reg32(uint32_t reg, uint32_t *val)
 {
     uint32_t ftaddr = (8u << 13) | (reg & 0x7FFFu);
-    uint8_t b0, b1, b2;
+    uint8_t b[4];
     int rc;
-    if ((rc = h3_sdc_cmd52_read(1, ftaddr, &b0)) != 0) return rc;
-    if ((rc = h3_sdc_cmd52_read(1, ftaddr + 1, &b1)) != 0) return rc;
-    if ((rc = h3_sdc_cmd52_read(1, ftaddr + 2, &b2)) != 0) return rc;
-    *val = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16);
+    if ((reg & 0x7FFFu) < 0x100) {
+        if ((rc = h3_sdc_cmd52_read(1, ftaddr, &b[0])) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_read(1, ftaddr + 1, &b[1])) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_read(1, ftaddr + 2, &b[2])) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_read(1, ftaddr + 3, &b[3])) != 0) return rc;
+    } else {
+        if ((rc = h3_sdc_cmd53_read_bytes(1, ftaddr, 4, b)) != 0) return rc;
+    }
+    *val = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16)
+         | ((uint32_t)b[3] << 24);
     return 0;
 }
 
-/* Чтение 16-бит регистра WLAN-функции (function 1) через CMD52. */
+/* Чтение 16-бит регистра WLAN-функции (function 1): CMD52 (<0x100) или
+   CMD53 byte-mode (>=0x100). */
 int h3_sdc_read_wlan_reg16(uint32_t reg, uint16_t *val)
 {
     uint32_t ftaddr = (8u << 13) | (reg & 0x7FFFu);
     uint8_t b0, b1;
     int rc;
-    if ((rc = h3_sdc_cmd52_read(1, ftaddr, &b0)) != 0) return rc;
-    if ((rc = h3_sdc_cmd52_read(1, ftaddr + 1, &b1)) != 0) return rc;
+    if ((reg & 0x7FFFu) < 0x100) {
+        if ((rc = h3_sdc_cmd52_read(1, ftaddr, &b0)) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_read(1, ftaddr + 1, &b1)) != 0) return rc;
+    } else {
+        uint8_t b[2];
+        if ((rc = h3_sdc_cmd53_read_bytes(1, ftaddr, 2, b)) != 0) return rc;
+        b0 = b[0]; b1 = b[1];
+    }
     *val = (uint16_t)(b0 | ((uint16_t)b1 << 8));
     return 0;
+}
+
+/* Запись 32-бит регистра WLAN-функции (function 1): CMD52 для reg<0x100
+   (4 байта, младший первым), CMD53 byte-mode для >=0x100 (sdio_write32). */
+int h3_sdc_write_wlan_reg32(uint32_t reg, uint32_t val)
+{
+    uint32_t ftaddr = (8u << 13) | (reg & 0x7FFFu);
+    uint8_t b[4];
+    int rc;
+    b[0] = (uint8_t)(val & 0xFF);
+    b[1] = (uint8_t)((val >> 8) & 0xFF);
+    b[2] = (uint8_t)((val >> 16) & 0xFF);
+    b[3] = (uint8_t)((val >> 24) & 0xFF);
+    if ((reg & 0x7FFFu) < 0x100) {
+        if ((rc = h3_sdc_cmd52_write(1, ftaddr,     b[0])) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_write(1, ftaddr + 1, b[1])) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_write(1, ftaddr + 2, b[2])) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_write(1, ftaddr + 3, b[3])) != 0) return rc;
+    } else {
+        if ((rc = h3_sdc_cmd53_write_bytes(1, ftaddr, 4, b)) != 0) return rc;
+    }
+    return 0;
+}
+
+/* Запись 16-бит регистра WLAN-функции (function 1): CMD52 (<0x100) или
+   CMD53 byte-mode (>=0x100). */
+int h3_sdc_write_wlan_reg16(uint32_t reg, uint16_t val)
+{
+    uint32_t ftaddr = (8u << 13) | (reg & 0x7FFFu);
+    int rc;
+    if ((reg & 0x7FFFu) < 0x100) {
+        if ((rc = h3_sdc_cmd52_write(1, ftaddr, (uint8_t)(val & 0xFF))) != 0) return rc;
+        if ((rc = h3_sdc_cmd52_write(1, ftaddr + 1, (uint8_t)((val >> 8) & 0xFF))) != 0) return rc;
+        return 0;
+    }
+    {
+        uint8_t b[2];
+        b[0] = (uint8_t)(val & 0xFF);
+        b[1] = (uint8_t)((val >> 8) & 0xFF);
+        return h3_sdc_cmd53_write_bytes(1, ftaddr, 2, b);
+    }
+}
+
+/* Запись 8-бит регистра WLAN-функции (function 1) через CMD52. */
+int h3_sdc_write_wlan_reg8(uint32_t reg, uint8_t val)
+{
+    if ((reg & 0x7FFFu) < 0x100)
+        return h3_sdc_cmd52_write(1, (8u << 13) | (reg & 0x7FFFu), val);
+    return h3_sdc_cmd53_write_bytes(1, (8u << 13) | (reg & 0x7FFFu), 1, &val);
+}
+
+int h3_sdc_read_wlan_reg8(uint32_t reg, uint8_t *val)
+{
+    if ((reg & 0x7FFFu) < 0x100)
+        return h3_sdc_cmd52_read(1, (8u << 13) | (reg & 0x7FFFu), val);
+    return h3_sdc_cmd53_read_bytes(1, (8u << 13) | (reg & 0x7FFFu), 1, val);
 }
 
 /* ---- Power-up sequence чипа RTL8189FTV (реализация rtl8188F_card_enable_flow) ----
@@ -523,6 +595,152 @@ int h3_wifi_efuse_read_mac(uint8_t mac[6])
         mac[byte_off] = v;
     }
     return 0;
+}
+
+/* ---- Доступ к RF-регистрам чипа (RF6052, LSSI Path A) ----
+ * Протокол 8188F (phy_RFSerialRead/Write_8188F, rtl8188f_phycfg.c):
+ *   запись: BB 0x840 = (rf_off << 20) | (data & 0xFFFFF);
+ *   чтение: BB 0x824 (rFPGA0_XA_HSSIParameter2) — адрес в [30:23] (<<23),
+ *     edge-триггер bit31 (снять -> поднять), пауза; readback из BB 0x8A0
+ *     (LSSI) или 0x8B8 (PI, если BB 0x820 bit8=1); значение & 0xFFFFF. */
+static void rf_write(uint8_t off, uint32_t data)
+{
+    h3_sdc_write_wlan_reg32(0x840, (((uint32_t)off & 0xFF) << 20) | (data & 0xFFFFF));
+}
+
+static uint32_t rf_read(uint8_t off)
+{
+    uint32_t t2 = 0, p1 = 0, rb = 0;
+
+    /* 1) адрес в 0x824 [30:23], edge снят (триггер чтения не активен). */
+    h3_sdc_read_wlan_reg32(0x824, &t2);
+    t2 = (t2 & ~0x7F800000u) | (((uint32_t)off & 0xFF) << 23);
+    h3_sdc_write_wlan_reg32(0x824, t2 & ~0x80000000u);
+    /* 2) повторить со снятым edge, затем поднять edge=1 (запуск LSSI-чтения). */
+    h3_sdc_read_wlan_reg32(0x824, &t2);
+    h3_sdc_write_wlan_reg32(0x824, t2 & ~0x80000000u);
+    h3_sdc_write_wlan_reg32(0x824, t2 | 0x80000000u);
+    udelay(100);
+    /* 3) readback: PI (0x8B8) или LSSI (0x8A0) по биту 8 в 0x820. */
+    h3_sdc_read_wlan_reg32(0x820, &p1);
+    if (p1 & (1u << 8))
+        h3_sdc_read_wlan_reg32(0x8B8, &rb);
+    else
+        h3_sdc_read_wlan_reg32(0x8A0, &rb);
+    return rb & 0xFFFFF;
+}
+
+/* ---- LCK: калибровка утечки гетеродина (phy_LCCalibrate_8188F, 1T1R path A) ----
+ * Последовательность из драйвера:
+ *  1) REG_TXPAUSE(0x522) = 0xFF — блокировать TX-очереди (чип не передаёт);
+ *  2) RF 0xB0 = 0xDFBF0 (LDO ON);
+ *  3) RF_CHNLBW (0x18) |= 0x08000 (бит 15 = LCK trigger);
+ *  4) пауза 100 мс (аппаратная калибровка);
+ *  5) RF 0xB0 = 0xDFFF0 (LDO OFF);
+ *  6) REG_TXPAUSE = 0x00 — снять блокировку. */
+void h3_wifi_rf_lck(void)
+{
+    uint32_t lc, ch;
+
+    uart_print("  lck: start\r\n");
+    /* 0) Включить BB/RF — как драйвер (PHY_BBConfig8188F + _DisableRFAFEAndResetBB):
+          a) SYS_FUNC_EN (0x02) 16-бит |= BIT13|BIT0|BIT1 (питание RF/BB);
+          b) сброс BB-машины: SYS_FUNC_EN байт0 = 0x16 (BB_RSTn=1), затем 0x14
+             (BB_GLB_RSTn=0 -> BB в сбросе);
+          c) REG_RF_CTRL (0x1F) = 0x07 (RF_EN|RF_RSTB|RF_SDMRSTB) и RF reg 1 =
+             0x780 (RF power-on) — ПОСЛЕ сброса BB (иначе сброс гасит RF);
+          d) SYS_FUNC_EN байт0 = 0x17 (BB из сброса);
+          e) REG_CR (0x100) = 0x63F;
+          f) загрузить полный BB-конфиг (bb_phy_reg[]) — настраивает RF-интерфейс
+             (0x840 LSSI mode, 0x860/0x864/0x870 SW control), без него LSSI
+             не доходит до RF (readback=0). */
+    {
+        uint16_t sf16 = 0;
+        uint8_t sf8 = 0;
+        h3_sdc_read_wlan_reg16(0x0002, &sf16);
+        uart_print("  lck: sf_pre=0x"); uart_print_hex(sf16); uart_print("\r\n");
+        h3_sdc_write_wlan_reg16(0x0002, (uint16_t)(sf16 | 0x2003u));  /* BIT13|BIT0|BIT1 */
+        udelay(50);
+        h3_sdc_write_wlan_reg8(0x02, 0x16);       /* BB: глобальный RSTn снят */
+        udelay(50);
+        h3_sdc_write_wlan_reg8(0x02, 0x14);       /* BB в сбросе */
+        udelay(50);
+        h3_sdc_write_wlan_reg8(0x1F, 0x07);       /* REG_RF_CTRL: RF_EN|RF_RSTB|RF_SDMRSTB */
+        udelay(100);
+        rf_write(0x01, 0x780);                    /* RF reg 1: RF power on (после сброса!) */
+        udelay(100);
+        h3_sdc_write_wlan_reg8(0x02, 0x17);       /* BB из сброса (младший байт) */
+        udelay(100);
+        h3_sdc_read_wlan_reg8(0x02, &sf8);
+        uart_print("  lck: sf8=0x"); uart_print_hex(sf8); uart_print("\r\n");
+        h3_sdc_write_wlan_reg32(0x0100, 0x0000063Fu);
+        udelay(100);
+        {
+            unsigned int k2;
+            for (k2 = 0; k2 < sizeof(bb_phy_reg)/sizeof(bb_phy_reg[0]); k2 += 2)
+                h3_sdc_write_wlan_reg32(bb_phy_reg[k2], bb_phy_reg[k2+1]);
+            udelay(100);
+            uart_print("  lck: bb_config loaded (");
+            uart_print_int((int)(sizeof(bb_phy_reg)/sizeof(bb_phy_reg[0])/2));
+            uart_print(" regs)\r\n");
+        }
+    }
+    /* Проверка живости BB/RF (0xE30 rTx_IQK_Tone_A пишем и читаем; RF 0x18
+       через LSSI — должен вернуть не 0). */
+    {
+        uint32_t tst = 0;
+        h3_sdc_write_wlan_reg32(0x0E30, 0x18008C1Cu);
+        udelay(10);
+        h3_sdc_read_wlan_reg32(0x0E30, &tst);
+        uart_print("  lck: bb_tone=0x");
+        uart_print_hex(tst);
+        uart_print(" rf18=0x");
+        uart_print_hex(rf_read(0x18));
+        uart_print("\r\n");
+    }
+    /* 1) блокировать TX. */
+    h3_sdc_write_wlan_reg8(0x0522, 0xFF);
+    /* 2) Выставить канал 1 (2412 МГц) в RF_CHNLBW[7:0] — LCK калибрует
+          утечку гетеродина на текущей частоте; канал 0 = «ничто». */
+    ch = rf_read(0x18);
+    uart_print("  lck: chnlbw_pre=0x");
+    uart_print_hex(ch);
+    uart_print("\r\n");
+    ch = (ch & ~0xFFu) | 0x01u;          /* канал 1 */
+    rf_write(0x18, ch);
+    udelay(100);
+    /* Лог после установки канала (ожидаем биты [7:0]=1). */
+    ch = rf_read(0x18);
+    uart_print("  lck: chnlbw_set=0x");
+    uart_print_hex(ch);
+    uart_print("\r\n");
+    /* 3) LDO ON. */
+    rf_write(0xB0, 0xDFBF0);
+    /* 4) триггер LCK: bit15 = 1. */
+    lc = rf_read(0x18);
+    rf_write(0x18, lc | 0x08000);
+    uart_print("  lck: chnlbw_trig=0x");
+    uart_print_hex(lc | 0x08000);
+    uart_print("\r\n");
+    /* 5) ждать калибровку (100 мс) и сброс bit15. */
+    udelay(100000);
+    lc = rf_read(0x18);
+    uart_print("  lck: chnlbw_done=0x");
+    uart_print_hex(lc);
+    uart_print("\r\n");
+    /* 6) LDO OFF. */
+    rf_write(0xB0, 0xDFFF0);
+    /* 7) Восстановить канал: LCK затирает биты [7:0]. */
+    lc = rf_read(0x18);
+    rf_write(0x18, (lc & ~0xFFu) | 0x01u);
+    udelay(100);
+    lc = rf_read(0x18);
+    uart_print("  lck: chnlbw_restored=0x");
+    uart_print_hex(lc);
+    uart_print("\r\n");
+    /* 8) снять блокировку TX. */
+    h3_sdc_write_wlan_reg8(0x0522, 0x00);
+    uart_print("  lck: done\r\n");
 }
 
 /* ---- Загрузка прошивки чипа RTL8189FTV (реализация rtl8188f_FirmwareDownload) ----
@@ -1076,7 +1294,7 @@ int h3_sdio_read_chip_id(uint16_t *manf_id, uint16_t *card_id)
  *    0b00 = 1-bit, 0b01 = 4-bit, 0b10 = 8-bit (Linux mmc/sdio.c).
  * 2) Аппаратно: SDC_CTYPE (0x0C) = 1 — шина 4-bit.
  *
- * В рабочей цепочке W.116 4-bit не используется: перед загрузкой прошивки
+ * В рабочей цепочке (W.136) 4-bit не используется: перед загрузкой прошивки
  * шина принудительно ставится в 1-bit (h3_wifi_download_fw).
  * Возвращает 0 при успехе; не-0 — ошибка. */
 int h3_sdio_set_bus_width(int four_bit)

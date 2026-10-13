@@ -211,6 +211,16 @@ int h3_sdc_read_wlan_reg32(uint32_t reg, uint32_t *val);
    Аналогично read_wlan_reg32, но возвращает 2 байта. */
 int h3_sdc_read_wlan_reg16(uint32_t reg, uint16_t *val);
 
+/* Запись регистра WLAN-функции (function 1): 32/16/8-бит, CMD52 для offset<0x100,
+   CMD53 byte-mode для >=0x100 (как sdio_writeN драйвера). */
+int h3_sdc_write_wlan_reg32(uint32_t reg, uint32_t val);
+int h3_sdc_write_wlan_reg16(uint32_t reg, uint16_t val);
+int h3_sdc_write_wlan_reg8(uint32_t reg, uint8_t val);
+
+/* Чтение 8-бит регистра WLAN-функции (function 1): CMD52 для reg<0x100,
+   CMD53 byte-mode для >=0x100. */
+int h3_sdc_read_wlan_reg8(uint32_t reg, uint8_t *val);
+
 /* Специфичная для чипа последовательность включения (power-on) RTL8189FTV:
    переводит карту из CARDEMU в ACTIVE перед загрузкой прошивки. Использует
    CMD52 к function 1. Возвращает 0 при успехе, не-0 — ошибка (см. коды). */
@@ -224,6 +234,10 @@ int h3_wifi_download_fw(const void *fw, uint32_t size);
 /* Прочитать заводской MAC из eFuse чипа (адрес 0x11A, 6 байт).
    Возвращает 0 при успехе (mac заполнен), -1 при недоступности eFuse. */
 int h3_wifi_efuse_read_mac(uint8_t mac[6]);
+
+/* RF-калибровка LCK (утечка гетеродина), path A (1T1R).
+   Порт phy_LCCalibrate_8188F. Вызывать после загрузки FW, до работы радио. */
+void h3_wifi_rf_lck(void);
 
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080

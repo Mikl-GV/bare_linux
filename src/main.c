@@ -446,6 +446,12 @@ void kmain(void)
                         uart_print("\r\n");
                     }
                 }
+
+                /* Этап 1: RF-калибровка LCK (утечка гетеродина, path A).
+                   После загрузки FW и установки MAC. Пока только LCK
+                   (IQK — следующим этапом). */
+                h3_wifi_rf_lck();
+
                 uart_print("\r\n");
             }
         }

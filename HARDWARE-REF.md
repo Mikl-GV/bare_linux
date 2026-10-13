@@ -103,7 +103,7 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 - **SDC1 на PG0-PG5** (function 2): PG0=CLK, PG1=CMD, PG2=D0, PG3=D1, PG4=D2, PG5=D3.
   Настройка: `PORTG CFG0 [15:0] = 0x2222`, `CFG1 [7:0] = 0x22` (код в h3_sdc1_init).
 
-### SDIO-протокол (проверено на стенде, рабочая точка W.118)
+### SDIO-протокол (проверено на стенде, рабочая точка W.136)
 
 - Порядок инициализации чипа (строго, подтверждён на стенде):
   `CMD5 (ждём C=1) → CMD3 (RCA) → CMD7 (select) → CMD52 вкл. Fn1 (CCCR 0x02) →
@@ -121,6 +121,27 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 - MAC: eFuse по 0x11A на Orange Pi Lite пуст (FF) → задаётся программно
   (локально-администрируемый 02:00:00:XX:XX:XX) в REG_MACID 0x610-0x615
   через CMD53 без инкремента (0x610 len=4, 0x614 len=2).
+
+### RF-доступ и калибровка (W.136, работает)
+
+- **LSSI-запись RF** (Path A): BB 0x840 = `(rf_off << 20) | (data & 0xFFFFF)`.
+- **LSSI-чтение RF**: BB 0x824 (`rFPGA0_XA_HSSIParameter2`) — адрес в [30:23]
+  (сдвиг 23, НЕ 20), edge-триггер bit31 (записать со снятым → поднятым edge),
+  пауза ~100 мкс, readback из BB **0x8A0** (LSSI) или 0x8B8 (PI, если bit8 в
+  0x820=1); значение = readback & 0xFFFFF.
+- **ВАЖНО**: LSSI работает только после загрузки полного BB-конфига
+  (`bb_phy_reg[]` из `halhwimg8188f_bb.c`, 209 записей) — он настраивает
+  RF-интерфейс (0x840 LSSI mode, 0x860/0x864/0x870 SW control). Без него
+  readback = 0.
+- **Включение BB/RF** (PHY_BBConfig8188F): SYS_FUNC_EN(0x02) |= BIT13|BIT0|BIT1
+  → сброс BB (байт0=0x16 → 0x14) → REG_RF_CTRL(0x1F)=0x07 (RF_EN|RF_RSTB|
+  RF_SDMRSTB) → RF reg 1 = 0x780 (power-on, ПОСЛЕ сброса!) → SYS_FUNC_EN=0x17
+  → REG_CR(0x100)=0x63F → BB-конфиг.
+- **LCK** (`h3_wifi_rf_lck`, по phy_LCCalibrate_8188F): TXPAUSE(0x522)=0xFF →
+  RF reg 0xB0=0xDFBF0 (LDO ON) → канал 1 в RF_CHNLBW(0x18)[7:0] →
+  RF_CHNLBW |= 0x8000 (бит 15 trigger) → 100 мс → RF 0xB0=0xDFFF0 (LDO OFF) →
+  TXPAUSE=0x00. Бит 15 после LCK может остаться 1 — норма для 8188F.
+- RF_CHNLBW дефолт 0x400 (бит 10 = полоса 20/40М), канал в [7:0].
 
 ### Важные особенности (из отладки)
 
