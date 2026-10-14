@@ -147,3 +147,26 @@ rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0 <- ни одного пакета даже �
 pkt=0). Блокер — не регистры хоста, а отсутствие реакции 8051 (не в рабочем
 цикле RX) либо физическая чувствительность (IQK не сходится). Следующие шаги —
 NEXT-CHAT-PROMPT.md.
+
+## Снимок W.181 (финал хост-стороны RX)
+
+```
+rx: mcu=0xC6 (fw_rdy=1 rst=0)      <- 8051 исполняет FW (WINTINI_RDY=1)
+rx: rpwm=0x00 cpwm=0x00 (active=1) <- FW подтвердила активный режим
+rx: h2c_pwrmode 1cc=0x0            <- H2C 0x20 SET_PWR_MODE принят (box0 0x1D0)
+rx: fbr=0x07 cccr_set=0x01         <- FBR INT_EN + CCCR IENM включены
+rx: rf18=0x401                     <- канал (свип: 0x201/0x206/0x20B как SwChnl)
+rx: rfmod=0x83075700               <- CCK/OFDM-блоки ON (было 0x83045700)
+rx: cr=0x000207FF (bit17/8/9=1)    <- NETTYPE_AP + MACTXEN + MACRXEN
+rx: rxpk=0x02000000 (bit25=1)      <- BIT25 (значение TBD); RW_RELEASE=0
+rx: himr_lo=0x07 hi=0x03           <- RX_REQUEST|AVAL|TXERR + C2HCMD
+rx: rcr=0x7000200F                 <- CBSSID_BCN(bit7) снят; AB(bit3) сохранён
+rx: c2h_evt=0x0 hisr=0x0           <- 8051 не генерирует события
+rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0<- ни одного декодированного кадра
+```
+
+**Вывод W.181**: хост-сторона 1:1 по драйверу (все шаги W.174→W.181: H2C 0x20,
+CCCR/FBR, RPWM active, RFMOD CCK/OFDM, RCR ~CBSSID_BCN, каналы SwChnl 0x201),
+но RX событий нет. 8051 жива, но физически не декодирует эфир. Блокер — в
+RF-приёмном тракте/калибровке (fifopg=0, rxpk bit25, TX-power/AGC не выставлен).
+Следующие шаги — NEXT-CHAT-PROMPT.md Шаг D.

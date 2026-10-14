@@ -19,7 +19,7 @@
 - Состояние:
   - **Звук:** готов и работает (FEL и SD) на DMA (H3 не кэш-когерентен — нужен
     clean D-cache перед стартом DMA; см. H3-BAREMETAL-GUIDE.md §5).
-  - **WiFi (рабочая точка W.171):** SDC1-драйвер, SDIO CMD52/CMD53, чтение CIS-ID
+  - **WiFi (рабочая точка W.181):** SDC1-драйвер, SDIO CMD52/CMD53, чтение CIS-ID
     (manf=0x024C, card=0xF179 — RTL8189FTV), PowerSeq CARDEMU→ACTIVE, загрузка
     прошивки (fwdl rc=0, **MCUFWDL=0xC6 = все 4 бита маски драйвера
     MCUFWDL_RDY|FWDL_ChkSum_rpt|WINTINI_RDY|RAM_DL_SEL — 8051 загружена и
@@ -29,16 +29,24 @@
     BB 0x824+edge → 0x8A0, канал читается/пишется). Ключевое: для LSSI обязателен
     полный BB-конфиг (bb_phy_reg[] из halhwimg8188f_bb.c). Подробности в
     HARDWARE-REF.md и H3-BAREMETAL-GUIDE.md §9.
-    **RX-путь**: собрана полная RX-инициализация по драйверу
+    **RX-путь (сессия W.171→W.181)**: полная инициализация по драйверу
     (LLT → TX-границы → rxff_bndy=0x3EFF → PBP → DRVINFO_SZ=4 → NETTYPE_AP →
     RCR/RXFLTMAP/MAR → RXDMA agg → REG_CR bit8/9 MACRXEN/MACTXEN → HIMR
-    32-бит вкл. C2HCMD → RW_RELEASE=0) и диагностика (RX0_REQ_LEN 0x1C,
-    RXPKT_NUM 0x287, C2H_EVT 0x01A0, HISR 0x18). **Симптом W.171**: при всей
-    конфигурации rxlen=0/pkt=0/hisr=0/c2h=0 — 8051 не генерирует события.
-    Движок IQK не сходится (0x142/0x42 — насыщение, маркеры сбоя из драйвера)
-    при любых константах/5-и retry/H2C/8051-off — вероятно, без полного
-    драйверного окружения (LPS-exit → rf_on → полный RF-конфиг) или FW
-    не в рабочем цикле (нет C2H). Следующий шаг — см. NEXT-CHAT-PROMPT.md.
+    32-бит вкл. C2HCMD → RW_RELEASE=0). В этой сессии добавлено:
+    **H2C SET_PWR_MODE=0x20 (FW в активный режим AllON, box0 0x1D0+EX 0x1F0!),
+    CCCR IENM (0x04), FBR INT_EN (0x100), RPWM=0x00→CPWM=0x00 (active=1),
+    RCR_BCN: снять RCR_CBSSID_BCN (bit7) для приёма beacon любой BSSID,
+    RFMOD|=BIT16|BIT17 (CCK/OFDM блоки ON), каналы по драйверу
+    SwChnl маска 0x3FF → 0x201/0x206/0x20B**.
+    **Симптом W.181 (ФИНАЛ хост-стороны)**: при 1:1 драйверной конфигурации
+    rxlen=0/pkt=0/hisr=0/c2h=0/rxpk_bt25=1/fifopg=0 даже у роутера в 10 см.
+    Проверено: H2C SCAN_ENABLE/MEDIA_STATUS/JOINBSSRPT в этом драйвере НЕ
+    используются (grep по .c — 0 вызовов); PHY_SwChnl идёт прямыми RF-записями
+    (не H2C); firmware-бинарник 0x4972 верен (сигнатура F1 88, заголовок 32 б);
+    8051 исполняет код (WINTINI_RDY). **Вывод**: хост-сторона исчерпана;
+    блокер — физический приёмный тракт (RF-усиление/конфиг/калибровка) —
+    см. NEXT-CHAT-PROMPT.md (Шаг D: RF RX-power/усиление, fifopg 0x0200,
+    rxpk бит25, probe request/TX-тест).
 
 ---
 

@@ -168,6 +168,37 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 11. **RW_RELEASE_EN**: `0x287 &= ~BIT18` (release RX DMA; BIT18=1 — пауза DMA).
 12. **Канал**: RF_CHNLBW(0x18) = 0x401 (канал 1, BW 20М; НЕ 0x8C01 — там бит 15=rежим калибровки).
 
+### Уточнения W.181 (сессия W.174→W.181, добавлено к RX)
+
+- **H2C SET_PWR_MODE (0x20)** — перевод FW в активный режим:
+  `rtl8188f_set_FwPwrMode_cmd(psmode=0)`: payload 6 байт — [0]MODE=0, [1]rlbm(2),
+  [2]awake_intvl(4), [3]uapsd=0, [4]PowerState=0x0C (AllON), [5]byte5=0x40.
+  **Формат FillH2CCmd8188F**: CmdLen>3 — первые 3 байта в box0 `0x1D0` (с id),
+  остальные в **EX-box `0x1F0`** (REG_HMEBOX_EXT0). НЕ писать в 0x1D4/0x1D6!
+- **CCCR IENM**: `0x04` (fn0) |= BIT0 — глобальное разрешение SDIO-прерываний
+  (было 0; без него 8051 не поднимает HISR-линию). **FBR INT_EN**: `0x100` (fn0)
+  |= BIT0 — прерывания функции 1.
+- **RPWM→CPWM active**: записать `HRPWM1 (0x0080, fn0) = 0x00` (запрос active),
+  поллить `CPWM (0x0038, fn0) == 0x00` — FW подтверждает (active=1 в W.177+).
+  0xC0 в RPWM — это запрос LPS/сна, для active надо 0x00.
+- **RCR для скана**: снять `RCR_CBSSID_BCN (BIT7)` — принимаем beacon любой
+  BSSID (wireless сканирование). `0x7000200F` = AAP(0)|APM(1)|AM(2)|AB(3) +
+  APP_PHYST_RXFF(28)|APP_ICV(29)|APP_MIC(30). Бит 3 (AB) СОХРАНЁН (0x0F),
+  снят только bit7.
+- **BBTurnOnBlock**: `RFMOD (0x800) |= BIT16 (bCCKEn) | BIT17 (bOFDMEn)` — в
+  BB-конфиге RFMOD=0x83045700 (биты 16/17 сброшены; без них CCK/OFDM-блоки
+  выключены, приёмник не декодирует эфир). После: 0x83075700.
+- **Канал в РАБОТЕ**: `phy_SwChnl8188F` пишет RF_CHNLBW **маской 0x3FF** —
+  реальное значение = RfRegChnlVal & 0x3FF = `0x201/0x206/0x20B` (каналы 1/6/11),
+  а НЕ 0x8C01 (там старшие биты от LCK, работой отсекаются).
+- **H2C SCAN_ENABLE (0x02) / MEDIA_STATUS_RPT (0x01) / JOINBSSRPT**: в rtl8189fs
+  определены в заголовке, но **нигде в .c не вызываются** (grep=0) — скан в этом
+  драйвере идёт без них (только регистры + H2C 0x20).
+- **Симптом**: вся конфигурация 1:1 по драйверу, но rxlen=0/pkt=0/hisr=0/c2h=0,
+  rxpk BIT25=1, fifopg=0 — 8051 исполняет FW (WINTINI_RDY=1), но физически не
+  декодирует кадры. Хост-сторона исчерпана → блокер в RF-приёмном тракте
+  (усиление/калибровка) или FIFOPAGE 0x0200. См. NEXT-CHAT-PROMPT.md Шаг D.
+
 ### Индикаторы RX (диагностика W.171)
 
 - **RX0_REQ_LEN**: `0x1C` (fn0) — длина ожидающего RX-запроса (16-бит); >0 = данные в FIFO.

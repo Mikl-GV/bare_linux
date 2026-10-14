@@ -1206,25 +1206,87 @@ void h3_wifi_rf_rx_test(void)
         uart_print(")\r\n");
         /* CPWM текущий (toggle). */
         h3_sdc_cmd52_read(0, 0x0038, &cpwm_orig);
-        /* set rpwm: toggle bit7 + PS_STATE bit6. */
-        h3_sdc_cmd52_read(0, 0x0080, &rpwm);
-        rpwm = (uint8_t)((rpwm & 0x80) + 0x80);
-        rpwm |= 0x40;
-        h3_sdc_cmd52_write(0, 0x0080, rpwm);
+        /* set rpwm: гипотеза — 0xC0 это запрос LPS/сна, а для ACTIVE
+           надо 0x00 (request active); ждём CPWM=0x00 от 8051. */
+        h3_sdc_cmd52_write(0, 0x0080, 0x00);
         uart_print("  rx: rpwm=0x");
-        uart_print_hex((uint32_t)rpwm);
+        uart_print_hex((uint32_t)0x00);
         uart_print("\r\n");
-        /* Поллим CPWM: смена bit7 (toggle) = FW проснулась. */
+        /* Поллим CPWM: ждём значение 0x00 (8051 в активном режиме). */
         wt = 0;
         do {
             udelay(1000);
             h3_sdc_cmd52_read(0, 0x0038, &cpwm_now);
-        } while (((cpwm_orig ^ cpwm_now) & 0x80) == 0 && (++wt < 100));
+        } while ((cpwm_now != 0x00u) && (++wt < 100));
         uart_print("  rx: cpwm=0x");
         uart_print_hex((uint32_t)cpwm_now);
-        uart_print(" (wake=");
-        uart_print_int((int)(((cpwm_orig ^ cpwm_now) & 0x80) ? 1 : 0));
+        uart_print(" (active=");
+        uart_print_int((int)((cpwm_now == 0x00u) ? 1 : 0));
         uart_print(")\r\n");
+    }
+
+    /* 0b) H2C SET_PWR_MODE = ACTIVE (rtl8188f_set_FwPwrMode_cmd, psmode=0):
+         перевести FW в активный режим приёма (PS_STATE=AllON). Без этого
+         8051 может остаться в power-save и не слушать эфир. Формат (6 байт):
+           [0]=MODE=0, [1]=rlbm(2)<<0|smart_ps(0)<<4=0x02, [2]=awake_intvl=4,
+           [3]=all_queue_uapsd=0, [4]=PWR_STATE=0x0C (AllON), [5]=byte5=0x40.
+         H2C id = 0x20 (H2C_8188F_SET_PWR_MODE), CmdLen=6, box0 (0x1D0). */
+    {
+        uint8_t hb = 0;
+        uint32_t h2c = 0, h2c_ex = 0;
+        /* Формат FillH2CCmd8188F: CmdLen<=3 -> box0; CmdLen>3 ->
+           первые 3 байта payload в box0 (0x1D0) с id, остальные — в
+           EX-box REG_HMEBOX_EXT0 (0x1F0). 6-байт: box0={id,0,2,4},
+           ex={0x0C,0x40}. */
+        h2c = 0x20u;                /* [0]=id 0x20 */
+        h2c |= 0x00u << 8;          /* [1]=MODE=0 */
+        h2c |= 0x02u << 16;         /* [2]=rlbm(2) */
+        h2c |= 0x04u << 24;         /* [3]=awake_intvl=4 */
+        h2c_ex = 0x00u;             /* byte4=all_queue_uapsd=0 */
+        h2c_ex |= 0x0Cu << 8;       /* byte5=PowerState AllON */
+        h2c_ex |= 0x40u << 16;      /* byte6=byte5 0x40 */
+        h3_sdc_write_wlan_reg8(0x01CC, 0x00);          /* HMETFR clear */
+        h3_sdc_write_wlan_reg32(0x01F0, h2c_ex);       /* EX-box: b4..b6 */
+        h3_sdc_write_wlan_reg32(0x01D0, h2c);          /* box0: id+b1..b3 */
+        {
+            unsigned int t2 = 0;
+            do {
+                udelay(1000);
+                h3_sdc_read_wlan_reg8(0x01CC, &hb);   /* HMETFR: FW забрала */
+            } while ((hb & 0x01u) && (++t2 < 100));
+            uart_print("  rx: h2c_pwrmode 1cc=0x");
+            uart_print_hex((uint32_t)hb);
+            uart_print("\r\n");
+        }
+        udelay(5000);
+    }
+
+    /* 0c) SDIO Interrupt Enable (гипотеза отладочной сессии):
+         FBR (fn0, 0x100) bit0 = INT_EN (прерывания функции 1) и
+         CCCR (fn0, 0x04) bit0 = IENM (общее разрешение прерываний).
+         Без них 8051 может не генерировать HISR/выкладывать RX. */
+    {
+        uint8_t fbr = 0, ioc = 0;
+        h3_sdc_cmd52_read(0, 0x0100, &fbr);
+        h3_sdc_cmd52_read(0, 0x0004, &ioc);
+        uart_print("  rx: fbr=0x");
+        uart_print_hex((uint32_t)fbr);
+        uart_print(" cccr=0x");
+        uart_print_hex((uint32_t)ioc);
+        uart_print(" (fbr_inten=");
+        uart_print_int((int)(fbr & 1));
+        uart_print(" cccr_ienm=");
+        uart_print_int((int)(ioc & 1));
+        uart_print(")\r\n");
+        h3_sdc_cmd52_write(0, 0x0100, (uint8_t)(fbr | 0x01));  /* INT_EN fn1 */
+        h3_sdc_cmd52_write(0, 0x0004, (uint8_t)(ioc | 0x01));  /* IENM */
+        h3_sdc_cmd52_read(0, 0x0100, &fbr);
+        h3_sdc_cmd52_read(0, 0x0004, &ioc);
+        uart_print("  rx: fbr_set=0x");
+        uart_print_hex((uint32_t)fbr);
+        uart_print(" cccr_set=0x");
+        uart_print_hex((uint32_t)ioc);
+        uart_print("\r\n");
     }
 
     /* 1) Канал 1 / 20 МГц: 0x401 (как после LCK), НЕ 0x8C01 (bit15!). */
@@ -1232,6 +1294,18 @@ void h3_wifi_rf_rx_test(void)
     udelay(100);
     uart_print("  rx: rf18=0x");
     uart_print_hex(rf_read(0x18));
+    uart_print("\r\n");
+
+    /* 1b) _BBTurnOnBlock (sdio_halinit.c:832-840): включить CCK и OFDM
+         блоки BB — rFPGA0_RFMOD (0x800) |= bCCKEn(BIT16) | bOFDMEn(BIT17).
+         В BB-таблице RFMOD=0x83045700 — биты 16/17 СБРОШЕНЫ, т.е. без
+         этого приёмник физически не декодирует эфир. */
+    h3_sdc_read_wlan_reg32(0x0800, &d);
+    d |= (1u << 16) | (1u << 17);
+    h3_sdc_write_wlan_reg32(0x0800, d);
+    h3_sdc_read_wlan_reg32(0x0800, &d);
+    uart_print("  rx: rfmod=0x");
+    uart_print_hex(d);
     uart_print("\r\n");
 
     /* 2) LLT + границы FIFO (rtl8188f_InitLLTTable, _InitPageBoundary):
@@ -1274,9 +1348,11 @@ void h3_wifi_rf_rx_test(void)
     uart_print("\r\n");
 
     /* 3) RCR (0x0608): APP_PHYST_RXFF|APP_ICV|APP_MIC (уже в 0x7000208E)
-       + AAP (бит 0) — принимать все физические пакеты (для скана);
-       RRSR (0x0440), RXFLTMAP, MAR — приём mgmt/broadcast. */
-    h3_sdc_write_wlan_reg32(0x0608, 0x7000208Fu);   /* + AAP */
+       + AAP (bit0). ВАЖНО: снять CBSSID_BCN (bit7) — как драйвер в
+       hw_var_set_mlme_sitesurvey для скана: иначе чип принимает beacon
+       только совпадающей BSSID и отбрасывает beacon'ы роутеров (наш
+       тест слушает эфир). RRSR (0x0440), RXFLTMAP, MAR — приём mgmt/bcast. */
+    h3_sdc_write_wlan_reg32(0x0608, 0x7000200Fu);   /* ~CBSSID_BCN(bit7) */
     /* RRSR (0x0440): базовые скорости. */
     h3_sdc_write_wlan_reg32(0x0440, 0x00000F0Fu);
     /* RXFLTMAP: все типы кадров. */
@@ -1426,10 +1502,13 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
     for (t = 0; t < 12; t++) {
         uint32_t ch;
         uint16_t rxlen = 0;
-        /* Канал в [7:0], BW в [11:8]=0x4: 1=0x401, 6=0x406, 11=0x40B. */
-        if (t < 4)      ch = 0x401u;
-        else if (t < 8) ch = 0x406u;
-        else            ch = 0x40Bu;
+        /* Канал в [7:0] + BW-бит 9; в РАБОТЕ драйвер пишет маской 0x3FF
+           (phy_SwChnl8188F:1361), т.е. RfRegChnlVal[ch1]=0x201 (не 0x8C01 —
+           там bit17/bit15 от LCK, маской 0x3FF отсекаются). 1=0x201,
+           6=0x206, 11=0x20B. */
+        if (t < 4)      ch = 0x201u;
+        else if (t < 8) ch = 0x206u;
+        else            ch = 0x20Bu;
         rf_write(0x18, ch);
         udelay(50000);   /* 50 мс на перестройку синтезатора */
         udelay(150000);  /* 150 мс слушаем */
