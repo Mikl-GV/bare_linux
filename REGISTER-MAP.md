@@ -2,7 +2,7 @@
 
 > Снимки значений, проверенные на стенде (FEL-загрузка, наша прошивка).
 > Это рабочий справочник для отладки; подробные выводы — в H3-BAREMETAL-GUIDE.md
-> и KNOWLEDGE.md. Ревизия: 2026-10-13 (этап WiFi, рабочая точка W.136).
+> и KNOWLEDGE.md. Ревизия: 2026-10-14 (этап WiFi, рабочая точка W.210).
 
 ## I2S0 (0x01C22000) — эталон (работает)
 
@@ -167,6 +167,42 @@ rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0<- ни одного декодированн
 
 **Вывод W.181**: хост-сторона 1:1 по драйверу (все шаги W.174→W.181: H2C 0x20,
 CCCR/FBR, RPWM active, RFMOD CCK/OFDM, RCR ~CBSSID_BCN, каналы SwChnl 0x201),
-но RX событий нет. 8051 жива, но физически не декодирует эфир. Блокер — в
-RF-приёмном тракте/калибровке (fifopg=0, rxpk bit25, TX-power/AGC не выставлен).
-Следующие шаги — NEXT-CHAT-PROMPT.md Шаг D.
+FW жива и читает H2C, но RX-событий нет. Блокер — физический приёмный тракт.
+
+## Снимок W.210 (точка восстановления — RF-тракт исчерпан)
+
+Ключевые регистры после полной инициализации (W.191→W.210):
+
+```
+# LCK (W.191: RF-таблица до LCK с пропуском 0x18, чистый канал)
+lck: rf_tab loaded (136 regs)  rfread df=0x100 56=0x51CF0 30=0x10000 ...
+lck: rf18_after_tab=0x401  chnlbw_set=0x401  done in 70 ms
+lck: rf00_restored=0x33D95   <- из RF-таблицы (не 0x30000!)
+
+# IQK (W.208-W.210: PI-режим + MAC-настройки, но 0x142/0x42 стабильно)
+iqk: pi_on 860=0x01000100 868=0x01000100   <- PI-режим RF-интерфейса
+iqk: mac_cal set            <- TXPAUSE=0x3F, BCN_CTRL 0x550/0x551 &=~BIT3, 0x40 &=~BIT5
+iqk: rf30=0x20000 rf31=0xF rf32=0x7FF7 rfdf=0x900 rf56=0x5102A rfEF=0x80000
+iqk: tx e94=0x01420000 e9c=0x00420000 eac=0x04002000 <- FAIL (0x142/0x42)
+
+# RX-конфигурация (W.197/W.203/W.205/W.207)
+rx: rfmod=0x83045700        <- RFC MOD: bCCKEn(24)|bOFDMEn(25) ON
+rx: rqpn=0x00E0020C          <- REG_RQPN (0x200): HPQ 0x0C|LPQ 0x02<<8|PUBQ 0xE0<<16
+rx: llt=0x2020  rx_bndy=0x3EFF
+rx: bwop=0x04                <- REG_BWOPMODE (0x603): BW_OPMODE_20MHZ
+rx: cr=0x000207FF (macrx_en=1 mactx_en=1)  <- MACTXEN=6, MACRXEN=7
+rx: rxdma_mode=0x0E agg_th=0x010F  <- RXDMA_MODE_CTRL (0x290), AGG_PG_TH (0x280)
+rx: rcr=0x7000604E rrsr=0xFFF mar=0xFFFFFFFF
+rx: fifopg=0x00E0020C        <- readback RQPN (0x200)
+
+# Свип — FW не приняла НИ ОДНОГО пакета
+rx: t=0..11 ch=1/6/11 rxlen=0 rxpkt=0x00020000 (RXDMA_IDLE) pkt=0
+rx: c2h_evt=0 hisr=0
+```
+
+**Вывод W.210**: BB/RF/MAC полностью 1:1 с драйвером (209+66+136 регистров,
+LCK 70 мс, RQPN, BWOPMODE, агрегация, RCR, H2C active), IQK-обвязка по эталону
+(PI+MAC+RF+BB), но FW не приняла ни одного пакета (счётчик RXPKT_NUM [15:0]=0).
+Блокер — физический приёмный тракт (сигнал не доходит до демодулятора) либо
+требуется эталонный лог с Linux-драйвера. Далее: NEXT-CHAT-PROMPT.md Шаг D
+(probe request, физика, эталонный лог).

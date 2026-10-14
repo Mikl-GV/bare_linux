@@ -631,17 +631,22 @@ static uint32_t rf_read(uint8_t off)
 }
 
 /* ---- LCK: калибровка утечки гетеродина (phy_LCCalibrate_8188F, 1T1R path A) ----
- * Последовательность из драйвера:
+ * Полная последовательность (W.191+):
+ *  0) BB/PLL: BB-конфиг (bb_phy_reg, 209), AGC-таблица (bb_agc_tab, 66),
+ *     RF-таблица RadioA (rf_radioa, 136 пар С ПРОПУСКОМ записи 0x18 —
+ *     таблица ставит 0xFC07, что ломает LCK-триггер), затем RF 0x18 = 0x401;
  *  1) REG_TXPAUSE(0x522) = 0xFF — блокировать TX-очереди (чип не передаёт);
  *  2) RF 0xB0 = 0xDFBF0 (LDO ON);
  *  3) RF 0x00 = 0 — перевести RF в LCK-режим (как в драйвере перед триггером);
  *  4) RF_CHNLBW (0x18) |= 0x08000 (бит 15 = LCK trigger);
  *  5) опрос: ждать сброса bit15 (LCK завершён), таймаут ~1 с (100 x 10 мс);
  *  6) RF 0xB0 = 0xDFFF0 (LDO OFF);
- *  7) восстановить канал в RF_CHNLBW[7:0];
- *  8) восстановить RF 0x00 = 0x30000 (штатный дефолт; LCK оставил его 0,
- *     что ломает тракт и заставляет IQK выдавать маркеры сбоя 0x142/0x42);
- *  9) REG_TXPAUSE = 0x00 — снять блокировку. */
+ *  7) восстановить канал: RF 0x18 = 0x401 (явно, с очисткой бит [15:8]);
+ *  8) восстановить RF 0x00 = 0x33D95 (последняя запись RF-таблицы,
+ *     ant-switch; НЕ 0x30000 — дефолт ломает тракт, заданный таблицей);
+ *  9) REG_TXPAUSE = 0x00 — снять блокировку.
+ * После LCK RF-таблица ОСТАЁТСЯ загруженной (чип не сбрасывается между
+ * фазами), поэтому IQK и RX-тест НЕ перезагружают её повторно. */
 void h3_wifi_rf_lck(void)
 {
     uint32_t lc, ch;
@@ -688,6 +693,79 @@ void h3_wifi_rf_lck(void)
             uart_print_int((int)(sizeof(bb_phy_reg)/sizeof(bb_phy_reg[0])/2));
             uart_print(" regs)\r\n");
         }
+        /* f2) AGC_TAB — RSSI-таблица приёмного тракта. Драйвер грузит её
+           ОТДЕЛЬНО после PHY_REG (phy_BB8188f_Config_ParaFile: шаг 2 —
+           "Read BB AGC table Initialization"). Без неё 0xC78/0xC50 остаются
+           в дефолтных значениях из PHY_REG и RX работает с дефолтной
+           таблицей усиления. */
+        {
+            unsigned int k2;
+            for (k2 = 0; k2 < sizeof(bb_agc_tab)/sizeof(bb_agc_tab[0]); k2 += 2)
+                h3_sdc_write_wlan_reg32(bb_agc_tab[k2], bb_agc_tab[k2+1]);
+            udelay(100);
+            uart_print("  lck: agc_tab loaded (");
+            uart_print_int((int)(sizeof(bb_agc_tab)/sizeof(bb_agc_tab[0])/2));
+            uart_print(" regs)\r\n");
+        }
+        {
+            uint32_t a50, a54, a58, a5c, a78;
+            h3_sdc_read_wlan_reg32(0x0C50, &a50);
+            h3_sdc_read_wlan_reg32(0x0C54, &a54);
+            h3_sdc_read_wlan_reg32(0x0C58, &a58);
+            h3_sdc_read_wlan_reg32(0x0C5C, &a5c);
+            h3_sdc_read_wlan_reg32(0x0C78, &a78);
+            uart_print("  lck: agc c50=0x"); uart_print_hex(a50);
+            uart_print(" c54=0x"); uart_print_hex(a54);
+            uart_print(" c58=0x"); uart_print_hex(a58);
+            uart_print(" c5c=0x"); uart_print_hex(a5c);
+            uart_print(" c78=0x"); uart_print_hex(a78);
+            uart_print("\r\n");
+        }
+    }
+    /* 0g) Загрузить полную RF-таблицу RadioA (rf_radioa[], 136 пар) —
+           как драйвер phy_RF6052_Config_ParaFile (rtl8188f_rf6052.c:147-249):
+           BB config → RF config → LCK. РАНЬШЕ RF-таблица грузилась ТОЛЬКО
+           внутри IQK (отключён), поэтому после LCK аналоговый тракт
+           (LNA/mixer/PLL/bias, регистры 0x30/0x31/0x32/0xDF/0x56/0xB0 и др.)
+           оставался в power-on дефолте и RX не мог принимать сигнал.
+           Условные записи (0x80000000/0x40000000/...) в таблице пропущены
+           (массив уже отфильтрован). */
+    {
+        unsigned int k2;
+        uint32_t rtmp;
+        for (k2 = 0; k2 < sizeof(rf_radioa)/sizeof(rf_radioa[0]); k2 += 2) {
+            /* Пропускаем записи в RF 0x18 (CHNLBW) — таблица ставит
+               0xFC07 (канал 7 + тестовые биты 11-14 + bit15=1), что ломает
+               LCK-триггер (done за 0 мс). Канал выставим явно после цикла. */
+            if ((rf_radioa[k2] & 0xFF) == 0x18)
+                continue;
+            rf_write((uint8_t)(rf_radioa[k2] & 0xFF), rf_radioa[k2+1]);
+            udelay(1);
+        }
+        /* Явно ставим RF 0x18 = 0x401 (канал 1, BW20 МГц) — как драйвер
+           RfRegChnlVal[0]=0x201/0x401 после PHY_RF6052_Config. */
+        rf_write(0x18, 0x401u);
+        udelay(100);
+        udelay(200);
+        uart_print("  lck: rf_tab loaded (");
+        uart_print_int((int)(sizeof(rf_radioa)/sizeof(rf_radioa[0])/2));
+        uart_print(" regs)\r\n");
+        uart_print("  lck: rfread df=0x"); uart_print_hex(rf_read(0xDF));
+        uart_print(" 56=0x"); uart_print_hex(rf_read(0x56));
+        uart_print(" 30=0x"); uart_print_hex(rf_read(0x30));
+        uart_print(" 31=0x"); uart_print_hex(rf_read(0x31));
+        uart_print(" 32=0x"); uart_print_hex(rf_read(0x32));
+        uart_print(" b0=0x"); uart_print_hex(rf_read(0xB0));
+        rtmp = rf_read(0x00);
+        uart_print(" 00=0x"); uart_print_hex(rtmp);
+        uart_print("\r\n");
+        /* rf18 после таблицы: должен быть 0x401 (чисто). */
+        {
+            uint32_t chnl = rf_read(0x18);
+            uart_print("  lck: rf18_after_tab=0x");
+            uart_print_hex(chnl);
+            uart_print("\r\n");
+        }
     }
     /* Проверка живости BB/RF (0xE30 rTx_IQK_Tone_A пишем и читаем; RF 0x18
        через LSSI — должен вернуть не 0). */
@@ -704,16 +782,14 @@ void h3_wifi_rf_lck(void)
     }
     /* 1) блокировать TX. */
     h3_sdc_write_wlan_reg8(0x0522, 0xFF);
-    /* 2) Выставить канал 1 (2412 МГц) в RF_CHNLBW[7:0] — LCK калибрует
-          утечку гетеродина на текущей частоте; канал 0 = «ничто». */
-    ch = rf_read(0x18);
-    uart_print("  lck: chnlbw_pre=0x");
-    uart_print_hex(ch);
-    uart_print("\r\n");
-    ch = (ch & ~0xFFu) | 0x01u;          /* канал 1 */
-    rf_write(0x18, ch);
+    /* 2) Выставить канал 1 (2412 МГц) в RF_CHNLBW — LCK калибрует утечку
+          гетеродина на текущей частоте. ВАЖНО: после RF-таблицы RF 0x18
+          = 0x401 (мы её грузим с пропуском записи 0x18 и явно ставим
+          0x401). Устанавливаем чистый 0x401 явно — как RfRegChnlVal[0]
+          драйвера после PHY_RF6052_Config (канал 1, BW20). */
+    rf_write(0x18, 0x401u);
     udelay(100);
-    /* Лог после установки канала (ожидаем биты [7:0]=1). */
+    /* Лог после установки канала (ожидаем 0x401 — чисто). */
     ch = rf_read(0x18);
     uart_print("  lck: chnlbw_set=0x");
     uart_print_hex(ch);
@@ -756,19 +832,19 @@ void h3_wifi_rf_lck(void)
     }
     /* 7) LDO OFF. */
     rf_write(0xB0, 0xDFFF0);
-    /* 8) Восстановить канал: LCK затирает биты [7:0]. */
-    lc = rf_read(0x18);
-    rf_write(0x18, (lc & ~0xFFu) | 0x01u);
+/* 8) Восстановить канал: LCK затирает биты [7:0] RF 0x18; ставим явно
+          чистый 0x401 (канал 1, BW20). */
+    rf_write(0x18, 0x401u);
     udelay(100);
     lc = rf_read(0x18);
     uart_print("  lck: chnlbw_restored=0x");
     uart_print_hex(lc);
     uart_print("\r\n");
-    /* 9) Восстановить RF 0x00: LCK перевёл его в специальный режим (0),
-          для нормальной работы тракта и IQK нужен штатный дефолт 0x30000
-          (первая запись rf_radioa.h). Без этого IQK даёт насыщение
-          0x142/0x42 (маркеры сбоя из драйвера). */
-    rf_write(0x00, 0x30000);
+    /* 9) Восстановить RF 0x00: LCK перевёл его в специальный режим (0).
+          Возвращаем значение ИЗ RF-таблицы (0x33D95, последняя запись
+          rf_radioa — ant-switch), а не дефолт 0x30000 — иначе аналоговый
+          тракт работает не в штатной конфигурации, заданной таблицей. */
+    rf_write(0x00, 0x33D95);
     udelay(100);
     lc = rf_read(0x00);
     uart_print("  lck: rf00_restored=0x");
@@ -813,20 +889,15 @@ void h3_wifi_rf_iqk(void)
 
     uart_print("  iqk: start\r\n");
 
-    /* Диагностика/гарантия: RF 0x00 должен быть 0x30000 (штатный дефолт).
-       Если LCK оставил 0 — исправляем: без этого IQK даёт насыщение. */
+    /* Диагностика: RF 0x00 (RF_AC) — после LCK должен быть 0x33D95
+       (последняя запись RF-таблицы). НЕ перезаписываем его в 0x30000:
+       это НЕ штатное значение для IQK — драйвер в phy_IQCalibrate_8188F
+       RF_AC не трогает (RF_AC=0x10000 ставит только phy_LCK_8188F на время
+       LCK и возвращает). Оставляем как есть, из RF-таблицы. */
     v = rf_read(0x00);
     uart_print("  iqk: rf00_pre=0x");
     uart_print_hex(v);
     uart_print("\r\n");
-    if (v != 0x30000u) {
-        rf_write(0x00, 0x30000);
-        udelay(100);
-        v = rf_read(0x00);
-        uart_print("  iqk: rf00_fix=0x");
-        uart_print_hex(v);
-        uart_print("\r\n");
-    }
 
     /* RF_WE_LUT (0xEF) bit19=1 ставится ВНУТРИ каждой фазы Tx/Rx —
        RF-таблица базового блока заканчивается записью 0xEF=0x1A0,
@@ -849,8 +920,10 @@ void h3_wifi_rf_iqk(void)
         h3_sdc_read_wlan_reg8(0x03, &en);
         uart_print("  iqk: mcu_pre=0x"); uart_print_hex((uint32_t)en); uart_print("\r\n");
 
-        /* Отправить H2C box0: [0]=ElementID 0x6D, [1..]=data {0x01}. */
-        h3_sdc_write_wlan_reg8(0x01CC, 0x00);        /* HMETFR: сбросить «FW ещё читает» */
+        /* Отправить H2C box0: [0]=ElementID 0x6D, [1..]=data {0x01}.
+           НЕ писать 0x00 в 0x1CC (раньше делали) — это сбивает valid-
+           бит, FW перестаёт читать команды. Ждём valid==0 (FW забрала
+           прошлую), как _is_fw_read_cmd_down. */
         h2c_cmd = 0u | (0x01u << 8) | (0x6Du << 0);  /* le32: [0]=0x6D, [1]=0x01 */
         h3_sdc_write_wlan_reg32(0x01D0, h2c_cmd);    /* HMEBOX0 */
         /* Ждать, пока FW заберёт (0x1CC bit0 взведётся как «читает», затем
@@ -880,8 +953,23 @@ void h3_wifi_rf_iqk(void)
         }
     }
 
-    /* TXPAUSE: заблокировать TX-очереди на время калибровки. */
-    h3_sdc_write_wlan_reg8(0x0522, 0xFF);
+    /* MAC-настройки калибровки (_PHY_MACSettingCalibration8188F,
+       halphyrf_8188f.c:1569-1573, вызывается из phy_IQCalibrate_8188F
+       :1883): TXPAUSE=0x3F (НЕ 0xFF как раньше — разблокировать high-
+       очередь), BCN_CTRL(0x550)/BCN_CTRL_1(0x551) &= ~BIT3 (EN_BCN off),
+       GPIO_MUXCFG(0x40) &= ~BIT5. У нас этого блока НЕ БЫЛО — ставили
+       просто 0xFF. */
+    {
+        uint8_t mreg;
+        h3_sdc_write_wlan_reg8(0x0522, 0x3F);        /* TXPAUSE: 0x3F */
+        h3_sdc_read_wlan_reg8(0x0550, &mreg);
+        h3_sdc_write_wlan_reg8(0x0550, (uint8_t)(mreg & ~(1u << 3))); /* BCN_CTRL */
+        h3_sdc_read_wlan_reg8(0x0551, &mreg);
+        h3_sdc_write_wlan_reg8(0x0551, (uint8_t)(mreg & ~(1u << 3))); /* BCN_CTRL_1 */
+        h3_sdc_read_wlan_reg8(0x0040, &mreg);
+        h3_sdc_write_wlan_reg8(0x0040, (uint8_t)(mreg & ~(1u << 5))); /* GPIO_MUXCFG */
+        uart_print("  iqk: mac_cal set\r\n");
+    }
 
     /* BB-подготовка тракта (phy_IQCalibrate_8188F, до циклов):
        RFMOD bit24=0, путь, мультиплексор, RF-интерфейс. */
@@ -891,11 +979,29 @@ void h3_wifi_rf_iqk(void)
     h3_sdc_write_wlan_reg32(0x0C08, 0x000800E4);   /* rOFDM0_TRMuxPar */
     h3_sdc_write_wlan_reg32(0x0874, 0x25204000);   /* rFPGA0_XCD_RFInterfaceSW */
 
-    /* RF_CHNLBW = 0x8C01 — как драйвер держит перед IQK (phy_LCK_8188F:
-       канал 1, BW, бит 15 = mode-калибровка, rtl8188f_phycfg.c:748).
-       У нас после LCK 0x401 — без бита 15 и других бит, чем отличается
-       состояние RF-тракта от драйверного перед калибровкой. */
-    rf_write(0x18, 0x8C01);
+    /* PI-режим RF-интерфейса (_PHY_PIModeSwitch8188F, halphyrf_8188f.c:
+       1606-1630, вызывается из phy_IQCalibrate_8188F :1847-1854 ПЕРЕД
+       калибровкой): 0x860/0x868 = 0x01000100. РАНЬШЕ ЭТОГО ШАГА НЕ БЫЛО —
+       без PI-режима движок IQK не получает тон и даёт насыщение
+       0x142/0x42. В конце восстанавливается 0x01000000 (SI-режим,
+       :2025-2032). */
+    h3_sdc_write_wlan_reg32(0x0860, 0x01000100);   /* XA_HSSIParameter1 PI */
+    h3_sdc_write_wlan_reg32(0x0868, 0x01000100);   /* XB_HSSIParameter1 PI */
+    udelay(100);
+    {
+        uint32_t pi_rd;
+        h3_sdc_read_wlan_reg32(0x0860, &pi_rd);
+        uart_print("  iqk: pi_on 860=0x"); uart_print_hex(pi_rd);
+        h3_sdc_read_wlan_reg32(0x0868, &pi_rd);
+        uart_print(" 868=0x"); uart_print_hex(pi_rd);
+        uart_print("\r\n");
+    }
+
+    /* RF_CHNLBW: канал 1 (0x401) — как драйвер после PHY_RF6052_Config.
+          РАНЬШЕ здесь ставили 0x8C01 (bit15=1) по аналогии с драйвером,
+          но это ломает IQK — как LCK до W.191 (калибровка не запускается).
+          RF-таблица уже загружена в LCK, канал чистый 0x401. */
+    rf_write(0x18, 0x401u);
     udelay(50);
     uart_print("  iqk: rf18=0x");
     uart_print_hex(rf_read(0x18));
@@ -915,26 +1021,17 @@ void h3_wifi_rf_iqk(void)
             h3_sdc_write_wlan_reg32(adda_reg[k], 0x03C00014);
     }
 
-    /* RF-таблица (Array_RadioA_8188F): грузим ТОЛЬКО базовый блок
-       (первые 36 пар, до канальных/условных секций 0x051+), чтобы не
-       перезаписать канал и не поднять бит 15 (0xFC07 из хвоста таблицы).
-       После загрузки восстанавливаем канал 1 в RF_CHNLBW[7:0]. */
+    /* RF-таблица (Array_RadioA_8188F) — НЕ перезагружаем: она уже загружена
+          в LCK (h3_wifi_rf_lck, блок 0g, с пропуском 0x18 — W.191).
+          Повторная загрузка здесь перезатрёт канал 1 и поднимет опасные
+          биты таблицы. Только убеждаемся, что RF 0x18 = 0x401. */
     {
-        unsigned int k, n;
-        uint32_t rf18;
-        n = sizeof(rf_radioa) / sizeof(rf_radioa[0]);
-        if (n / 2 > 36) n = 36 * 2;
-        for (k = 0; k + 1 < n; k += 2) {
-            rf_write((uint8_t)(rf_radioa[k] & 0xFF), rf_radioa[k + 1]);
-            udelay(1);
+        uint32_t rf18 = rf_read(0x18);
+        if ((rf18 & 0xFFu) != 0x01u) {
+            rf_write(0x18, (rf18 & ~0xFFu) | 0x01u);  /* канал 1 на всякий случай */
+            udelay(50);
         }
-        rf18 = rf_read(0x18);
-        rf18 = (rf18 & ~0xFFu) | 0x01u;  /* канал 1, снять бит 15 */
-        rf_write(0x18, rf18);
-        udelay(50);
-        uart_print("  iqk: rf_config loaded (");
-        uart_print_int((int)(n / 2));
-        uart_print(" regs) rf18=0x");
+        uart_print("  iqk: rf18_pre=0x");
         uart_print_hex(rf_read(0x18));
         uart_print("\r\n");
     }
@@ -966,13 +1063,17 @@ void h3_wifi_rf_iqk(void)
         uart_print(" rf56=0x"); uart_print_hex(rf_read(0x56));
         uart_print(" rfEF=0x"); uart_print_hex(rf_read(0xEF));
         uart_print("\r\n");
-        /* 0x948 (Path_SEL_BB): должен быть 0x00000080 (Path A ADDA включён). */
+        (void)rf_read(0xEF);   /* (без вывода) */
+        /* 0x948 (Path_SEL_BB): НЕ трогаем! 0x948=0x80 ставит драйвер
+           только в phy_PathB_IQK_8188F («switch to path B», halphyrf_8188f.
+           c:942). У нас Path A — запись 0x948=0x80 переключала движок на
+           путь B и ломала калибровку пути A. Оставляем 0x99000000 из
+           BB-таблицы. */
         {
             uint32_t d;
             h3_sdc_read_wlan_reg32(0x0948, &d);
             uart_print("  iqk: sel948=0x"); uart_print_hex(d); uart_print("\r\n");
         }
-        h3_sdc_write_wlan_reg32(0x0948, 0x00000080);   /* Path A */
 
         /* e94/e9c/eac ДО триггера — убедиться, что они обновляются
            движком, а не висят на дефолте. */
@@ -1145,31 +1246,76 @@ void h3_wifi_rf_iqk(void)
     }
 
     /* Выход из IQK и восстановление тонов по умолчанию (как в драйвере
-       после калибровки): 0xe28=0, 0xe30/0xe34=0x01008C00. */
+       после калибровки): 0xe28=0, 0xe30/0xe34=0x01008C00,
+       и SI-режим RF-интерфейса (_PHY_PIModeSwitch8188F(FALSE),
+       halphyrf_8188f.c:2025-2032): 0x860/0x868 = 0x01000000. */
     h3_sdc_write_wlan_reg32(rFPGA0_IQK, 0x00000000);
     h3_sdc_write_wlan_reg32(rTx_IQK_Tone_A, 0x01008C00);
     h3_sdc_write_wlan_reg32(rRx_IQK_Tone_A, 0x01008C00);
+    h3_sdc_write_wlan_reg32(0x0860, 0x01000000);   /* XA_HSSIParameter1 SI */
+    h3_sdc_write_wlan_reg32(0x0868, 0x01000000);   /* XB_HSSIParameter1 SI */
     h3_sdc_write_wlan_reg8(0x0522, 0x00);   /* TXPAUSE снять */
+    /* Восстановить BCN_CTRL (EN_BCN) — _PHY_ReloadMACRegisters8188F
+       (halphyrf_8188f.c:2039): 0x550/0x551 возвращаем бит 3. */
+    {
+        uint8_t mreg;
+        h3_sdc_read_wlan_reg8(0x0550, &mreg);
+        h3_sdc_write_wlan_reg8(0x0550, (uint8_t)(mreg | (1u << 3)));
+        h3_sdc_read_wlan_reg8(0x0551, &mreg);
+        h3_sdc_write_wlan_reg8(0x0551, (uint8_t)(mreg | (1u << 3)));
+    }
 
     /* H2C-обвязка после IQK (sdio_halinit.c:1291-1293): сообщить FW об
-       окончании калибровки — H2C 0x6D={0}. */
+       окончании калибровки — H2C 0x6D={0}. ВАЖНО: не писать 0x00 в
+       0x1CC (как делали раньше) — это сбивает valid-бит, FW перестаёт
+       читать команды (лог 1cc=0x01 после IQK). Ждём valid==0 и пишем. */
     {
         uint32_t h2c_cmd = 0;
-        h3_sdc_write_wlan_reg8(0x01CC, 0x00);
+        unsigned int t4 = 0;
+        uint8_t hm4 = 0xFF;
+        do {
+            udelay(1000);
+            h3_sdc_read_wlan_reg8(0x01CC, &hm4);
+        } while ((hm4 & 0x01u) && (++t4 < 100));
+        uart_print("  iqk: h2c0_pre 1cc=0x");
+        uart_print_hex((uint32_t)hm4);
+        uart_print("\r\n");
         h2c_cmd = 0u | (0x00u << 8) | (0x6Du << 0);
         h3_sdc_write_wlan_reg32(0x01D0, h2c_cmd);
-        udelay(1000);
+        /* ОБЯЗАТЕЛЬНО дождаться, пока FW заберёт команду (valid==0) —
+           иначе бокс останется занят, и все следующие H2C (SET_PWR_MODE
+           в RX-блоке) потеряются (лог: h2c_pre 1cc=0x01). */
+        {
+            unsigned int t5 = 0;
+            uint8_t hm5 = 0xFF;
+            do {
+                udelay(1000);
+                h3_sdc_read_wlan_reg8(0x01CC, &hm5);
+            } while ((hm5 & 0x01u) && (++t5 < 100));
+            uart_print("  iqk: h2c0_after 1cc=0x");
+            uart_print_hex((uint32_t)hm5);
+            uart_print("\r\n");
+        }
     }
     uart_print("  iqk: done\r\n");
 }
 
-/* ---- RX-тест: проверка живости RX-пути без завершённого IQK ----
- * 1) RF_CHNLBW = 0x401 (канал 1, 20 МГц) — БЕЗ бита 15 (в 0x8C01 он
- *    оставался от IQK-режима и блокировал приём);
- * 2) FIFO-граница TX/RX (0x0114, rxff_bndy высокий байт);
- * 3) RCR=0x7000208e / RRSR=0x0440 / RXFLTMAP / MAR — приём mgmt+bcast;
- * 4) REG_CR бит 6 (RXDMA_EN) — включить RX DMA;
- * 5) опрос счётчика принятых пакетов (RXPKT_NUM 0x287, device 8). */
+/* ---- RX-тест: проверка живости RX-пути ----
+ * Полная конфигурация приёмника по драйверу rtl8189fs:
+ *  0) пробуждение FW (RPWM/CPWM), H2C SET_PWR_MODE=ACTIVE (0x20),
+ *     прерывания FBR/CCCR/HIMR (RX_REQUEST), C2H-очистка (0x1AF);
+ *  1) RF_CHNLBW = 0x401 (канал 1, 20 МГц) — БЕЗ бита 15 (0x8C01 — это
+ *     LCK/IQK-режим, блокирует приём);
+ *  1b) RFMOD (0x800) |= bCCKEn(bit24) | bOFDMEn(bit25) — включить
+ *      CCK/OFDM-блоки BB (в BB-таблице они сброшены), иначе приёмник
+ *      физически не декодирует эфир; 0x577=3, 0x976=0 (2nd CCA);
+ *  2) LLT (0x224 |= BIT16) + границы FIFO (0x116=0x3EFF, TX 0xF1);
+ *  2c) BWOPMODE (0x603)=0x04, SIFS/RL/EDCA (из _InitEDCA/_InitAdaptiveCtrl);
+ *  3) RCR=0x7000604E / RRSR=0xFFF / RXFLTMAP / MAR — приём mgmt+bcast;
+ *  4) REG_CR |= HCI_RXDMA(1)|RXDMA_EN(3)|MACTXEN(6)|MACRXEN(7);
+ *  4d) RX-DMA: PBP=0x11, DRVINFO=4, AGG_PG_TH=0x010F, 0x290=0x0E;
+ *  5) свип каналов 1→6→11 со слушанием 150 мс, диагностика
+ *     rxlen(0x1C)/rxpkt(0x284)/cca(0xA08)/trssi(0xA50). */
 void h3_wifi_rf_rx_test(void)
 {
     uint8_t num = 0;
@@ -1237,15 +1383,32 @@ void h3_wifi_rf_rx_test(void)
         /* Формат FillH2CCmd8188F: CmdLen<=3 -> box0; CmdLen>3 ->
            первые 3 байта payload в box0 (0x1D0) с id, остальные — в
            EX-box REG_HMEBOX_EXT0 (0x1F0). 6-байт: box0={id,0,2,4},
-           ex={0x0C,0x40}. */
-        h2c = 0x20u;                /* [0]=id 0x20 */
-        h2c |= 0x00u << 8;          /* [1]=MODE=0 */
-        h2c |= 0x02u << 16;         /* [2]=rlbm(2) */
-        h2c |= 0x04u << 24;         /* [3]=awake_intvl=4 */
-        h2c_ex = 0x00u;             /* byte4=all_queue_uapsd=0 */
-        h2c_ex |= 0x0Cu << 8;       /* byte5=PowerState AllON */
-        h2c_ex |= 0x40u << 16;      /* byte6=byte5 0x40 */
-        h3_sdc_write_wlan_reg8(0x01CC, 0x00);          /* HMETFR clear */
+           ex={0x0C,0x40}. ВАЖНО: РАНЬШЕ делали write 0x00 в 0x1CC
+           (HMETFR) — это НЕ в драйвере (rtl8188f_cmd.c:96-127): драйвер
+           ТОЛЬКО читает 0x1CC, ждёт valid==0 (FW забрала прошлую
+           команду), пишет EX-box, потом box0. Запись 0x00 в 0x1CC
+           сбивала valid и FW не получала команду (1cc=0x01 в логе). */
+        {
+            unsigned int t3 = 0;
+            uint8_t hm3 = 0xFF;
+            /* ждать, пока FW заберёт предыдущую команду (valid==0) */
+            do {
+                udelay(1000);
+                h3_sdc_read_wlan_reg8(0x01CC, &hm3);
+            } while ((hm3 & 0x01u) && (++t3 < 100));
+            uart_print("  rx: h2c_pre 1cc=0x");
+            uart_print_hex((uint32_t)hm3);
+            uart_print("\r\n");
+        }
+        /* Сформировать H2C: box0={id 0x20, mode 0, rlbm 2, awake 4},
+           EX-box={uapsd 0, PowerState 0x0C, byte5 0x40}. */
+        h2c = 0x20u;
+        h2c |= 0x00u << 8;
+        h2c |= 0x02u << 16;
+        h2c |= 0x04u << 24;
+        h2c_ex = 0x00u;
+        h2c_ex |= 0x0Cu << 8;
+        h2c_ex |= 0x40u << 16;
         h3_sdc_write_wlan_reg32(0x01F0, h2c_ex);       /* EX-box: b4..b6 */
         h3_sdc_write_wlan_reg32(0x01D0, h2c);          /* box0: id+b1..b3 */
         {
@@ -1297,22 +1460,55 @@ void h3_wifi_rf_rx_test(void)
     uart_print("\r\n");
 
     /* 1b) _BBTurnOnBlock (sdio_halinit.c:832-840): включить CCK и OFDM
-         блоки BB — rFPGA0_RFMOD (0x800) |= bCCKEn(BIT16) | bOFDMEn(BIT17).
-         В BB-таблице RFMOD=0x83045700 — биты 16/17 СБРОШЕНЫ, т.е. без
-         этого приёмник физически не декодирует эфир. */
+         блоки BB — rFPGA0_RFMOD (0x800) |= bCCKEn | bOFDMEn.
+         ВАЖНО: bCCKEn = 0x1000000 (BIT24), bOFDMEn = 0x2000000 (BIT25) —
+         Hal8188FPhyReg.h:515-516! Раньше мы ставили (1<<16)|(1<<17) —
+         НЕ ТЕ биты, CCK/OFDM так и не включались (лог rfmod=0x82075700,
+         а должно 0x83075700). Без этих бит приёмник физически не
+         декодирует эфир. */
     h3_sdc_read_wlan_reg32(0x0800, &d);
-    d |= (1u << 16) | (1u << 17);
+    d |= (1u << 24) | (1u << 25);   /* bCCKEn | bOFDMEn */
     h3_sdc_write_wlan_reg32(0x0800, d);
     h3_sdc_read_wlan_reg32(0x0800, &d);
     uart_print("  rx: rfmod=0x");
     uart_print_hex(d);
     uart_print("\r\n");
 
-    /* 2) LLT + границы FIFO (rtl8188f_InitLLTTable, _InitPageBoundary):
-       - AUTO_LLT (0x0224) |= BIT16 — автопостроение LLT-таблицы
-         страниц SRAM (без этого RX-буфер не выделен, fifopg=0);
+    /* 1b) Записи из конца драйверной инициализации (sdio_halinit.c:1158-1159):
+         REG_SECONDARY_CCA_CTRL_8188F (0x577) = 0x3 — CRC-CCA;
+         0x976 = 0 — 2nd CCA. У нас их не было. */
+    h3_sdc_write_wlan_reg8(0x0577, 0x03);
+    h3_sdc_write_wlan_reg8(0x0976, 0x00);
+
+    /* 2) FIFO-разметка (как драйвер sdio_halinit.c:1126-1130):
+       - RQPN (0x200) = 0x80E0020C, RQPN_NPQ (0x214) = 0x02 —
+         _InitQueueReservedPage (TX-страницы HQ/LQ/PUBQ). РАНЬШЕ НЕ ДЕЛАЛИ:
+         без этого разметки хвостового TX-буфера не было (logs fifopg=0);
+       - TX-границы 0x424/0x425/0x45D/0x114 = 0xF1 — _InitTxBufferBoundary
+         (ДО LLT, как драйвер);
+       - AUTO_LLT (0x0224) |= BIT16 — автопостроение LLT-таблицы страниц
+         SRAM (rtl8188f_InitLLTTable);
        - TRXFF_BNDY+2 (0x0116) = RX_DMA_BOUNDARY = 0x3EFF (16K-0x100-1). */
+    h3_sdc_write_wlan_reg8(0x0214, 0x02);        /* RQPN_NPQ */
+    h3_sdc_write_wlan_reg32(0x0200, 0x80E0020Cu);/* RQPN: HPQ|LPQ|PUBQ|LD */
+    h3_sdc_read_wlan_reg32(0x0200, &d);
+    uart_print("  rx: rqpn=0x");
+    uart_print_hex(d);
+    uart_print("\r\n");
+
+    /* 2a) TX-границы (_InitTxBufferBoundary, sdio_halinit.c:321-324):
+         txpktbuf_bndy = TX_PAGE_BOUNDARY_8188F = 0xF1
+         (0xFF - BCNQ 0x08 - BCNQ1 0x00 - WOWLAN 0x07 + 1) в 4 регистра.
+         Драйвер делает ЭТО ДО LLT (порядок sdio_halinit.c:1126-1130:
+         _InitQueueReservedPage → _InitTxBufferBoundary → LLT). Раньше
+         у нас TX-границы стояли ПОСЛЕ LLT — порядок исправлен. */
+    h3_sdc_write_wlan_reg8(0x0424, 0xF1);   /* TXPKTBUF_BCNQ_BDNY */
+    h3_sdc_write_wlan_reg8(0x0425, 0xF1);   /* TXPKTBUF_MGQ_BDNY */
+    h3_sdc_write_wlan_reg8(0x045D, 0xF1);   /* TXPKTBUF_WMAC_LBK */
+    h3_sdc_write_wlan_reg8(0x0114, 0xF1);   /* TRXFF_BNDY (tx start) */
+
     h3_sdc_read_wlan_reg32(0x0224, &d);
+
     h3_sdc_write_wlan_reg32(0x0224, d | (1u << 16));
     {
         unsigned int lt = 0;
@@ -1331,13 +1527,30 @@ void h3_wifi_rf_rx_test(void)
     uart_print_hex(d);
     uart_print("\r\n");
 
-    /* 2b) TX-границы (_InitTxBufferBoundary, sdio_halinit.c:321-324):
-         txpktbuf_bndy = TX_PAGE_BOUNDARY_8188F = 0xF1
-         (0xFF - BCNQ 0x08 - BCNQ1 0x00 - WOWLAN 0x07 + 1) в 4 регистра. */
-    h3_sdc_write_wlan_reg8(0x0424, 0xF1);   /* TXPKTBUF_BCNQ_BDNY */
-    h3_sdc_write_wlan_reg8(0x0425, 0xF1);   /* TXPKTBUF_MGQ_BDNY */
-    h3_sdc_write_wlan_reg8(0x045D, 0xF1);   /* TXPKTBUF_WMAC_LBK */
-    h3_sdc_write_wlan_reg8(0x0114, 0xF1);   /* TRXFF_BNDY (tx start) */
+    /* 2c) Ревизия W.205: упущенные драйверные шаги (_InitOperationMode
+         sdio_halinit.c:793, _InitEDCA :600-619, _InitAdaptiveCtrl:592-597):
+         - REG_BWOPMODE (0x603) = BW_OPMODE_20MHZ (BIT2=0x04) — ширина
+           канала приёмника;
+         - SIFS: 0x428/0x63A/0x514/0x516 = 0x100a;
+         - RL (0x42A) = 0x3030;
+         - EDCA: 0x508/0x50C/0x504/0x500 + 0x638/0x55C. */
+    h3_sdc_write_wlan_reg8(0x0603, 0x04);          /* BWOPMODE 20MHz */
+    h3_sdc_write_wlan_reg16(0x0428, 0x100A);       /* SPEC_SIFS */
+    h3_sdc_write_wlan_reg16(0x063A, 0x100A);       /* MAC_SPEC_SIFS */
+    h3_sdc_write_wlan_reg16(0x0514, 0x100A);       /* SIFS_CTX (CCK) */
+    h3_sdc_write_wlan_reg16(0x0516, 0x100A);       /* SIFS_TRX (OFDM) */
+    h3_sdc_write_wlan_reg16(0x042A, 0x3030);       /* RL: LRL/SRL 0x30 */
+    h3_sdc_write_wlan_reg32(0x0508, 0x005EA42Bu);
+    h3_sdc_write_wlan_reg32(0x050C, 0x0000A44Fu);
+    h3_sdc_write_wlan_reg32(0x0504, 0x005EA324u);
+    h3_sdc_write_wlan_reg32(0x0500, 0x002FA226u);
+    h3_sdc_write_wlan_reg8(0x0638, 0x28);          /* USTIME_EDCA */
+    h3_sdc_write_wlan_reg8(0x055C, 0x28);          /* USTIME_TSF */
+    /* readback BWOPMODE — подтвердить запись. */
+    h3_sdc_read_wlan_reg8(0x0603, &num);
+    uart_print("  rx: bwop=0x");
+    uart_print_hex((uint32_t)num);
+    uart_print("\r\n");
 
     /* _InitNetworkType: REG_CR[17:16] = NT_LINK_AP (0x2). */
     h3_sdc_read_wlan_reg32(0x0100, &d);
@@ -1347,27 +1560,34 @@ void h3_wifi_rf_rx_test(void)
     uart_print_hex(d);
     uart_print("\r\n");
 
-    /* 3) RCR (0x0608): APP_PHYST_RXFF|APP_ICV|APP_MIC (уже в 0x7000208E)
-       + AAP (bit0). ВАЖНО: снять CBSSID_BCN (bit7) — как драйвер в
-       hw_var_set_mlme_sitesurvey для скана: иначе чип принимает beacon
-       только совпадающей BSSID и отбрасывает beacon'ы роутеров (наш
-       тест слушает эфир). RRSR (0x0440), RXFLTMAP, MAR — приём mgmt/bcast. */
-    h3_sdc_write_wlan_reg32(0x0608, 0x7000200Fu);   /* ~CBSSID_BCN(bit7) */
-    /* RRSR (0x0440): базовые скорости. */
-    h3_sdc_write_wlan_reg32(0x0440, 0x00000F0Fu);
-    /* RXFLTMAP: все типы кадров. */
-    h3_sdc_write_wlan_reg16(0x06A4, 0xFFFF);   /* RXFLTMAP2 */
+    /* 3) RCR (0x0608): по _InitWMACSetting (sdio_halinit.c:548-556):
+           RCR_APM|RCR_AM|RCR_AB | RCR_CBSSID_DATA|RCR_CBSSID_BCN|RCR_AMF |
+           RCR_HTC_LOC_CTRL | RCR_APP_PHYST_RXFF|RCR_APP_ICV|RCR_APP_MIC
+           = 0x700060CE (биты 28-30|14|13|7|6|3|2|1). Раньше мы ставили
+           0x7000200F — без AM (bit2, multicast) и с снятым CBSSID_DATA (6).
+           Для скана снимаем только CBSSID_BCN (bit7) → 0x7000604E. */
+    h3_sdc_write_wlan_reg32(0x0608, 0x7000604Eu);   /* _InitWMACSetting, ~BCN */
+    /* RRSR (0x0440): базовые скорости — по драйверу (hal_com_reg.h:
+       RATE_ALL_CCK|RATE_ALL_OFDM_AG = 0xFFF). Мы раньше ставили 0xF0F
+       (без OFDM 6M/9M/12M/18M) — а beacon'ы роутера часто идут на 6M/12M
+       (OFDM), при 0xF0F приёмник их отбрасывает. Ставим 0xFFF + старший
+       байт & 0xF0 (как rtl8188f_hal_init.c:6217). */
+    h3_sdc_write_wlan_reg32(0x0440, 0x00000FFFu);
+    /* RXFLTMAP: как hw_var_set_mlme_sitesurvey при скане
+       (rtl8188f_hal_init.c:5539): RXFLTMAP2 = 0 — не принимать data-кадры,
+       принимать только mgmt (beacon/probe) через RXFLTMAP0. */
+    h3_sdc_write_wlan_reg16(0x06A4, 0x0000);   /* RXFLTMAP2: 0 (sitesurvey) */
     h3_sdc_write_wlan_reg16(0x06A2, 0x0400);   /* RXFLTMAP1: ps-poll */
     h3_sdc_write_wlan_reg16(0x06A0, 0xFFFF);   /* RXFLTMAP0: mgmt */
     /* MAR (0x0620): broadcast + свой MAC (пишем FF, приём всех). */
     h3_sdc_write_wlan_reg32(0x0620, 0xFFFFFFFF);
     h3_sdc_write_wlan_reg32(0x0624, 0xFFFFFFFF);
 
-    /* 4) REG_CR (0x0100): бит 6 = HCI_RXDMA_EN, бит 7 = RXDMA_ENABLE,
-       бит 8 = MACTXEN, бит 9 = MACRXEN (sdio_halinit.c:1240 «Enable
-       MACTXEN/MACRXEN block») — 32-бит RMW, чтобы НЕ затереть bit17
-       (NETTYPE_AP) из шага выше. Без MACRXEN 802.11-MAC не запущен
-       и RX невозможен в принципе. */
+    /* 4) REG_CR (0x0100): MACTXEN=BIT6, MACRXEN=BIT7 (hal_com_reg.h:1293-1294,
+           sdio_halinit.c:1238-1241 «Enable MACTXEN/MACRXEN block»); также
+           включаем BIT8 (ENSWBCN) и BIT9 (ENSEC) — как драйвер до nettype.
+           32-бит RMW, чтобы НЕ затереть bit17 (NETTYPE_AP) из шага выше.
+           Без MACRXEN 802.11-MAC не запущен и RX невозможен в принципе. */
     h3_sdc_read_wlan_reg32(0x0100, &d);
     d |= (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9);
     h3_sdc_write_wlan_reg32(0x0100, d);
@@ -1376,35 +1596,56 @@ void h3_wifi_rf_rx_test(void)
     uart_print_hex((uint32_t)d);
     uart_print(" (bit17=");
     uart_print_int((int)((d >> 17) & 1));
-    uart_print(" bit8=");
-    uart_print_int((int)((d >> 8) & 1));
-    uart_print(" bit9=");
-    uart_print_int((int)((d >> 9) & 1));
+    uart_print(" macrx_en=");
+    uart_print_int((int)((d >> 7) & 1));
+    uart_print(" mactx_en=");
+    uart_print_int((int)((d >> 6) & 1));
     uart_print(")\r\n");
 
-    /* 4b) REG_RXPKT_NUM (0x287 device 8) = счётчик пакетов в RXPKTBUF;
-           его бит 18 (RW_RELEASE_EN) = пауза RX DMA. Если взведён —
-           DMA заморожена и пакеты не выкладываются в хост. Сбрасываем
-           (release), как rtw_hal_release_rx_dma (hal_com.c:1566). */
-    h3_sdc_read_wlan_reg32(0x0287, &d);
-    h3_sdc_write_wlan_reg32(0x0287, d & ~(1u << 18));
-    h3_sdc_read_wlan_reg32(0x0287, &d);
+/* 4b) REG_RXPKT_NUM (0x284 device 8 = hal_com_reg.h:187): счётчик пакетов
+       в RXPKTBUF + биты RW_RELEASE_EN(18)/RXDMA_IDLE(17)/RXPKT_RELEASE(16).
+       Если бит 18 (RW_RELEASE_EN) взведён — DMA заморожена и пакеты не
+       выкладываются в хост. Сбрасываем (release), как
+       rtw_hal_release_rx_dma (hal_com.c:1566). */
+    h3_sdc_read_wlan_reg32(0x0284, &d);
+    h3_sdc_write_wlan_reg32(0x0284, d & ~(1u << 18));
+    h3_sdc_read_wlan_reg32(0x0284, &d);
     uart_print("  rx: rxpk=0x");
     uart_print_hex(d);
     uart_print(" (rw_release=");
     uart_print_int((int)((d >> 18) & 1));
     uart_print(")\r\n");
 
-    /* 4c) SDIO HIMR (0x14, device 0) — 32-битный: RX_REQUEST (BIT0),
-           AVAL (BIT1), TXERR (BIT2) в байте 0x14 + C2HCMD (BIT17 =
-           бит1 байта 0x16). Раньше писали только байт 0x14 (0x01) —
-           C2H-маска (0x16) не включалась, поэтому C2H-события не шли.
-           HISR (0x18) сбросить. */
-    h3_sdc_cmd52_write(0, 0x0014, 0x07);   /* RX_REQUEST|AVAL|TXERR */
-    h3_sdc_cmd52_write(0, 0x0015, 0x00);
-    h3_sdc_cmd52_write(0, 0x0016, 0x02);   /* C2HCMD (BIT17) */
-    h3_sdc_cmd52_write(0, 0x0017, 0x00);
-    h3_sdc_cmd52_write(0, 0x0018, 0xFF);   /* HISR: clear */
+    /* 4b2) System Interrupt + C2H-очистка — EnableInterrupt8188FSdio
+           (sdio_ops.c:1787-1799): REG_HSIMR (0x58) |= SysIntrMask (0),
+           и REG_C2HEVT_CLEAR (0x1AF) = C2H_EVT_HOST_CLOSE (0x00) —
+           закрыть C2H-событие, иначе FW НЕ ШЛЁТ новые C2H (пока старый
+           не взят). Пропуск этой записи = FW принимает пакеты (счётчик
+           RXPKT_NUM растёт), но C2H/HISR молчат. */
+    {
+        uint32_t hsimr = 0;
+        h3_sdc_read_wlan_reg32(0x0058, &hsimr);
+        h3_sdc_write_wlan_reg32(0x0058, hsimr);   /* SysIntrMask=0 — читаем/пишем как драйвер */
+        h3_sdc_write_wlan_reg8(0x01AF, 0x00);     /* C2H_EVT_HOST_CLOSE */
+        udelay(100);
+        uart_print("  rx: c2h_clr=0x");
+        h3_sdc_read_wlan_reg8(0x01AF, &num);
+        uart_print_hex((uint32_t)num);
+        uart_print("\r\n");
+    }
+
+    /* 4c) SDIO HIMR (0x14, device 0) — 32-битный, ВАЖНО: драйвер
+           InitInterrupt8188FSdio (sdio_ops.c:1646-1677) маскирует ТОЛЬКО
+           SDIO_HIMR_RX_REQUEST_MSK (BIT0); все остальные биты
+           (AVAL/TXERR/RXERR/C2HCMD/...) закомментированы.
+           W.195: CMD52-запись байтом 0x14=0x01 НЕ применялась (readback
+           давал 0x07 — старые биты). Драйвер пишет HIMR 4-байтно через
+           sdio_local_write (sdio_ops.c:1781, CMD53). Пишем так же. */
+    {
+        uint8_t himr4[4] = { 0x01, 0x00, 0x00, 0x00 };  /* RX_REQUEST только */
+        h3_sdc_cmd53_write_bytes(0, 0x0014, 4, himr4);
+    }
+    h3_sdc_cmd52_write(0, 0x0018, 0xFF);   /* HISR: clear (write-1-clear) */
     h3_sdc_cmd52_read(0, 0x0014, &num);
     uart_print("  rx: himr_lo=0x");
     uart_print_hex((uint32_t)num);
@@ -1413,13 +1654,10 @@ void h3_wifi_rf_rx_test(void)
     uart_print_hex((uint32_t)num);
     uart_print("\r\n");
 
-    /* 4e) Диагностика (W.165): порог агрегации, drvinfo, RXDMA_CTRL,
-           C2H_EVT (firmware mailbox), HISR до свипа. */
-    h3_sdc_read_wlan_reg8(0x0280, &num);
-    uart_print("  rx: agg_th=0x");
-    uart_print_hex((uint32_t)num);
+    /* 4e) Диагностика (W.165): drvinfo, RXDMA_CTRL, C2H_EVT (firmware
+           mailbox), HISR до свипа. agg_th читается после записи в 4d. */
     h3_sdc_read_wlan_reg8(0x060F, &num);
-    uart_print(" drvinfo=0x");
+    uart_print("  rx: drvinfo=0x");
     uart_print_hex((uint32_t)num);
     h3_sdc_read_wlan_reg8(0x0286, &num);
     uart_print(" rxdma=0x");
@@ -1434,21 +1672,30 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
     uart_print_hex((uint32_t)num);
     uart_print("\r\n");
 
-    /* 4d) RX-DMA настройки из драйвера (sdio_halinit.c):
+/* 4d) RX-DMA настройки из драйвера (sdio_halinit.c):
          - PBP (0x0104) = PBP_128|PBP_128 (0x11) — разбиение SRAM;
          - RX_DRVINFO_SZ (0x060F) = 4 — размер драйвер-инфо перед
            802.11-кадром;
-         - TRXDMA_CTRL (0x010C) |= RXDMA_AGG_EN (BIT2) — агрегация;
-         - RXDMA_MODE_CTRL (0x0290) |= RXDMA_AGG_MODE_EN (BIT1). */
+         - REG_RXDMA_AGG_PG_TH (0x0280) = 0x010F — по HalRxAggr8188FSdio
+           (sdio_halinit.c:649-658: dma_time_th=1, dma_len_th=15). Раньше
+           у нас было 0x03 (из дефолта) — порог не тот;
+         - TRXDMA_CTRL (0x010C) |= RXDMA_AGG_EN (BIT2);
+         - RXDMA_MODE_CTRL (0x0290) = 0x0E — по sdio_AggSettingRxUpdate
+           (sdio_halinit.c:661-679): AGG_MODE_EN(bit1)|aggBurstNum(3<<2)|
+           aggBurstSize(0<<4) = 0x0C|0x02 = 0x0E. Раньше у нас было 0x06. */
     h3_sdc_write_wlan_reg8(0x0104, 0x11);          /* PBP 128+128 */
     h3_sdc_write_wlan_reg8(0x060F, 0x04);          /* RX_DRVINFO_SZ */
+    h3_sdc_write_wlan_reg16(0x0280, 0x010F);       /* AGG_PG_TH: time=1, len=15 */
     h3_sdc_read_wlan_reg8(0x010C, &num);
     h3_sdc_write_wlan_reg8(0x010C, (uint8_t)(num | 0x04));  /* RXDMA_AGG_EN */
-    h3_sdc_read_wlan_reg8(0x0290, &num);
-    h3_sdc_write_wlan_reg8(0x0290, (uint8_t)(num | 0x02));  /* RXDMA_AGG_MODE_EN */
+    h3_sdc_write_wlan_reg8(0x0290, 0x0E);          /* RXDMA_MODE_CTRL: agg on, burst=4, size=1K */
     h3_sdc_read_wlan_reg8(0x0290, &num);
     uart_print("  rx: rxdma_mode=0x");
     uart_print_hex((uint32_t)num);
+    h3_sdc_read_wlan_reg16(0x0280, (uint16_t *)&d);
+    d &= 0xFFFF;
+    uart_print(" agg_th=0x");
+    uart_print_hex(d);
     uart_print("\r\n");
 
     /* readback ключевых регистров + FIFO. */
@@ -1468,31 +1715,10 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
     h3_sdc_read_wlan_reg16(0x06A4, (uint16_t *)&d);
     d &= 0xFFFF;
     uart_print(" flt2=0x"); uart_print_hex(d);
-    h3_sdc_read_wlan_reg32(0x0204, &d);
+    h3_sdc_read_wlan_reg32(0x0200, &d);
     uart_print(" fifopg=0x"); uart_print_hex(d);
     h3_sdc_read_wlan_reg32(0x011C, &d);
     uart_print(" rxffptr=0x"); uart_print_hex(d);
-    uart_print("\r\n");
-
-    /* 4e) Диагностика: порог агрегации, drvinfo, RXDMA_CTRL, C2H_EVT,
-           HISR до свипа. */
-    h3_sdc_read_wlan_reg8(0x0280, &num);
-    uart_print("  rx: agg_th=0x");
-    uart_print_hex((uint32_t)num);
-    h3_sdc_read_wlan_reg8(0x060F, &num);
-    uart_print(" drvinfo=0x");
-    uart_print_hex((uint32_t)num);
-    h3_sdc_read_wlan_reg8(0x0286, &num);
-    uart_print(" rxdma=0x");
-    uart_print_hex((uint32_t)num);
-    uart_print("\r\n");
-    h3_sdc_read_wlan_reg32(0x01A0, &d);
-    uart_print("  rx: c2h_evt=0x");
-    uart_print_hex(d);
-    uart_print("\r\n");
-    h3_sdc_cmd52_read(0, 0x0018, &num);
-    uart_print("  rx: hisr_before=0x");
-    uart_print_hex((uint32_t)num);
     uart_print("\r\n");
 
     /* 5) Опрос RX-доступности через SDIO_REG_RX0_REQ_LEN (0x1C,
@@ -1502,15 +1728,36 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
     for (t = 0; t < 12; t++) {
         uint32_t ch;
         uint16_t rxlen = 0;
-        /* Канал в [7:0] + BW-бит 9; в РАБОТЕ драйвер пишет маской 0x3FF
-           (phy_SwChnl8188F:1361), т.е. RfRegChnlVal[ch1]=0x201 (не 0x8C01 —
-           там bit17/bit15 от LCK, маской 0x3FF отсекаются). 1=0x201,
-           6=0x206, 11=0x20B. */
+        /* Канал в [7:0] + BW-бит 9 (20 МГц). Драйвер (phy_SwChnl8188F:1360-1361)
+           пишет RF 0x18 маской 0x3FF: RfRegChnlVal[0] = 0x201 (канал 1,
+           BW20), 6 = 0x206, 11 = 0x20B. БЕЗ бит 15/17 (LCK/калибровка). */
         if (t < 4)      ch = 0x201u;
         else if (t < 8) ch = 0x206u;
         else            ch = 0x20Bu;
         rf_write(0x18, ch);
         udelay(50000);   /* 50 мс на перестройку синтезатора */
+
+        /* Notch-фильтр паразита (phy_SpurCalibration_8188F, вызывается из
+           phy_SwChnl8188F при каждом переключении канала, rtl8188f_phycfg.c:
+           1118-1137): для каналов 5/6/7/8/13/14 включается CSI-notch с
+           конкретной маской [28:24] и битом 9 в 0xC40 + 0xD40/0xD44/0xD48/
+           0xD4C/0xD2C. У нас 0xC40=0x1F78403F из BB-таблицы (bit9=0, [28:24]=
+           0x31 — мусор), т.е. на канале 6 (частота свипа!) паразит 2440 МГц
+           не режется и давит RX. Ставим как драйвер для канала 6: */
+        {
+            uint32_t d40;
+            if (t >= 4 && t < 8) {
+                h3_sdc_write_wlan_reg32(0x0C40, 0x04002000u | 0x200u); /* [28:24]=4, bit9=1 */
+                h3_sdc_write_wlan_reg32(0x0D40, 0x00000600u);
+                h3_sdc_write_wlan_reg32(0x0D44, 0x00000000u);
+                h3_sdc_write_wlan_reg32(0x0D48, 0x00000000u);
+                h3_sdc_write_wlan_reg32(0x0D4C, 0x00000000u);
+                h3_sdc_read_wlan_reg32(0x0D2C, &d40);
+                h3_sdc_write_wlan_reg32(0x0D2C, d40 | (1u << 28));  /* CSI mask */
+                udelay(1000);
+                uart_print("  rx: notch ch6 set\r\n");
+            }
+        }
         udelay(150000);  /* 150 мс слушаем */
         h3_sdc_cmd52_read(0, 0x001C, &num);      /* RX0_REQ_LEN, device 0 */
         rxlen = num;
@@ -1520,11 +1767,45 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         uart_print_int((int)(ch & 0xFF));
         uart_print(" rxlen=0x");
         uart_print_hex((uint32_t)rxlen);
-        /* RXPKT_NUM (0x287 dev8): счётчик пакетов во внутреннем RXPKTBUF
-           FW — растёт ли, если чип физически принимает (MACRXEN включён). */
+        /* RXPKT_NUM (0x284 dev8, полное 32-битное слово): счётчик пакетов
+           во внутреннем RXPKTBUF FW. Если !=0 — FW приняла кадры. Раньше
+           читали только байт 0x287 (см. pkt ниже) — полное слово покажет
+           точное число. */
+        h3_sdc_read_wlan_reg32((8u << 13) | 0x0284, &d);
+        uart_print(" rxpkt=0x");
+        uart_print_hex(d);
+        /* RXDMA_CTRL (0x286 dev8, байт): bit3 = «RX DMA has req» — FW
+           сформировала запрос на выдачу пакета хосту (hal_com.c:1634).
+           Если bit3=1, а rxlen=0 — пакет есть, но не выложен. */
+        h3_sdc_read_wlan_reg8((8u << 13) | 0x0286, &num);
+        uart_print(" req=");
+        uart_print_int((int)((num >> 3) & 1));
+        uart_print(" dr=0x");
+        uart_print_hex((uint32_t)num);
+        /* RXPKT_NUM байт 0x287 (для совместимости с прошлыми логами). */
         h3_sdc_read_wlan_reg8((8u << 13) | 0x0287, &num);
         uart_print(" pkt=0x");
         uart_print_hex((uint32_t)num);
+        /* CCA-статистика приёмника: rCCK0_CCA (0xA08) — счётчик CCK-CCA
+           (чувствует ли чип активность в эфире), rOFDM0_ECCAThreshold
+           (0xC4C) — состояние OFDM. Если cca/cr растут между свипами —
+           антенна и RF-тракт слышат эфир. */
+        h3_sdc_read_wlan_reg32(0x0A08, &d);
+        uart_print(" cca=0x");
+        uart_print_hex(d);
+        h3_sdc_read_wlan_reg32(0x0C4C, &d);
+        uart_print(" ofdm=0x");
+        uart_print_hex(d);
+        /* rCCK0_TRSSIReport (0xA50): биты [6:0] = TRSSI — отчёт уровеня
+           принятого сигнала (bCCKTRSSI=0x7F). Ненулевой при активности
+           в эфире — самый прямой признак, что RF/BB слышит канал.
+           rCCK0_RxReport (0xA54): RX-отчёт CCK. */
+        h3_sdc_read_wlan_reg32(0x0A50, &d);
+        uart_print(" trssi=0x");
+        uart_print_hex(d & 0x7Fu);
+        h3_sdc_read_wlan_reg32(0x0A54, &d);
+        uart_print(" rxrpt=0x");
+        uart_print_hex(d);
         uart_print("\r\n");
     }
 
