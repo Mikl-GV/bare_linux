@@ -143,6 +143,42 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
   TXPAUSE=0x00. Бит 15 после LCK может остаться 1 — норма для 8188F.
 - RF_CHNLBW дефолт 0x400 (бит 10 = полоса 20/40М), канал в [7:0].
 
+### RX-инициализация (W.171, по rtl8188f_hal_init/sdio_halinit) 
+
+Порядок (проверен, все адреса из драйвера 8188F):
+
+1. **LLT auto-init** (`rtl8188f_InitLLTTable`): `0x0224 |= BIT16`, поллинг сброса (до 1 с).
+2. **TX-границы** (`_InitTxBufferBoundary`): `txpktbuf_bndy=0xF1` = TX_PAGE_BOUNDARY_8188F
+   (0xFF − BCNQ 0x08 − BCNQ1 0x00 − WOWLAN 0x07 + 1) в 0x0424, 0x0425, 0x045D, 0x0114.
+3. **RX-граница** (`_InitPageBoundary`): `0x0116 = 0x3EFF` (16-бит) = RX_DMA_BOUNDARY_8188F
+   (0x4000 − 0x100 − 1). ВАЖНО: 0x0116, не 0x0115.
+4. **PBP** (`_InitTransferPageSize`): `0x0104 = 0x11` (PBP_128|PBP_128).
+5. **DRVINFO_SZ** (`_InitDriverInfoSize`): `0x060F = 0x04` (единицы 8 байт).
+6. **NETTYPE_AP** (`_InitNetworkType`): `REG_CR[17:16] = 0x2` (32-бит RMW!).
+7. **RCR/RRSR/RXFLTMAP/MAR** (`_InitWMACSetting`): 0x0608=0x7000208F (AAP|APP_PHYST_RXFF|
+   APP_ICV|APP_MIC|AMF|CBSSID...), 0x0440=0x000F0F (скорости), 0x06A0/0x06A2/0x06A4,
+   0x0620/0x0624=0xFFFFFFFF.
+8. **RXDMA** (`_initSdioAggregationSetting`): `0x010C |= BIT2` (RXDMA_AGG_EN),
+   `0x0290 |= BIT1` (RXDMA_AGG_MODE_EN).
+9. **REG_CR MAC-блок** (sdio_halinit.c:1240 «Enable MACTXEN/MACRXEN block»):
+   `0x0100 |= BIT6|BIT7|BIT8(MACTXEN)|BIT9(MACRXEN)` — БЕЗ bit8/9 802.11-MAC не запущен,
+   RX невозможен в принципе. (у нас из BB-конфига REG_CR=0x63F без них).
+10. **SDIO HIMR** (0x14, fn0, 32-бит!): байт 0x14 = 0x07 (RX_REQUEST|AVAL|TXERR),
+    байт 0x16 = 0x02 (C2HCMD BIT17). HISR (0x18) = 0xFF (clear).
+11. **RW_RELEASE_EN**: `0x287 &= ~BIT18` (release RX DMA; BIT18=1 — пауза DMA).
+12. **Канал**: RF_CHNLBW(0x18) = 0x401 (канал 1, BW 20М; НЕ 0x8C01 — там бит 15=rежим калибровки).
+
+### Индикаторы RX (диагностика W.171)
+
+- **RX0_REQ_LEN**: `0x1C` (fn0) — длина ожидающего RX-запроса (16-бит); >0 = данные в FIFO.
+- **RXPKT_NUM**: `0x287` (device 8) — число пакетов в RXPKTBUF (FW), биты [7:0].
+  `0x02000000` в 32-бит = BIT25 (не счётчик! счётчик в младших битах).
+- **C2H_EVT**: `0x01A0` — событие firmware→host (0 = FW не генерирует).
+- **HISR**: `0x18` (fn0) — статус SDIO-прерываний (bit0 RX_REQUEST).
+- **MCUFWDL**: `0x0080` — `0xC6` = MCUFWDL_RDY|FWDL_ChkSum_rpt|WINTINI_RDY|RAM_DL_SEL
+  — **ШТАТНОЕ состояние загруженной и готовой 8051** (маска value_expected драйвера).
+  Бит 2 = FWDL_ChkSum_rpt (подтверждение ЧК), НЕ ошибка!
+
 ### Важные особенности (из отладки)
 
 - Такт MMC1: **OLD mode** (бит30=0), НЕ MODE_NEW — иначе карта не отвечает.

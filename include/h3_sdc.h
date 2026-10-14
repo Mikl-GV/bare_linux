@@ -239,6 +239,15 @@ int h3_wifi_efuse_read_mac(uint8_t mac[6]);
    Порт phy_LCCalibrate_8188F. Вызывать после загрузки FW, до работы радио. */
 void h3_wifi_rf_lck(void);
 
+/* RF-калибровка IQK (дисбаланс I/Q), path A (1T1R).
+   Порт phy_IQCalibrate_8188F (Tx IQK + Rx IQK). Вызывать после LCK. */
+void h3_wifi_rf_iqk(void);
+
+/* RX-тест: настроить приём (RCR/RRSR/RXFLTMAP), канал 1, опросить
+   счётчик принятых пакетов (RXPKT_NUM) — проверка живости RX-пути
+   без завершённого IQK. */
+void h3_wifi_rf_rx_test(void);
+
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080
 #define FW_8188F_START       0x1000

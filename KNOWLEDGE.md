@@ -19,14 +19,26 @@
 - Состояние:
   - **Звук:** готов и работает (FEL и SD) на DMA (H3 не кэш-когерентен — нужен
     clean D-cache перед стартом DMA; см. H3-BAREMETAL-GUIDE.md §5).
-  - **WiFi (рабочая точка W.136):** SDC1-драйвер, SDIO CMD52/CMD53, чтение CIS-ID
+  - **WiFi (рабочая точка W.171):** SDC1-драйвер, SDIO CMD52/CMD53, чтение CIS-ID
     (manf=0x024C, card=0xF179 — RTL8189FTV), PowerSeq CARDEMU→ACTIVE, загрузка
-    прошивки (fwdl rc=0), чтение eFuse (MAC пуст — FF) и программная установка
-    MAC в REG_MACID 0x610-0x615 (подтверждена readback).
+    прошивки (fwdl rc=0, **MCUFWDL=0xC6 = все 4 бита маски драйвера
+    MCUFWDL_RDY|FWDL_ChkSum_rpt|WINTINI_RDY|RAM_DL_SEL — 8051 загружена и
+    готова**, 0xC6 это НЕ ошибка), чтение eFuse (MAC пуст — FF) и программная
+    установка MAC в REG_MACID 0x610-0x615 (подтверждена readback).
     **RF-калибровка LCK работает** (LSSI-доступ к RF-регистрам через
     BB 0x824+edge → 0x8A0, канал читается/пишется). Ключевое: для LSSI обязателен
     полный BB-конфиг (bb_phy_reg[] из halhwimg8188f_bb.c). Подробности в
     HARDWARE-REF.md и H3-BAREMETAL-GUIDE.md §9.
+    **RX-путь**: собрана полная RX-инициализация по драйверу
+    (LLT → TX-границы → rxff_bndy=0x3EFF → PBP → DRVINFO_SZ=4 → NETTYPE_AP →
+    RCR/RXFLTMAP/MAR → RXDMA agg → REG_CR bit8/9 MACRXEN/MACTXEN → HIMR
+    32-бит вкл. C2HCMD → RW_RELEASE=0) и диагностика (RX0_REQ_LEN 0x1C,
+    RXPKT_NUM 0x287, C2H_EVT 0x01A0, HISR 0x18). **Симптом W.171**: при всей
+    конфигурации rxlen=0/pkt=0/hisr=0/c2h=0 — 8051 не генерирует события.
+    Движок IQK не сходится (0x142/0x42 — насыщение, маркеры сбоя из драйвера)
+    при любых константах/5-и retry/H2C/8051-off — вероятно, без полного
+    драйверного окружения (LPS-exit → rf_on → полный RF-конфиг) или FW
+    не в рабочем цикле (нет C2H). Следующий шаг — см. NEXT-CHAT-PROMPT.md.
 
 ---
 
