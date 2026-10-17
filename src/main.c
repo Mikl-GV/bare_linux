@@ -443,10 +443,10 @@ void kmain(void)
                 }
 
                 /* Этап 1: RF-калибровка LCK, затем RX-тест.
-                   IQK отключён: его H2C-обвязка 0x6D (BT_WLAN_CALIBRATION)
-                   сбивает FW — после неё FW не читает H2C (1cc=0x01),
-                   и power-handshake/RX не тестируются. Без IQK FW читает
-                   H2C штатно (1cc=0x00). */
+                   IQK вызывается внутри h3_wifi_rf_rx_test (после включения
+                   MAC, как драйвер: sdio_halinit.c:1238 → :1273 LCK → :1277-1288
+                   H2C 0x6D + poll 0x1E7 + PHY_IQCalibrate), с H2C-обвязкой
+                   0x6D (BT_WLAN_CALIBRATION) до и после калибровки. */
                 h3_wifi_rf_lck();
                 h3_wifi_rf_rx_test();
 

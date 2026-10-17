@@ -9,6 +9,15 @@
 #define UART0_USR (*(volatile uint32_t *)(H3_UART0_BASE + 0x7C))
 #define UART0_THR (*(volatile uint32_t *)(H3_UART0_BASE + 0x00))
 
+/* W.278: кольцевой буфер вывода. uart_putc пишет в память (машино-быстро,
+   не влияет на фазы/тайминги SDIO/RF), а реальная передача в UART идёт
+   порциями при вызовах uart_flush() из udelay()/пауз — так лог больше не
+   тормозит протокол. */
+#define UART_BUF_SIZE 4096
+static volatile uint32_t uart_wr = 0;   /* индекс записи */
+static volatile uint32_t uart_rd = 0;   /* индекс чтения */
+static volatile char uart_buf[UART_BUF_SIZE];
+
 void uart_init(void)
 {
     set_pin_mode(PORTA, 4, 2);   /* PA4 = UART0 TX (F2) */
@@ -17,6 +26,8 @@ void uart_init(void)
     H3_CCU_RST4    |= (1u << 16);   /* снять reset UART0 */
     volatile uint32_t n = 1000;
     while (n--) {}
+    uart_wr = 0;
+    uart_rd = 0;
 }
 
 static int uart_tx_ready(void)
@@ -24,13 +35,40 @@ static int uart_tx_ready(void)
     return (UART0_USR & (1u << 1)) ? 1 : 0;
 }
 
+/* Вытолкнуть разом всё, что есть в буфере (до 256 байт за вызов), чтобы
+   не держать CPU на busy-wait дольше микросекунд. */
+void uart_flush(void)
+{
+    uint32_t wr = uart_wr;
+    uint32_t rd = uart_rd;
+    uint32_t avail = (uint32_t)(wr - rd);   /* unsigned wrap-safe */
+    if (avail > 256) avail = 256;
+    uint32_t sent = 0;
+    while (sent < avail && uart_tx_ready()) {
+        UART0_THR = (uint32_t)(unsigned char)uart_buf[rd & (UART_BUF_SIZE - 1)];
+        rd++;
+        sent++;
+    }
+    uart_rd = rd;
+}
+
+void uart_putc_buffered(char c)
+{
+    uint32_t wr = uart_wr;
+    uint32_t rd = uart_rd;
+    /* Если буфер полностью заполнен — принудительно слить всё. */
+    if ((uint32_t)(wr - rd) >= (UART_BUF_SIZE - 256)) {
+        uart_flush();
+        rd = uart_rd;
+    }
+    uart_buf[wr & (UART_BUF_SIZE - 1)] = c;
+    wr++;
+    uart_wr = wr;
+}
+
 void uart_putc(char c)
 {
-    uint32_t t = 0;
-    while (!uart_tx_ready()) {
-        if (++t > 100000) return;
-    }
-    UART0_THR = (uint32_t)(unsigned char)c;
+    uart_putc_buffered(c);
 }
 
 void uart_print(const char *s)

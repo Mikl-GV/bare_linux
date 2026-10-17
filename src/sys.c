@@ -1,6 +1,7 @@
 #include "sys.h"
 #include "h3.h"
 #include "h3_ccu.h"
+#include "uart.h"
 
 /* High-Speed Timer (HSTMR) на 0x01C60000, 64-bit счётчик вниз.
    Реально работает на ~96.8 МГц (берём 97). Читаем ТОЛЬКО CURNT_LO - по
@@ -51,7 +52,17 @@ void udelay(uint32_t us)
        чтобы избежать зависания при 32-bit переполнении (~44 с). */
     uint32_t cur = HSTMR_CURNT_LO;          /* счётчик вниз */
     uint32_t ticks = us * HSTMR_MHZ;
-    while ((uint32_t)(cur - HSTMR_CURNT_LO) < ticks) { }  /* продвинулись на ticks */
+    /* W.278: пока ждём — фоново сливаем UART-буфер (машино-быстрая запись
+       уже не тормозит протокол; реальная передача идёт в паузах). */
+    uint32_t next_flush = HSTMR_CURNT_LO;
+    uint32_t flush_gap = HSTMR_MHZ / 20;    /* ~50 мкс между сливами */
+    while ((uint32_t)(cur - HSTMR_CURNT_LO) < ticks) {
+        if ((uint32_t)(next_flush - HSTMR_CURNT_LO) >= flush_gap) {
+            next_flush = HSTMR_CURNT_LO;
+            uart_flush();
+        }
+    }
+    uart_flush();
 }
 
 /* Free-standing memset (may be called by the toolchain). */

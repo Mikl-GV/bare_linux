@@ -891,6 +891,7 @@ static uint32_t rf_read(uint8_t off)
 void h3_wifi_rf_lck(void)
 {
     uint32_t lc, ch;
+    uint32_t rf_ac;   /* W: сохр. факт. RF_AC — эталон для packet-TX его НЕ трогает */
 
     uart_print("  lck: start\r\n");
     /* 0) Включить BB/RF — как драйвер (PHY_BBConfig8188F + _DisableRFAFEAndResetBB):
@@ -1081,8 +1082,17 @@ void h3_wifi_rf_lck(void)
     uart_print("\r\n");
     /* 3) LDO ON. */
     rf_write(0xB0, 0xDFBF0);
-    /* 4) подготовка: RF 0x00 = 0 — перевести RF в LCK-режим. */
-    rf_write(0x00, 0x00000);
+    /* 4) Сохранить RF_AC (RF 0x00) и НЕ занулять его: эталон
+          phy_LCCalibrate_8188F (halphyrf_8188f.c:2096-2120) для packet-TX
+          (0xd03 & 0x70 == 0) RF_AC не трогает — только TXPAUSE + 0xB0 + 0x18.
+          Принудительное 0x33D95 после LCK не совпадает с живым чипом
+          (0x28017, D7) и расстраивает аналоговый тракт. */
+    {
+        rf_ac = rf_read(0x00);
+        uart_print("  lck: rf_ac_save=0x");
+        uart_print_hex(rf_ac);
+        uart_print("\r\n");
+    }
     udelay(50);
     lc = rf_read(0x00);
     uart_print("  lck: rf00=0x");
@@ -1094,27 +1104,14 @@ void h3_wifi_rf_lck(void)
     uart_print("  lck: chnlbw_trig=0x");
     uart_print_hex(lc | 0x08000);
     uart_print("\r\n");
-    /* 6) опрос: ждать сброс bit15 (LCK завершён), таймаут ~1 с (100 x 10 мс). */
-    {
-        unsigned int t = 0;
-        lc = rf_read(0x18);
-        while ((lc & 0x08000u) && (++t < 100)) {
-            udelay(10000);
-            lc = rf_read(0x18);
-        }
-        if (lc & 0x08000u) {
-            uart_print("  lck: TIMEOUT after ");
-            uart_print_int((int)(t * 10));
-            uart_print(" ms\r\n");
-        } else {
-            uart_print("  lck: done in ");
-            uart_print_int((int)(t * 10));
-            uart_print(" ms\r\n");
-        }
-        uart_print("  lck: chnlbw_done=0x");
-        uart_print_hex(lc);
-        uart_print("\r\n");
-    }
+    /* 6) LCK-пауза: эталон phy_LCCalibrate_8188F (halphyrf_8188f.c:2133)
+          ждёт фиксированные 100 мс БЕЗ поллинга бита 15 — у 8188F бит 15
+          может оставаться взведённым после завершения (D7). */
+    udelay(100000);
+    lc = rf_read(0x18);
+    uart_print("  lck: chnlbw_done=0x");
+    uart_print_hex(lc);
+    uart_print("\r\n");
     /* 7) LDO OFF. */
     rf_write(0xB0, 0xDFFF0);
 /* 8) Восстановить канал: LCK затирает биты [7:0] RF 0x18; ставим явно
@@ -1125,11 +1122,11 @@ void h3_wifi_rf_lck(void)
     uart_print("  lck: chnlbw_restored=0x");
     uart_print_hex(lc);
     uart_print("\r\n");
-    /* 9) Восстановить RF 0x00: LCK перевёл его в специальный режим (0).
-          Возвращаем значение ИЗ RF-таблицы (0x33D95, последняя запись
-          rf_radioa — ant-switch), а не дефолт 0x30000 — иначе аналоговый
-          тракт работает не в штатной конфигурации, заданной таблицей. */
-    rf_write(0x00, 0x33D95);
+    /* 9) Восстановить RF_AC (RF 0x00) из сохранённого значения. LCK не
+          должен менять режим RF-тракта; возвращаем то, что было до LCK
+          (не жёсткий 0x33D95 из таблицы, который расходится с живым
+          0x28017 и расстраивает аналоговый тракт). */
+    rf_write(0x00, rf_ac);
     udelay(100);
     lc = rf_read(0x00);
     uart_print("  lck: rf00_restored=0x");
@@ -1208,46 +1205,19 @@ void h3_wifi_rf_iqk(void)
        «пишутся» только в shadow и не применяются к аналоговому тракту,
        из-за чего IQK даёт насыщение 0x142/0x42. */
 
-    /* H2C-обвязка до IQK (sdio_halinit.c:1275-1293): firmware координирует
-       калибровку — отправить H2C 0x6D={1} (H2C_8188F_BT_WLAN_CALIBRATION),
-       дождаться, что FW приняла кадр (0x1CC bit0=0), затем поллить 0x1E7
-       bit0 (FW выполнила свою часть), но НЕ выключать 8051 — иначе FW
-       не обработает H2C. */
+    /* W.279: H2C 0x6D={1} BT_WLAN_CALIBRATION УБРАН. В W.276-W.278 FW НЕ
+       обрабатывает эту команду: box0 (0x1CC bit0) навсегда остаётся занят
+       (hmetfr=0x01 весь свип), все последующие H2C (SET_PWR_MODE уже прошёл,
+       AP_REQ_TXRPT в c2h_ping) теряются, C2H не приходит, пакеты не
+       выкладываются в SDIO FIFO. 0x6D — опциональная обвязка BT/WLAN coex;
+       у нас нет BT, а IQK host-driven (мы сами пишем BB/RF, триггерим one-shot,
+       читаем e94/e9c/eac) и проходит без участия FW. Убираем отправку, чтобы
+       освободить box0 для настоящих H2C. 0x1E7 оставлен как диагностика. */
     {
         uint8_t en = 0;
-        uint8_t hm = 0;
-        uint32_t h2c_cmd = 0;
-
-        /* 8051 включён? (FEN_CPUEN = 0x03 bit2). */
         h3_sdc_read_wlan_reg8(0x03, &en);
         uart_print("  iqk: mcu_pre=0x"); uart_print_hex((uint32_t)en); uart_print("\r\n");
-
-        /* Отправить H2C box0: [0]=ElementID 0x6D, [1..]=data {0x01}.
-           ВАЖНО (W.267a): НЕ ждать valid==0 после записи — драйвер
-           (rtl8188f_cmd.c:96-127) тоже не ждёт: FW держит valid взведённым,
-           пока выполняет калибровку (это и есть «beginning of IQK»), а хост
-           параллельно делает IQK. Ожидание valid здесь застревает на 100 мс
-           и главное — ломает отправку финального 0x6D={0} после IQK
-           (бокс остаётся занят). Только поллим 0x1E7 cal_ready ниже. */
-        h2c_cmd = 0u | (0x01u << 8) | (0x6Du << 0);  /* le32: [0]=0x6D, [1]=0x01 */
-        h3_sdc_write_wlan_reg32(0x01D0, h2c_cmd);    /* HMEBOX0 */
-        /* Диагностика: прочитать valid, НО не ждать его снятия. */
-        h3_sdc_read_wlan_reg8(0x01CC, &hm);
-        uart_print("  iqk: h2c_sent 0x6D={1} 1cc=0x");
-        uart_print_hex((uint32_t)hm);
-        uart_print("\r\n");
-        /* Поллить 0x1E7 bit0 (FW сообщила о готовности к калибровке). */
-        {
-            unsigned int t = 0;
-            uint8_t s = 0;
-            do {
-                udelay(10000);
-                h3_sdc_read_wlan_reg8(0x01E7, &s);
-            } while (!(s & 0x01u) && (++t < 40));    /* ~400 мс, как драйвер */
-            uart_print("  iqk: cal_ready 1e7=0x");
-            uart_print_hex((uint32_t)s);
-            uart_print("\r\n");
-        }
+        uart_print("  iqk: 0x6D removed (box0 free)\r\n");
     }
 
     /* MAC-настройки калибровки (_PHY_MACSettingCalibration8188F,
@@ -1615,38 +1585,16 @@ void h3_wifi_rf_iqk(void)
         h3_sdc_write_wlan_reg8(0x0551, (uint8_t)(mreg | (1u << 3)));
     }
 
-    /* H2C-обвязка после IQK (sdio_halinit.c:1291-1293): сообщить FW об
-       окончании калибровки — H2C 0x6D={0}. ПЕРЕД записью ждём, пока FW
-       сняла valid с прошлого 0x6D={1} (она калибрует ~100 мс, за это
-       время наш IQK успел закончиться) — как _is_fw_read_cmd_down
-       (rtl8188f_cmd.c:31-50). НЕ писать 0x00 в 0x1CC — сбивает valid. */
+    /* W.279: H2C 0x6D={0} УБРАН (вместе с 0x6D={1} до IQK). Как и при входе,
+       FW не обрабатывает 0x6D, и отправка финального кадра вешала box0.
+       Вместо него — диагностика HMETFR: подтвердить, что box0 свободен
+       после IQK (эталонный путь: после калибровки FW свободна для H2C). */
     {
-        uint32_t h2c_cmd = 0;
-        unsigned int t4 = 0;
-        uint8_t hm4 = 0xFF;
-        do {
-            udelay(1000);
-            h3_sdc_read_wlan_reg8(0x01CC, &hm4);
-        } while ((hm4 & 0x01u) && (++t4 < 100));
-        uart_print("  iqk: h2c0_pre 1cc=0x");
-        uart_print_hex((uint32_t)hm4);
+        uint32_t hm4 = 0;
+        h3_sdc_read_wlan_reg32(0x01CC, &hm4);
+        uart_print("  iqk: hmetfr_after=0x");
+        uart_print_hex(hm4);
         uart_print("\r\n");
-        h2c_cmd = 0u | (0x00u << 8) | (0x6Du << 0);
-        h3_sdc_write_wlan_reg32(0x01D0, h2c_cmd);
-        /* ОБЯЗАТЕЛЬНО дождаться, пока FW заберёт команду (valid==0) —
-           иначе бокс останется занят, и все следующие H2C (SET_PWR_MODE
-           в RX-блоке) потеряются (лог: h2c_pre 1cc=0x01). */
-        {
-            unsigned int t5 = 0;
-            uint8_t hm5 = 0xFF;
-            do {
-                udelay(1000);
-                h3_sdc_read_wlan_reg8(0x01CC, &hm5);
-            } while ((hm5 & 0x01u) && (++t5 < 100));
-            uart_print("  iqk: h2c0_after 1cc=0x");
-            uart_print_hex((uint32_t)hm5);
-            uart_print("\r\n");
-        }
     }
     uart_print("  iqk: done\r\n");
 }
@@ -1694,7 +1642,7 @@ void h3_wifi_rf_rx_test(void)
         uart_print_hex((uint32_t)rpwm);
         uart_print(" (fw_rdy=");
         uart_print_int((int)((rpwm >> 1) & 1));
-        uart_print(" err=");
+        uart_print(" chksum=");
         uart_print_int((int)((rpwm >> 2) & 1));
         uart_print(" rst=");
         uart_print_int((int)((rpwm >> 3) & 1));
@@ -1787,6 +1735,24 @@ void h3_wifi_rf_rx_test(void)
             uart_print_hex((uint32_t)hb);
             uart_print("\r\n");
         }
+        udelay(5000);
+    }
+
+    /* W.277: H2C RSSI_SETTING (0x42) УБРАН — в W.276 FW застревает на нём:
+       после записи 0x42 бокс0 остаётся занят (1cc=0x01), и все последующие
+       H2C (0x6D={1}/0x6D={0}, AP_REQ_TXRPT) теряются; cal_ready 1e7=0.
+       RSSI_SETTING в драйвере шлётся из ODM в связанном состоянии (STA с
+       MACID), для NOLINK/scan он not applicable. Вместо него — диагностика
+       HMETFR (0x1CC, 32-бит): valid-биты 0..3 = занятость боксов 0..3. */
+    {
+        uint32_t hmfr = 0;
+        h3_sdc_read_wlan_reg32(0x01CC, &hmfr);
+        uart_print("  rx: hmetfr=0x");
+        uart_print_hex(hmfr);
+        uart_print(" (box");
+        for (int bx = 0; bx < 4; bx++)
+            uart_print_int((int)((hmfr >> bx) & 1));
+        uart_print(")\r\n");
         udelay(5000);
     }
 
@@ -1907,6 +1873,7 @@ void h3_wifi_rf_rx_test(void)
     h3_sdc_write_wlan_reg8(0x0425, 0xF8);   /* TXPKTBUF_MGQ_BDNY */
     h3_sdc_write_wlan_reg8(0x045D, 0xF8);   /* TXPKTBUF_WMAC_LBK */
     h3_sdc_write_wlan_reg8(0x0114, 0xF8);   /* TRXFF_BNDY (tx start) */
+    h3_sdc_write_wlan_reg8(0x0209, 0xF8);   /* REG_TDECTRL+1 (0x0208+1): 5-й регистр _InitTxBufferBoundary (sdio_halinit.c:325) */
 
     h3_sdc_read_wlan_reg32(0x0224, &d);
 
@@ -2005,11 +1972,12 @@ void h3_wifi_rf_rx_test(void)
            0x7000200F — без AM (bit2, multicast) и с снятым CBSSID_DATA (6).
            Для скана снимаем только CBSSID_BCN (bit7) → 0x7000604E. */
     h3_sdc_write_wlan_reg32(0x0608, 0x7000604Eu);   /* _InitWMACSetting, ~BCN */
-/* RRSR (0x0440): базовые принимаемые скорости. Живой чип (дифф с Lakka,
-       rtl8189fs-live-snapshot: 0x440=0x15F) ставит RATE_ALL_CCK|RATE_1M_24M
-       OFDM = 0x15F (CCK 1/2/5.5/11 + OFDM 6/9/12/18/24), БЕЗ 36/48/54. Мы
-       раньше ставили 0xFFF (все OFDM). Выравниваем ровно по живому эталону. */
-h3_sdc_write_wlan_reg32(0x0440, 0x0000015Fu);
+/* RRSR (0x0440): базовые принимаемые скорости. Эталон на инициализации
+        (_InitAdaptiveCtrl, sdio_halinit.c:583-586) пишет RATE_RRSR_CCK_ONLY_1M
+        = 0xFFFF1 (RATE_BITMAP_ALL=0xFFFFF с очисткой, hal_com_reg.h:767,770).
+        Раньше ставили 0x15F (CCK 1/2/5.5/11 + OFDM 6..24) — такого значения
+        драйвер для 8188F не пишет; выравниваем по эталону. */
+h3_sdc_write_wlan_reg32(0x0440, 0x000FFFF1u);
     /* RXFLTMAP на скане (как hw_var_set_mlme_sitesurvey): RXFLTMAP2=0 —
        не принимать data-кадры, RXFLTMAP1=ps-poll, RXFLTMAP0=mgmt.
        Живой чип (Lakka) в том же режиме читается как 0x6A0=0xffff,
@@ -2248,16 +2216,29 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
        Оставлен КОМПАКТНЫЙ контрольный дамп ключевых MAC-регистров. */
     uart_print("  rx: macchk");
     {
-        static const uint32_t macchk[12] = {
-            0x0100, 0x0102, 0x0104, 0x010C, 0x0116, 0x0200,
+        /* 0x00F0 = REG_SYS_CFG: RTL_ID bit23 (1=TEST, 0=NORMAL, hal_com_reg.h:1248),
+           CUT-версия bits 12-15 (CHIP_VER_RTL_MASK, :1252), vendor bits 18-19
+           (EXT_VENDOR_ID, :1239, :1254). Остальные — ключевые MAC-регистры. */
+        static const uint32_t macchk[13] = {
+            0x00F0, 0x0100, 0x0102, 0x0104, 0x010C, 0x0116, 0x0200,
             0x0280, 0x0284, 0x0290, 0x0608, 0x060F, 0x0624
         };
-        for (int mi = 0; mi < 12; mi++) {
+        for (int mi = 0; mi < 13; mi++) {
             h3_sdc_read_wlan_reg32(macchk[mi], &d);
             uart_print(" ");
             uart_print_hex(d);
         }
         uart_print("\r\n");
+        h3_sdc_read_wlan_reg32(0x00F0, &d);
+        uart_print("  rx: syscfg=0x");
+        uart_print_hex(d);
+        uart_print(" (rtl_id=");
+        uart_print_int((int)((d >> 23) & 1));
+        uart_print(" cut=");
+        uart_print_hex((d >> 12) & 0xF);
+        uart_print(" vend=");
+        uart_print_int((int)((d >> 18) & 0x3));
+        uart_print(")\r\n");
     }
 
     /* 4f) TX-probe request (W.220): после разметки TX FIFO (RQPN/LLT, шаг 2)
@@ -2330,14 +2311,23 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             }
         }
         udelay(150000);  /* 150 мс слушаем */
-        /* RX0_REQ_LEN (0x1C, device 0) читаем 16-бит — как драйвер
-           SdioLocalCmd52Read2Byte (sdio_ops.c:2196). Раньше читали байт
-           0x1C — старший байт длины терялся, длинные пакеты казались 0. */
+        /* W.279: RX0_REQ_LEN (0x1C) читаем CMD53 4 байта через функцию 1
+           (sdio_local_read_bytes) — как FREE_TXPG (0x20) в h3_wifi_tx_free_pages_hiq.
+           Два отдельных CMD52 (как было) могут не увидеть SDIO-local целиком. */
         {
-            uint8_t lo = 0, hi = 0;
-            h3_sdc_cmd52_read(0, 0x001C, &lo);
-            h3_sdc_cmd52_read(0, 0x001D, &hi);
-            rxlen = (uint16_t)(lo | (hi << 8));
+            uint8_t rxl4[4] = {0, 0, 0, 0};
+            int rrc = h3_sdc_cmd53_read_bytes(1, 0x001C, 4, rxl4);
+            if (rrc != 0) {
+                uart_print("  rx: rxl4 FAIL rc=");
+                uart_print_int(rrc);
+                uart_print("\r\n");
+            }
+            rxlen = (uint16_t)(rxl4[0] | ((uint16_t)rxl4[1] << 8));
+#if 0
+            /* альтернатива для сравнения: полное 32-бит слово */
+            uint32_t rxlen32 = rxl4[0] | ((uint32_t)rxl4[1] << 8)
+                             | ((uint32_t)rxl4[2] << 16) | ((uint32_t)rxl4[3] << 24);
+#endif
         }
         uart_print("  rx: t=");
         uart_print_int((int)t);
@@ -2345,6 +2335,58 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         uart_print_int((int)(ch & 0xFF));
         uart_print(" rxlen=0x");
         uart_print_hex((uint32_t)rxlen);
+        /* W.280: НАСТОЯЩАЯ выдача пакета из RX FIFO (аналог RecvOnePkt,
+           sdio_ops.c:2313-2348 + sd_recv_rxfifo:1977 sdio_read_port):
+           если RX0_REQ_LEN > 0 — FW сформировала пакет, читаем его CMD53
+           block-mode из device 7 (WLAN_RX0FF_DEVICE_ID), адрес (7<<13)|seq&3,
+           длина RND4(rxlen), seq инкрементится как SdioRxFIFOCnt. После
+           чтения FW освобождает FIFO и RX0_REQ_LEN обнуляется. */
+        if (rxlen > 0) {
+            static uint32_t rx_seq = 0;
+            uint8_t rxpkt[520];
+            uint32_t rdlen = ((uint32_t)rxlen + 3u) & ~3u;
+            if (rdlen > 512) rdlen = 512;
+            for (uint32_t ri = 0; ri < rdlen; ri++) rxpkt[ri] = 0;
+            int frc = h3_sdc_cmd53_read(7, 0x0000 | (rx_seq & 3u), 1, rxpkt);
+            rx_seq++;
+            uart_print(" fifo_rd rc=");
+            uart_print_int(frc);
+            if (frc == 0) {
+                /* rxdesc: [0:1]=rxlen, [2:3]=rxoff, байт 3 bit7=RX, бит21+ = CRC32 */
+                uart_print(" d0=0x");
+                uart_print_hex((uint32_t)rxpkt[0]);
+                uart_print(" d1=0x");
+                uart_print_hex((uint32_t)rxpkt[1]);
+                uart_print(" d2=0x");
+                uart_print_hex((uint32_t)rxpkt[2]);
+                uart_print(" d3=0x");
+                uart_print_hex((uint32_t)rxpkt[3]);
+                uart_print(" d4=0x");
+                uart_print_hex((uint32_t)rxpkt[4]);
+                uart_print(" d5=0x");
+                uart_print_hex((uint32_t)rxpkt[5]);
+            }
+            /* После выдачи проверить, что RX0_REQ_LEN сбросился. */
+            {
+                uint8_t rxl2[4] = {0, 0, 0, 0};
+                h3_sdc_cmd53_read_bytes(1, 0x001C, 4, rxl2);
+                uint16_t rxlen2 = (uint16_t)(rxl2[0] | ((uint16_t)rxl2[1] << 8));
+                uart_print(" rxlen2=0x");
+                uart_print_hex((uint32_t)rxlen2);
+            }
+        }
+        /* W.277: HMETFR (0x1CC, 32-бит) в свипе: valid-биты боксов. Если
+           какой-то бокс застрял (бит=1) — FW не отпустила команду. */
+        {
+            uint32_t hmfr = 0;
+            h3_sdc_read_wlan_reg32(0x01CC, &hmfr);
+            uart_print(" hmetfr=0x");
+            uart_print_hex(hmfr);
+            uart_print("(b");
+            for (int bx = 0; bx < 4; bx++)
+                uart_print_int((int)((hmfr >> bx) & 1));
+            uart_print(")");
+        }
         /* RXPKT_NUM (0x284 dev8, полное 32-битное слово): счётчик пакетов
            во внутреннем RXPKTBUF FW. Если !=0 — FW приняла кадры. Раньше
            читали только байт 0x287 (см. pkt ниже) — полное слово покажет
@@ -2364,6 +2406,25 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         h3_sdc_read_wlan_reg8((8u << 13) | 0x0287, &num);
         uart_print(" pkt=0x");
         uart_print_hex((uint32_t)num);
+        /* W.279: разбор 0x284 по битам: [15:0]=RXPKT_NUM, bit16=RXPKT_RELEASE,
+           bit17=RXDMA_IDLE, bit18=RW_RELEASE_EN (hal_com_reg.h:187-188). */
+        {
+            uint32_t rxpk = d;
+            uart_print(" cnt=");
+            uart_print_hex(rxpk & 0xFFFF);
+            uart_print(" b16="); uart_print_int((int)((rxpk >> 16) & 1));
+            uart_print(" b17="); uart_print_int((int)((rxpk >> 17) & 1));
+            uart_print(" b18="); uart_print_int((int)((rxpk >> 18) & 1));
+        }
+        /* W.279: TRXFF_STATUS (0x011C, 32-бит) — RXFF_PTR/RXFF_WR_PTR живого
+           движется (D7: 0x37003700); у нас читался байт по смещению — теперь
+           полное слово, чтобы увидеть указатель записи/чтения RX FIFO. */
+        {
+            uint32_t trxst = 0;
+            h3_sdc_read_wlan_reg32((8u << 13) | 0x011C, &trxst);
+            uart_print(" trxst=0x");
+            uart_print_hex(trxst);
+        }
         /* W.257: ревизия диагностики. 0xC4C (rOFDM0_ECCAThreshold) — статичный
            порог, НЕ индикатор приёма (драйвер его как статус RX не читает).
            Заменён на живой HISR (0x18 dev0): бит0 = RX_REQUEST — FW собрала
@@ -2375,19 +2436,41 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
            вывод цикла (4 MMIO-чтения + ~200 символов UART ~17 мс на 115200).
            Оставлены только критичные индикаторы: rxlen/rxpkt/req/pkt/hisr. */
         (void)d;
-        h3_sdc_cmd52_read(0, 0x0018, &num);
-        uart_print(" hisr_rx=");
-        uart_print_int((int)(num & 1));
-        uart_print("(0x");
-        uart_print_hex((uint32_t)num);
-        uart_print(")\r\n");
+        /* W.280: HISR (0x18, SDIO-local) читаем 32-бит через CMD53 fn1 — как
+           ReadInterrupt8188FSdio (sdio_ops.c:1627-1630: байты 0x18..0x1B).
+           Через CMD52 fn0 HISR не виден (доказано W.276-W.279: rxlen тоже
+           читался CMD52 fn0 = 0, стал 0x100 после CMD53). */
+        {
+            uint8_t hisr4[4] = {0, 0, 0, 0};
+            h3_sdc_cmd53_read_bytes(1, 0x0018, 4, hisr4);
+            uint32_t hisr32 = (uint32_t)hisr4[0] | ((uint32_t)hisr4[1] << 8)
+                            | ((uint32_t)hisr4[2] << 16) | ((uint32_t)hisr4[3] << 24);
+            uart_print(" hisr=0x");
+            uart_print_hex(hisr32);
+            uart_print("(b0=");
+            uart_print_int((int)(hisr32 & 1));
+            uart_print(" b17=");
+            uart_print_int((int)((hisr32 >> 17) & 1));
+            uart_print(")");
+        }
+        uart_print("\r\n");
+        uart_flush();   /* W.278: слить лог итерации до перехода на след. канал */
     }
 
     /* HISR после свипа — поднялся ли RX_REQUEST (bit0) от FW. */
-    h3_sdc_cmd52_read(0, 0x0018, &num);
-    uart_print("  rx: hisr_after=0x");
-    uart_print_hex((uint32_t)num);
-    uart_print("\r\n");
+    {
+        uint8_t hisr_a[4] = {0, 0, 0, 0};
+        h3_sdc_cmd53_read_bytes(1, 0x0018, 4, hisr_a);
+        uint32_t hisr32 = (uint32_t)hisr_a[0] | ((uint32_t)hisr_a[1] << 8)
+                        | ((uint32_t)hisr_a[2] << 16) | ((uint32_t)hisr_a[3] << 24);
+        uart_print("  rx: hisr_after=0x");
+        uart_print_hex(hisr32);
+        uart_print("(b0=");
+        uart_print_int((int)(hisr32 & 1));
+        uart_print(" b17=");
+        uart_print_int((int)((hisr32 >> 17) & 1));
+        uart_print(")\r\n");
+    }
 
     /* ===== W.266: C2H-ping. Показать, что 8051 читает H2C и отвечает
        C2H по регистровому пути (0x1A0), НЕ через RX-FIFO. =====
@@ -2399,8 +2482,9 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
     {
         unsigned int tt = 0;
         uint8_t cv = 0xFF;
-        uint8_t hisr = 0;
+        uint32_t hisr = 0;
         uint32_t rxn = 0;
+        uint32_t hmfr = 0;
         uint32_t c2hid = 0, c2hseq = 0, c2hlen = 0, c2h0 = 0, c2h1 = 0;
 
         /* ждать, пока FW заберёт предыдущую H2C (valid==0). */
@@ -2408,6 +2492,8 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             udelay(1000);
             h3_sdc_read_wlan_reg8(0x01CC, &cv);
         } while ((cv & 0x01u) && (++tt < 100));
+        /* W.277: полный HMETFR после ожидания — какие боксы свободны. */
+        h3_sdc_read_wlan_reg32(0x01CC, &hmfr);
 
         /* box0 = {id 0x43, macid1=1, macid2=0, 0} */
         h3_sdc_write_wlan_reg32(0x01D0, 0x43u | (0x01u << 8) | (0x00u << 16));
@@ -2418,7 +2504,13 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         h3_sdc_read_wlan_reg32(0x01A0, &c2hid);      /* C2HEVT_CMD_ID/LEN/SEQ */
         h3_sdc_read_wlan_reg32(0x01A4, &c2h0);       /* payload [0..3] */
         h3_sdc_read_wlan_reg32(0x01A8, &c2h1);       /* payload [4..7] */
-        h3_sdc_cmd52_read(0, 0x0018, &hisr);         /* SDIO HISR */
+        {
+            /* W.280: HISR 32-бит через CMD53 fn1 (как выше). */
+            uint8_t hisr4[4] = {0, 0, 0, 0};
+            h3_sdc_cmd53_read_bytes(1, 0x0018, 4, hisr4);
+            hisr = (uint8_t)((uint32_t)hisr4[0] | ((uint32_t)hisr4[1] << 8)
+                   | ((uint32_t)hisr4[2] << 16) | ((uint32_t)hisr4[3] << 24));
+        }
         h3_sdc_read_wlan_reg32(0x0284, &rxn);        /* RXPKT_NUM */
 
         uart_print("  rx: c2h_ping 0x1A0=0x");
@@ -2431,6 +2523,8 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         uart_print_hex((uint32_t)hisr);
         uart_print(" rxpk=0x");
         uart_print_hex(rxn);
+        uart_print(" hmetfr=0x");
+        uart_print_hex(hmfr);
         if (c2hid & 0xFu)
             uart_print(" C2H-PRESENT");
         else

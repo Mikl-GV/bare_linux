@@ -7,8 +7,11 @@
 
 void uart_init(void);
 void uart_putc(char c);
+void uart_putc_buffered(char c);
 void uart_print(const char *s);
 void uart_print_hex(uint32_t n);
 void uart_print_int(int n);
+/* Принудительный слив буфера UART в линию (не дожидаясь udelay). */
+void uart_flush(void);
 
 #endif /* UART_H */
