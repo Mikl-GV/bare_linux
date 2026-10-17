@@ -2348,23 +2348,24 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         static uint8_t rxbuf[0x4000 + 512];
         if (rxlen > 0) {
             uint32_t acc = 0;
-            /* W.307: накопленный пакет (rxlen до 0x4000) читается одним
-               окном: seq фиксирован на окно, чанками по 4096 внутри. */
+            /* W.308: drain-цикл эталона (sdio_ops.c:2196-2223). Перечитываем
+               0x1C (RX0_REQ_LEN) на каждой итерации и читаем РОВНО size одним
+               CMD53, seq++ один раз за пакет (окно). Без cap на 8 блоков:
+               эталон читает size целиком (sd_recv_rxfifo). Это выгребает весь
+               накопленный буфер (rxlen2 после ch1 = 0x26DC), а не бросает
+               остаток в чужое окно след. канала. */
             uint32_t total = (uint32_t)rxlen;
             if (total > 0x4000) total = 0x4000;
             uint32_t off_read = 0;
             int frc = 0;
-            /* W.307: одно окно на пакет — как эталон sdio_read_port → _sd_read:
-               адрес (7<<13)|(SdioRxFIFOCnt&3) ФИКСИРОВАН, seq инкрементится ОДИН
-               раз за окно (sdio_ops.c:776). Внутри окна читаем чанками по 4096
-               (8 блоков — проверенный рабочий размер W.285) БЕЗ rx_seq++ на
-               каждый чанк. Накопленный пакет (rxlen=0x3BCF) выгребается всё в
-               ТОМ ЖЕ окне, затем seq++ один раз. */
-            uint32_t blk_chunk = 8;                       /* 8 блоков = 4096 байт */
-            while (off_read < total) {
-                uint32_t want = total - off_read;
-                uint32_t blocks = (want + 511u) / 512u;
-                if (blocks > blk_chunk) blocks = blk_chunk;
+            for (;;) {
+                uint8_t r[4] = {0, 0, 0, 0};
+                if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, r) != 0) break;
+                uint32_t size = r[0] | ((uint32_t)r[1] << 8);
+                if (size == 0) break;
+                if (off_read + size > 0x4000) size = 0x4000 - off_read;
+                if (size == 0) break;
+                uint32_t blocks = (size + 511u) / 512u;
                 uint32_t addr = (7u << 13) | (rx_seq & 3u);
                 frc = h3_sdc_cmd53_read(1, addr, blocks, rxbuf + off_read);
                 uart_print(" seg blks=");
@@ -2373,8 +2374,9 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                 uart_print_int(frc);
                 if (frc != 0) break;
                 off_read += blocks * 512u;
+                rx_seq++;                                 /* один раз за пакет (окно) */
+                if (off_read >= 0x4000) break;
             }
-            rx_seq++;                                     /* seq ОДИН раз за окно (после чтения) */
             uart_print(" fifo_rd rc=");
             uart_print_int(frc);
             uart_print(" read=0x");
