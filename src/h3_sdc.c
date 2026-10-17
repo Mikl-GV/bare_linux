@@ -765,6 +765,10 @@ int h3_wifi_efuse_read_mac(uint8_t mac[6])
         if (h3_sdc_cmd52_read(1, (8u << 13) | 0x0030, &v)) return -1;
         mac[byte_off] = v;
     }
+    /* W.310: снять EFUSE_ACCESS_ON (0xCF=0x00) — как эталон rtw_efuse.c
+       всегда делает в конце. Без этого чип остаётся в eFuse-режиме на всю
+       оставшуюся инициализацию (LCK/IQK/работа 8051). */
+    h3_sdc_cmd52_write(1, (8u << 13) | 0x00CF, 0x00);
     return 0;
 }
 
@@ -794,6 +798,8 @@ int h3_wifi_efuse_read_byte(uint16_t addr, uint8_t *v)
         return -1;
     }
     if (h3_sdc_cmd52_read(1, (8u << 13) | 0x0030, v)) return -1;
+    /* W.310: снять EFUSE_ACCESS_ON (0xCF=0x00), как эталон в конце. */
+    h3_sdc_cmd52_write(1, (8u << 13) | 0x00CF, 0x00);
     return 0;
 }
 
@@ -1037,9 +1043,13 @@ void h3_wifi_rf_lck(void)
                 xcap = 0x20;  /* EEPROM_Default_CrystalCap_8188F */
             xcap &= 0x3F;
             {
-                uint32_t xt = (uint32_t)(xcap | (xcap << 6));
+                /* W.310: CrystalCap по эталону hal_com.c:7811
+                   PHY_SetBBReg(REG_AFE_XTAL_CTRL, 0x007FF800, crystal_cap|crystal_cap<<6).
+                   Маска [22:11] (12 бит), value сдвигается на 11. Старый код
+                   делал <<17, задевая [27:23] — коррапт при xcap с битами 4-5. */
+                uint32_t cc = (uint32_t)(xcap | (xcap << 6)) & 0x0FFFu;
                 h3_sdc_read_wlan_reg32(0x0024, &rtmp);
-                rtmp = (rtmp & ~0x7FF800u) | ((xt & 0x7FF) << 11) | (((xt & 0x7FF)) << 17);
+                rtmp = (rtmp & ~0x007FF800u) | (cc << 11);
                 h3_sdc_write_wlan_reg32(0x0024, rtmp);
             }
             uart_print("  lck: crystalcap=eF=0x");
@@ -2295,15 +2305,38 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         {
             uint32_t d40;
             if (t >= 4 && t < 8) {
-                h3_sdc_write_wlan_reg32(0x0C40, 0x04002000u | 0x200u); /* [28:24]=4, bit9=1 */
-                h3_sdc_write_wlan_reg32(0x0D40, 0x00000600u);
+                /* Каналы 5..8: включить CSI-notch как драйвер (маски каналов).
+                   Значения — из rtl8188f_phycfg.c:1129-1154 (case 6/7/8). */
+                uint32_t c40v, d40v, d4cv;
+                switch (t) {
+                case 4: /* канал 5: [28:24]=0xB, D40=0x06000000 */
+                    c40v = 0x0B000000u; d40v = 0x06000000u; d4cv = 0x00000000u; break;
+                case 5: /* канал 6: [28:24]=0x4, D40=0x00000600 */
+                    c40v = 0x04000000u; d40v = 0x00000600u; d4cv = 0x00000000u; break;
+                case 6: /* канал 7: [28:24]=0x3, D4C=0x06000000 */
+                    c40v = 0x03000000u; d40v = 0x00000000u; d4cv = 0x06000000u; break;
+                default: /* канал 8: [28:24]=0xA, D4C=0x00000380 */
+                    c40v = 0x0A000000u; d40v = 0x00000000u; d4cv = 0x00000380u; break;
+                }
+                h3_sdc_read_wlan_reg32(0x0C40, &d40);
+                d40 = (uint32_t)((d40 & ~0x1F000000u) | c40v) | (1u << 9); /* [28:24]+bit9=enable */
+                h3_sdc_write_wlan_reg32(0x0C40, d40);
+                h3_sdc_write_wlan_reg32(0x0D40, d40v);
                 h3_sdc_write_wlan_reg32(0x0D44, 0x00000000u);
                 h3_sdc_write_wlan_reg32(0x0D48, 0x00000000u);
-                h3_sdc_write_wlan_reg32(0x0D4C, 0x00000000u);
+                h3_sdc_write_wlan_reg32(0x0D4C, d4cv);
                 h3_sdc_read_wlan_reg32(0x0D2C, &d40);
                 h3_sdc_write_wlan_reg32(0x0D2C, d40 | (1u << 28));  /* CSI mask */
                 udelay(1000);
-                uart_print("  rx: notch ch6 set\r\n");
+                uart_print("  rx: notch prev set\r\n");
+            } else {
+                /* W.310: для всех остальных каналов сбросить notch — как
+                   default эталона (rtl8188f_phycfg.c:1165-1167,1173-1174):
+                   C40 bit9=0 (disable), D2C bit28=0 (disable CSI). */
+                h3_sdc_read_wlan_reg32(0x0C40, &d40);
+                h3_sdc_write_wlan_reg32(0x0C40, d40 & ~(1u << 9));
+                h3_sdc_read_wlan_reg32(0x0D2C, &d40);
+                h3_sdc_write_wlan_reg32(0x0D2C, d40 & ~(1u << 28));
             }
         }
         udelay(150000);  /* 150 мс слушаем */
@@ -2375,6 +2408,16 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                 if (frc != 0) break;
                 off_read += blocks * 512u;
                 rx_seq++;                                 /* один раз за пакет (окно) */
+                /* W.310: гейт эталона (sdio_ops.c:2218-2222) — после чтения
+                   пакета читаем HISR (0x18, fn1) и продолжаем drain, ТОЛЬКО
+                   пока SDIO_HISR_RX_REQUEST(bit0) ещё взведён. Без этого после
+                   первого пакета FW уже не готова, а мы запрашиваем следующий
+                   блок(и) → rc=-1 / заморозка DMA. */
+                {
+                    uint8_t h4[4] = {0,0,0,0};
+                    if (h3_sdc_cmd53_read_bytes(1, 0x0018, 4, h4) != 0) break;
+                    if (!(h4[0] & 0x01u)) break;      /* RX_REQUEST снят — пакетов больше нет */
+                }
                 if (off_read >= 0x4000) break;
             }
             uart_print(" fifo_rd rc=");
@@ -2389,14 +2432,12 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                 int pkts = 0;
                 while (off + 24 <= acc && pkts < 64) {
                     uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
-                    uint32_t drvsz = (uint32_t)((rxbuf[off+2] & 0x0F)) << 3;
-                    {
-                        uint32_t d1 = (uint32_t)rxbuf[off+4] | ((uint32_t)rxbuf[off+5] << 8)
-                                   | ((uint32_t)rxbuf[off+6] << 16) | ((uint32_t)rxbuf[off+7] << 24);
-                        uint32_t dv = ((d1 >> 28) & 0xFu) << 3;
-                        if (dv == 0) dv = 4;
-                        drvsz = dv;
-                    }
+                    /* W.310: drvinfo из GET_RX_STATUS_DESC_DRVINFO_SIZE_8188F =
+                       LE_BITS_TO_4BYTE(pdesc,16,4) = rxbuf[off+2] & 0x0F, <<3
+                       (rtl8188f_rxdesc.c:39). Убрана перезапись из off+4..7
+                       (второе dword, там drvinfo нет). Fallback 4, если поле=0. */
+                    uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
+                    if (drvsz == 0) drvsz = 4;
                     uint32_t pkt_total = 24u + drvsz + plen;
                     if (plen == 0 || plen > 0x2000 || off + pkt_total > acc) break;
                     uint32_t fr = off + 24u + drvsz;
