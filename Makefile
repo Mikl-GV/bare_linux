@@ -23,8 +23,16 @@ CFLAGS := -mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard \
           -O2 -g -Wall -Wextra -ffreestanding -fno-builtin -nostdlib \
           -std=gnu99 -fno-stack-protector -fno-common \
           -fno-unwind-tables -fno-asynchronous-unwind-tables \
+          -MMD -MP \
           -I$(INCDIR) -Isrc
 LDFLAGS := -T linker.ld -nostartfiles -nostdlib -Wl,--no-warn-rwx-segments -lgcc
+
+# Автозависимости от заголовков (генерируются -MMD; см. %.d ниже).
+DEPS := $(OBJS:.o=.d)
+-include $(DEPS)
+
+# Порядок: объекты создаются до попытки включить их .d-файлы.
+$(DEPS): ;
 
 .PHONY: all clean bin bump
 

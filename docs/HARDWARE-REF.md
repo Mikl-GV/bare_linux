@@ -103,7 +103,7 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 - **SDC1 на PG0-PG5** (function 2): PG0=CLK, PG1=CMD, PG2=D0, PG3=D1, PG4=D2, PG5=D3.
   Настройка: `PORTG CFG0 [15:0] = 0x2222`, `CFG1 [7:0] = 0x22` (код в h3_sdc1_init).
 
-### SDIO-протокол (проверено на стенде, рабочая точка W.136)
+### SDIO-протокол (проверено на стенде)
 
 - Порядок инициализации чипа (строго, подтверждён на стенде):
   `CMD5 (ждём C=1) → CMD3 (RCA) → CMD7 (select) → CMD52 вкл. Fn1 (CCCR 0x02) →
@@ -112,9 +112,10 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
   PowerSeq CARDEMU→ACTIVE (`h3_wifi_power_on_chip`) выполняется **ДО включения
   Fn1** — без него CMD53-write к функции 1 срывается (rc=-2, risr=0).
 - Чистая I/O-карта: **CMD0/CMD8/ACMD41 не используются** (по спецификации SDIO).
-- Рабочая ширина на этом этапе — **1-bit** (перед FW принудительно ставится 1-bit).
-  4-bit: CCCR 0x07 [2:0] = 0b01 + `SDC_CTYPE=1` (по SDIO-спецификации); на стенде
-  не используется до подтверждённого RX.
+- Рабочая ширина по эталону (dtb `sun8i-h3-orangepi-lite.dtb`, образ 2.3.1) — **4-bit**
+  для mmc@01c10000 (bus-width=<4>) + pinctrl `drive-strength=<30>`, `bias-pull-up`
+  (у child `sdio_wifi@1` — drive-strength=<40>). Переключение: CCCR 0x07 [2:0] = 0b10
+  (bit1) + `SDC_CTYPE=1`. Такт: SCLK 24M/2/2 = 6 МГц (N=0, M=2), CKC DIV=0.
 - CIS: адрес из CCCR 0x09-0x0B = 0x1000, тюпл 0x20 → Manufacturer 0x024C,
   Card/PID 0xF179 (RTL8189FTV).
 - ID чипа печатается как `chip_id manf=0x024C card=0xF179`.
@@ -122,7 +123,7 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
   (локально-администрируемый 02:00:00:XX:XX:XX) в REG_MACID 0x610-0x615
   через CMD53 без инкремента (0x610 len=4, 0x614 len=2).
 
-### RF-доступ и калибровка (W.136, работает)
+### RF-доступ и калибровка (работает)
 
 - **LSSI-запись RF** (Path A): BB 0x840 = `(rf_off << 20) | (data & 0xFFFFF)`.
 - **LSSI-чтение RF**: BB 0x824 (`rFPGA0_XA_HSSIParameter2`) — адрес в [30:23]
@@ -143,7 +144,7 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
   TXPAUSE=0x00. Бит 15 после LCK может остаться 1 — норма для 8188F.
 - RF_CHNLBW дефолт 0x400 (бит 10 = полоса 20/40М), канал в [7:0].
 
-### RX-инициализация (W.171, по rtl8188f_hal_init/sdio_halinit) 
+### RX-инициализация (по rtl8188f_hal_init/sdio_halinit) 
 
 Порядок (проверен, все адреса из драйвера 8188F):
 
@@ -161,14 +162,16 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 8. **RXDMA** (`_initSdioAggregationSetting`): `0x010C |= BIT2` (RXDMA_AGG_EN),
    `0x0290 |= BIT1` (RXDMA_AGG_MODE_EN).
 9. **REG_CR MAC-блок** (sdio_halinit.c:1240 «Enable MACTXEN/MACRXEN block»):
-   `0x0100 |= BIT6|BIT7|BIT8(MACTXEN)|BIT9(MACRXEN)` — БЕЗ bit8/9 802.11-MAC не запущен,
-   RX невозможен в принципе. (у нас из BB-конфига REG_CR=0x63F без них).
+   `0x0100 |= BIT6|BIT7 (MACTXEN=BIT6, MACRXEN=BIT7 — hal_com_reg.h:1293-1294)` —
+   без MACTXEN/MACRXEN 802.11-MAC не запущен, RX невозможен в принципе.
+   К ним же добавляются bit8/9 (ENSWBCN/ENSEC, из `_InitNetworkType`).
+   (у нас из BB-конфига REG_CR=0x63F без них; итог 0x0206FF).
 10. **SDIO HIMR** (0x14, fn0, 32-бит!): байт 0x14 = 0x07 (RX_REQUEST|AVAL|TXERR),
     байт 0x16 = 0x02 (C2HCMD BIT17). HISR (0x18) = 0xFF (clear).
 11. **RW_RELEASE_EN**: `0x287 &= ~BIT18` (release RX DMA; BIT18=1 — пауза DMA).
 12. **Канал**: RF_CHNLBW(0x18) = 0x401 (канал 1, BW 20М; НЕ 0x8C01 — там бит 15=rежим калибровки).
 
-### Уточнения W.181 (сессия W.174→W.181, добавлено к RX)
+### Уточнения RX-сессии (добавлено к RX)
 
 - **H2C SET_PWR_MODE (0x20)** — перевод FW в активный режим:
   `rtl8188f_set_FwPwrMode_cmd(psmode=0)`: payload 6 байт — [0]MODE=0, [1]rlbm(2),
@@ -179,31 +182,33 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
   (было 0; без него 8051 не поднимает HISR-линию). **FBR INT_EN**: `0x100` (fn0)
   |= BIT0 — прерывания функции 1.
 - **RPWM→CPWM active**: записать `HRPWM1 (0x0080, fn0) = 0x00` (запрос active),
-  поллить `CPWM (0x0038, fn0) == 0x00` — FW подтверждает (active=1 в W.177+).
+  поллить `CPWM (0x0038, fn0) == 0x00` — FW подтверждает (active=1).
   0xC0 в RPWM — это запрос LPS/сна, для active надо 0x00.
 - **RCR для скана**: снять `RCR_CBSSID_BCN (BIT7)` — принимаем beacon любой
-  BSSID (wireless сканирование). `0x7000200F` = AAP(0)|APM(1)|AM(2)|AB(3) +
-  APP_PHYST_RXFF(28)|APP_ICV(29)|APP_MIC(30). Бит 3 (AB) СОХРАНЁН (0x0F),
-  снят только bit7.
-- **BBTurnOnBlock**: `RFMOD (0x800) |= BIT16 (bCCKEn) | BIT17 (bOFDMEn)` — в
-  BB-конфиге RFMOD=0x83045700 (биты 16/17 сброшены; без них CCK/OFDM-блоки
+  BSSID (wireless сканирование). Итог скана `0x7000604E` = AAP(0)|APM(1)|AM(2)|AB(3)
+  + CBSSID_DATA(6) + AMF(13) + APP_PHYST_RXFF(28)|APP_ICV(29)|APP_MIC(30),
+  снят только bit7. (ранний вариант 0x7000200F без AM/CBSSID_DATA — устарел).
+- **BBTurnOnBlock**: `RFMOD (0x800) |= bCCKEn | bOFDMEn` — биты **BIT24 (bCCKEn) |
+  BIT25 (bOFDMEn)** (Hal8188FPhyReg.h:515-516; НЕ bit16/17!). В
+  BB-конфиге RFMOD=0x83045700 (биты 24/25 сброшены; без них CCK/OFDM-блоки
   выключены, приёмник не декодирует эфир). После: 0x83075700.
-- **Канал в РАБОТЕ**: `phy_SwChnl8188F` пишет RF_CHNLBW **маской 0x3FF** —
-  реальное значение = RfRegChnlVal & 0x3FF = `0x201/0x206/0x20B` (каналы 1/6/11),
-  а НЕ 0x8C01 (там старшие биты от LCK, работой отсекаются).
-- **H2C SCAN_ENABLE (0x02) / MEDIA_STATUS_RPT (0x01) / JOINBSSRPT**: в rtl8189fs
-  определены в заголовке, но **нигде в .c не вызываются** (grep=0) — скан в этом
-  драйвере идёт без них (только регистры + H2C 0x20).
+- **Канал в РАБОТЕ**: свип пишет RF_CHNLBW напрямую `0xC01/0xC06/0xC0B`
+  (BW20-биты 0xC00 | канал — W.242+; раньше писали 0x201/0x206/0x20B, что
+  ставило не тот бит полосы). НЕ 0x8C01 (там старшие биты от LCK/режим
+  калибровки, ломает приём).
+- **H2C SCAN_ENABLE (0x02) / MEDIA_STATUS_RPT (0x01)**: в драйвере-эталоне
+  (8189fs v4.3.24, образ 2.3.1) определены; MEDIA_STATUS_RPT используется
+  в нашем RX-блоке (MSR=STA + H2C 0x01), скан идёт через регистры.
 - **Симптом**: вся конфигурация 1:1 по драйверу, но rxlen=0/pkt=0/hisr=0/c2h=0,
   rxpk BIT25=1, fifopg=0 — 8051 исполняет FW (WINTINI_RDY=1), но физически не
   декодирует кадры. Хост-сторона исчерпана → блокер в RF-приёмном тракте
-  (усиление/калибровка) или FIFOPAGE 0x0200. См. NEXT-CHAT-PROMPT.md Шаг D.
+  (усиление/калибровка) или FIFOPAGE 0x0200. См. NEXT-CHAT-PROMPT.md. Шаг D.
 
-### Индикаторы RX (диагностика W.171)
+### Индикаторы RX (диагностика)
 
 - **RX0_REQ_LEN**: `0x1C` (fn0) — длина ожидающего RX-запроса (16-бит); >0 = данные в FIFO.
-- **RXPKT_NUM**: `0x287` (device 8) — число пакетов в RXPKTBUF (FW), биты [7:0].
-  `0x02000000` в 32-бит = BIT25 (не счётчик! счётчик в младших битах).
+- **RXPKT_NUM**: `0x284` (device 8) — число пакетов в RXPKTBUF (FW), биты [15:0].
+  `0x00020000` в 32-бит = RXDMA_IDLE (BIT17, не счётчик!).
 - **C2H_EVT**: `0x01A0` — событие firmware→host (0 = FW не генерирует).
 - **HISR**: `0x18` (fn0) — статус SDIO-прерываний (bit0 RX_REQUEST).
 - **MCUFWDL**: `0x0080` — `0xC6` = MCUFWDL_RDY|FWDL_ChkSum_rpt|WINTINI_RDY|RAM_DL_SEL
@@ -214,7 +219,7 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
 
 - Такт MMC1: **OLD mode** (бит30=0), НЕ MODE_NEW — иначе карта не отвечает.
   `SDMMC1_CLK_REG` (0x01C2008C) = SCLK_GATING | SRC_OSC24M | (2<<16) | (15<<0)
-  ≈ 750 кГц, затем CKC немая делитель (DIV=1 → ~375 кГц на инициализации).
+  ≈ 750 кГц, затем CKC делитель (DIV=0 → 6 МГц рабочего такта).
 - Для SDIO-команд CRC ответа НЕ проверяется (CMD52/CMD53).
 - Для data-команд контроллер НЕ взводит CMD_DONE — завершение ждём по
   DATA_DONE (TRANS_COMPLETE). Без этого блочная запись/чтение «зависали».
@@ -222,5 +227,5 @@ OHCI1/OHCI2. Для клавиатуры: USB HID boot protocol. USB Audio (вн
   регистры WLAN IOREG (MAC 0x05, 0x06, 0xF0) — по device id **8**.
   SDIO-адрес команды = `(device_id << 13) | (offset & mask)`.
 
-Документация по чипу и драйверу — в `tools/wifi/HARDWARE-WIFI.md`, референсный
+Документация по чипу и драйверу — в `HARDWARE-WIFI.md`, референсный
 драйвер Linux — в `tools/wifi/rtl8189fs/` (не включается в репозиторий).

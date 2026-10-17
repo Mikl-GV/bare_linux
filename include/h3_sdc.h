@@ -234,6 +234,20 @@ int h3_wifi_download_fw(const void *fw, uint32_t size);
 /* Прочитать заводской MAC из eFuse чипа (адрес 0x11A, 6 байт).
    Возвращает 0 при успехе (mac заполнен), -1 при недоступности eFuse. */
 int h3_wifi_efuse_read_mac(uint8_t mac[6]);
+int h3_wifi_efuse_read_byte(uint16_t addr, uint8_t *v);
+
+/* Состояние питания чипа (диагностика): 0xA0[1:0], 1 = ACTIVE; -1 при ошибке. */
+int h3_wifi_power_state(void);
+
+/* Свободные страницы очереди HIQ в TX FIFO (SDIO-local 0x20; счётчики по чётным
+   байтам HIQ/MIQ/LOQ/PUBQ, 16-бит LE). -1 при ошибке доступа.
+   Перед записью кадра нужно дождаться >= 1 страницы (rtl8189fs_xmit.c:95-121). */
+int h3_wifi_tx_free_pages_hiq(void);
+
+/* Записать MAC в REG_MACID (0x610..0x615): сначала инкрементный путь (как
+   драйвер, sdio_writel), при несовпадении чтения — откат на запись без
+   инкремента. Возвращает 0 при подтверждённой записи, -1 иначе. */
+int h3_wifi_set_mac(const uint8_t mac[6]);
 
 /* RF-калибровка LCK (утечка гетеродина), path A (1T1R).
    Порт phy_LCCalibrate_8188F. Вызывать после загрузки FW, до работы радио. */
@@ -247,6 +261,11 @@ void h3_wifi_rf_iqk(void);
    счётчик принятых пакетов (RXPKT_NUM) — проверка живости RX-пути
    без завершённого IQK. */
 void h3_wifi_rf_rx_test(void);
+
+/* TX: передать probe request (механика 802.11, активный скан).
+   Рецепт из драйвера: tx_desc 40 байт (MGNT_FRAMETAG) + кадр 802.11,
+   запись CMD53 block в TX FIFO (WLAN_TX_HIQ_DEVICE_ID). Возвращает 0/не-0. */
+int h3_wifi_tx_probe_req(uint8_t channel);
 
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080

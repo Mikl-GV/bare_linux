@@ -2,7 +2,7 @@
 
 > Снимки значений, проверенные на стенде (FEL-загрузка, наша прошивка).
 > Это рабочий справочник для отладки; подробные выводы — в H3-BAREMETAL-GUIDE.md
-> и KNOWLEDGE.md. Ревизия: 2026-10-14 (этап WiFi, рабочая точка W.210).
+> и KNOWLEDGE.md. Ревизия: 2026-10-16 (эталон — распакованный образ Lakka 2.3.1).
 
 ## I2S0 (0x01C22000) — эталон (работает)
 
@@ -61,9 +61,9 @@ CPUIF_PMR(0x04)= 000000f8   <- prio mask
 
 ```
 0x00 GCTL  = 20000110   <- INT_ENB(4) CD_DBC(8) + AHB FIFO mode (bit31) при передаче
-0x04 CKC   = 00030001   <- CCLK_ENB(16) CCLK_CTRL(17) DIV=1 (~375 кГц init)
+0x04 CKC   = 00030000   <- CCLK_ENB(16) CCLK_CTRL(17) DIV=0 (такт 6 МГц, 24M/2/2)
 0x08 TMOR  = 00FFFFFF40
-0x0C CTYPE = 00000001   <- 4-bit шина
+0x0C CTYPE = 00000001   <- 4-bit шина (эталон dtb bus-width=<4>)
 0x10 BLKSZ = 00000200   <- 512
 0x38 RISR  = 00000004   <- после CMD: CMD_DONE (для data-команд ждём DATA_DONE/bit3)
 0x3C STA   = 0001AD06   <- FIFO/статус
@@ -76,7 +76,7 @@ pin: pl_before=0x400, pl_after=0x480 (WIFI_EN PL7 поднят)
 pg_cfg0=0x77772222, pg_cfg1=0x00777722 (PG0-5 = function 2 = SDC1)
 ```
 
-## Фактические значения из UART-лога (W.136, работает — полный init + RF LCK)
+## Фактические значения из UART-лога (работает — полный init + RF LCK)
 
 ```
 sdio_init rc=0
@@ -95,12 +95,12 @@ lck: chnlbw_trig=0x8401 done=0x8401      <- LCK отработал (бит15 о�
 lck: done
 ```
 
-Ключевые регистры SDC1 во время работы (1-bit, ~375 кГц init):
+Ключевые регистры SDC1 во время работы (4-bit, 6 МГц — эталон dtb):
 ```
 0x00 GCTL  = 0x20000110   <- INT_ENB(4) CD_DBC(8) + AHB FIFO (bit31) при передаче
-0x04 CKC   = 0x00030001   <- CCLK_ENB(16) CCLK_CTRL(17) DIV=1
+0x04 CKC   = 0x00030000   <- CCLK_ENB(16) CCLK_CTRL(17) DIV=0 (6 МГц)
 0x08 TMOR  = 0xFFFFFFFF   <- ставится на каждую передачу (макс. таймаут)
-0x0C CTYPE = 0x00000000   <- 1-bit (4-bit пока не используется)
+0x0C CTYPE = 0x00000001   <- 4-bit шина (эталон bus-width=<4>)
 0x18 CMDR  = 0x80002675   <- CMD53 write: START|idx|RESP|DATA_TRANS|TRANS_DIR|WAIT_PRE
 0x38 RISR  = 0x00000004   <- CMD_DONE (для data-команд ждём DATA_DONE/bit3)
 0x3C STA   = 0x0001AD06   <- FIFO/статус
@@ -122,7 +122,7 @@ RF 0x01 = 0x780   <- RF power-on
 RF 0xB0 = 0xDFBF0 (LDO ON) / 0xDFFF0 (LDO OFF)
 ```
 
-## Снимок RX-диагностики (W.171, полный init + RX-конфиг)
+## Снимок RX-диагностики (полный init + RX-конфиг)
 
 ```
 rx: mcu=0xC6 (fw_rdy=1 rst=0)      <- 8051 загружена: RDY|ChkSum|WINTINI|RAM_DL_SEL
@@ -132,7 +132,7 @@ rx: rf18=0x401                      <- канал 1, BW 20М
 rx: llt=0x2020                      <- LLT построена (инкремент половины?)
 rx: rx_bndy=0x3EFF                  <- RX_DMA_BOUNDARY (0x0116)
 rx: cr=0x000207FF (bit17=1 bit8=1 bit9=1) <- NETTYPE_AP + MACTXEN + MACRXEN
-rx: rxpk=0x02000000 (rw_release=0)  <- BIT25 (не счётчик); RW_RELEASE снят
+rx: rxpk=0x00020000 (rw_release=0)  <- 0x284: RXDMA_IDLE (BIT17; счётчик [15:0]=0); RW_RELEASE снят
 rx: himr_lo=0x07 hi=0x03            <- RX_REQUEST|AVAL|TXERR + C2HCMD
 rx: agg_th=0x03 drvinfo=0x04 rxdma=0x02
 rx: c2h_evt=0x0                     <- FW НЕ генерирует события (0x01A0)
@@ -142,13 +142,13 @@ rx: fifopg=0x0 rxffptr=0x0          <- FIFOPAGE в порядке (LLT), ука�
 rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0 <- ни одного пакета даже в 10 см от роутера
 ```
 
-**Вывод W.171**: вся RX-конфигурация по драйверу применена и readback подтверждает,
+**Вывод (RX-конфигурация)**: вся RX-конфигурация по драйверу применена и readback подтверждает,
 8051 загружена (0xC6 — штатная маска), но событий нет (c2h=0, hisr=0, rxlen=0,
 pkt=0). Блокер — не регистры хоста, а отсутствие реакции 8051 (не в рабочем
 цикле RX) либо физическая чувствительность (IQK не сходится). Следующие шаги —
 NEXT-CHAT-PROMPT.md.
 
-## Снимок W.181 (финал хост-стороны RX)
+## Снимок (финал хост-стороны RX)
 
 ```
 rx: mcu=0xC6 (fw_rdy=1 rst=0)      <- 8051 исполняет FW (WINTINI_RDY=1)
@@ -158,49 +158,49 @@ rx: fbr=0x07 cccr_set=0x01         <- FBR INT_EN + CCCR IENM включены
 rx: rf18=0x401                     <- канал (свип: 0x201/0x206/0x20B как SwChnl)
 rx: rfmod=0x83075700               <- CCK/OFDM-блоки ON (было 0x83045700)
 rx: cr=0x000207FF (bit17/8/9=1)    <- NETTYPE_AP + MACTXEN + MACRXEN
-rx: rxpk=0x02000000 (bit25=1)      <- BIT25 (значение TBD); RW_RELEASE=0
+rx: rxpk=0x02000000 (rw_release=0)  <- 0x284: RXDMA_IDLE (старшие биты; счётчик [15:0]=0); RW_RELEASE=0
 rx: himr_lo=0x07 hi=0x03           <- RX_REQUEST|AVAL|TXERR + C2HCMD
 rx: rcr=0x7000200F                 <- CBSSID_BCN(bit7) снят; AB(bit3) сохранён
 rx: c2h_evt=0x0 hisr=0x0           <- 8051 не генерирует события
 rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0<- ни одного декодированного кадра
 ```
 
-**Вывод W.181**: хост-сторона 1:1 по драйверу (все шаги W.174→W.181: H2C 0x20,
+**Вывод (хост-сторона)**: хост-сторона 1:1 по драйверу (все шаги: H2C 0x20,
 CCCR/FBR, RPWM active, RFMOD CCK/OFDM, RCR ~CBSSID_BCN, каналы SwChnl 0x201),
 FW жива и читает H2C, но RX-событий нет. Блокер — физический приёмный тракт.
 
-## Снимок W.210 (точка восстановления — RF-тракт исчерпан)
+## Снимок (точка восстановления — RF-тракт исчерпан)
 
-Ключевые регистры после полной инициализации (W.191→W.210):
+Ключевые регистры после полной инициализации:
 
 ```
-# LCK (W.191: RF-таблица до LCK с пропуском 0x18, чистый канал)
+# LCK (RF-таблица до LCK с пропуском 0x18, чистый канал)
 lck: rf_tab loaded (136 regs)  rfread df=0x100 56=0x51CF0 30=0x10000 ...
 lck: rf18_after_tab=0x401  chnlbw_set=0x401  done in 70 ms
 lck: rf00_restored=0x33D95   <- из RF-таблицы (не 0x30000!)
 
-# IQK (W.208-W.210: PI-режим + MAC-настройки, но 0x142/0x42 стабильно)
+# IQK (PI-режим + MAC-настройки, но 0x142/0x42 стабильно)
 iqk: pi_on 860=0x01000100 868=0x01000100   <- PI-режим RF-интерфейса
 iqk: mac_cal set            <- TXPAUSE=0x3F, BCN_CTRL 0x550/0x551 &=~BIT3, 0x40 &=~BIT5
 iqk: rf30=0x20000 rf31=0xF rf32=0x7FF7 rfdf=0x900 rf56=0x5102A rfEF=0x80000
 iqk: tx e94=0x01420000 e9c=0x00420000 eac=0x04002000 <- FAIL (0x142/0x42)
 
-# RX-конфигурация (W.197/W.203/W.205/W.207)
+# RX-конфигурация
 rx: rfmod=0x83045700        <- RFC MOD: bCCKEn(24)|bOFDMEn(25) ON
-rx: rqpn=0x00E0020C          <- REG_RQPN (0x200): HPQ 0x0C|LPQ 0x02<<8|PUBQ 0xE0<<16
-rx: llt=0x2020  rx_bndy=0x3EFF
+rx: rqpn=0x00E7020C          <- REG_RQPN (0x200): HPQ 0x0C|LPQ 0x02<<8|NQ 0x07<<24
+rx: llt=0x2020  rx_bndy=0x3F7F
 rx: bwop=0x04                <- REG_BWOPMODE (0x603): BW_OPMODE_20MHZ
 rx: cr=0x000207FF (macrx_en=1 mactx_en=1)  <- MACTXEN=6, MACRXEN=7
 rx: rxdma_mode=0x0E agg_th=0x010F  <- RXDMA_MODE_CTRL (0x290), AGG_PG_TH (0x280)
 rx: rcr=0x7000604E rrsr=0xFFF mar=0xFFFFFFFF
-rx: fifopg=0x00E0020C        <- readback RQPN (0x200)
+rx: fifopg=0x00E7020C        <- readback RQPN (0x200)
 
 # Свип — FW не приняла НИ ОДНОГО пакета
 rx: t=0..11 ch=1/6/11 rxlen=0 rxpkt=0x00020000 (RXDMA_IDLE) pkt=0
 rx: c2h_evt=0 hisr=0
 ```
 
-**Вывод W.210**: BB/RF/MAC полностью 1:1 с драйвером (209+66+136 регистров,
+**Вывод (RF-тракт)**: BB/RF/MAC полностью 1:1 с драйвером (209+66+136 регистров,
 LCK 70 мс, RQPN, BWOPMODE, агрегация, RCR, H2C active), IQK-обвязка по эталону
 (PI+MAC+RF+BB), но FW не приняла ни одного пакета (счётчик RXPKT_NUM [15:0]=0).
 Блокер — физический приёмный тракт (сигнал не доходит до демодулятора) либо

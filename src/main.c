@@ -406,16 +406,11 @@ void kmain(void)
                     }
                     uart_print("\r\n");
 
-                    /* Запись MAC в REG_MACID (0x610-0x615) двумя CMD53 без инкремента:
-                       0x610 (4 байта) + 0x614 (2 байта), как 32-битные регистры. */
+                    /* Запись MAC в REG_MACID (0x610-0x615) — через слой WiFi
+                       (h3_sdc.c): сначала инкрементный путь как у драйвера,
+                       при несовпадении чтения — откат на запись без инкремента. */
                     {
-                        uint32_t lo = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8)
-                                    | ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
-                        uint32_t hi = (uint32_t)mac[4] | ((uint32_t)mac[5] << 8);
-                        uint32_t base = (8u << 13) | (0x610u & 0x7FFFu);
-                        int wk = 0;
-                        if (h3_sdc_cmd53_write_bytes_noinc(1, base, 4, &lo) != 0) wk = -1;
-                        if (h3_sdc_cmd53_write_bytes_noinc(1, base + 4, 2, &hi) != 0) wk = -1;
+                        int wk = h3_wifi_set_mac(mac);
                         uart_print("  mac_set=");
                         uart_print(wk == 0 ? "OK" : "FAIL");
                         uart_print("\r\n");
@@ -447,14 +442,12 @@ void kmain(void)
                     }
                 }
 
-                /* Этап 1: RF-калибровки: LCK (утечка гетеродина) → IQK (I/Q
-                   дисбаланс). W.208: IQK ВЕРНУТ — исправлена подготовка:
-                   добавлен PI-режим RF-интерфейса (0x860/0x868=0x01000100,
-                   _PHY_PIModeSwitch8188F, которого раньше НЕ было), убраны
-                   rf00_fix и 0x948=0x80 (W.193), исправлена запись 0x1CC
-                   (W.198-W.200). Затем — проверка RX-пути (свип каналов). */
+                /* Этап 1: RF-калибровка LCK, затем RX-тест.
+                   IQK отключён: его H2C-обвязка 0x6D (BT_WLAN_CALIBRATION)
+                   сбивает FW — после неё FW не читает H2C (1cc=0x01),
+                   и power-handshake/RX не тестируются. Без IQK FW читает
+                   H2C штатно (1cc=0x00). */
                 h3_wifi_rf_lck();
-                h3_wifi_rf_iqk();
                 h3_wifi_rf_rx_test();
 
                 uart_print("\r\n");

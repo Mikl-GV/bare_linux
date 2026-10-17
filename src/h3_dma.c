@@ -70,9 +70,14 @@ struct dma_lli {
 };
 
 /* LLI читает сам DMAC — обязан лежать в uncached RAM (.coherent). */
-static struct dma_lli g_lli[2] __attribute__((section(".coherent"), aligned(64)));
+static struct dma_lli g_lli[H3_DMA_AUDIO_PERIODS_MAX]
+    __attribute__((section(".coherent"), aligned(64)));
 
 static int g_ch = AUDIO_DMA_CH;
+static int      g_periods;      /* периодов в кольце */
+static uint32_t g_buf_phys;     /* физический адрес буфера */
+static uint32_t g_buf_bytes;    /* размер кольца в байтах */
+static uint32_t g_last_pos;     /* последняя достоверная позиция, байты */
 
 /* Погасить осиротевшие DMA-каналы (наследие SPL/U-Boot).
  *
@@ -86,6 +91,13 @@ static int g_ch = AUDIO_DMA_CH;
  * НЕ делаем CCU soft-reset DMA (BUS_SOFT_RESET0 bit6) и не трогаем GIC — это
  * рискованно и не нужно: у USB свой HC-DMA (не общий DMAC), HDMI управляется
  * регистрами DE2/TCON, а SD мёртв после `go`.
+ *
+ * I9 (осознанное решение): перебор идёт по ВСЕМ 12 каналам, а не по «безопасному»
+ * диапазону. Зомби встречался именно на канале 4 (PROJECT-MEMORY-ARCHIVE), а у
+ * загрузчика могут остаться каналы и в младших номерах — сужение диапазона
+ * оставило бы часть агентов живыми и вернуло бы «то рычание, то тишину».
+ * Сужать имеет смысл только когда в проекте появится второй потребитель общего
+ * DMAC — тогда по битовой маске владельцев, а не по номеру канала.
  */
 static void dma_reap_stray(void)
 {
@@ -130,8 +142,18 @@ static int dma_pick_channel(void)
     return -1;
 }
 
-int h3_dma_audio_init(uint32_t buf_phys, uint32_t buf_bytes)
+int h3_dma_audio_init(uint32_t buf_phys, uint32_t buf_bytes, int periods)
 {
+    /* Кольцо из periods равных дескрипторов; период кратен 4 байтам. */
+    if (periods < 1 || periods > H3_DMA_AUDIO_PERIODS_MAX) return -1;
+    if (buf_bytes == 0 || (buf_bytes % (uint32_t)periods) != 0) return -1;
+    if ((buf_bytes / (uint32_t)periods) % 4u) return -1;
+
+    g_periods   = periods;
+    g_buf_phys  = buf_phys;
+    g_buf_bytes = buf_bytes;
+    g_last_pos  = 0;
+
     /* Тактировать DMAC. Если DMA-блок в reset (RST0 bit6=0) — снять reset;
        это НЕ глобальный soft-reset, а только сброс состояния. В FEL SPL
        оставляет DMA в reset, поэтому его регистры (SEC/AUTO_GATE/каналы) не
@@ -180,15 +202,15 @@ int h3_dma_audio_init(uint32_t buf_phys, uint32_t buf_bytes)
                  | CFG_DST_DRQ(DRQ_I2S0_TX) | CFG_DST_MODE_IO
                  | CFG_DST_BURST(BURST_8) | CFG_DST_WIDTH(2);
 
-    uint32_t half = buf_bytes / 2;
-    for (int i = 0; i < 2; i++) {
+    uint32_t period_bytes = buf_bytes / (uint32_t)periods;
+    for (int i = 0; i < periods; i++) {
         struct dma_lli *l = &g_lli[i];
         l->cfg    = cfg;
-        l->src    = buf_phys + (uint32_t)i * half;
+        l->src    = buf_phys + (uint32_t)i * period_bytes;
         l->dst    = H3_I2S0_TX_FIFO;
-        l->len    = half;
+        l->len    = period_bytes;
         l->para   = NORMAL_WAIT;
-        l->p_next = (uint32_t)(uintptr_t)&g_lli[(i + 1) & 1];  /* циклически */
+        l->p_next = (uint32_t)(uintptr_t)&g_lli[(i + 1) % periods];  /* циклически */
     }
     __asm volatile("dmb sy" ::: "memory");
     __asm volatile("dsb" ::: "memory");
@@ -197,9 +219,26 @@ int h3_dma_audio_init(uint32_t buf_phys, uint32_t buf_bytes)
        физическому адресу, минуя кэш CPU. Без этого он читает старые данные
        (JTAG показал CFG=0xea000016 и CUR="eGON" по адресу 0x40100000). */
     dcc_clean_range((uint32_t)(uintptr_t)&g_lli[0],
-                    (uint32_t)(uintptr_t)&g_lli[2] - (uint32_t)(uintptr_t)&g_lli[0]);
+                    (uint32_t)(uintptr_t)&g_lli[periods] - (uint32_t)(uintptr_t)&g_lli[0]);
 
     return 0;
+}
+
+/* Позиция чтения внутри кольца (байты). Регистры канала: LLI/DESC 0x08,
+   CUR_SRC 0x10 (RO) — HARDWARE-REF.md:51. Значение вне диапазона буфера
+   (канал остановлен или ещё не стартовал) игнорируем и отдаём последнее
+   достоверное: во время работы CUR_SRC «живой» и лежит внутри [buf, buf+len). */
+uint32_t h3_dma_audio_pos_bytes(void)
+{
+    int n = g_ch;
+    if (n < 0 || g_buf_bytes == 0) return g_last_pos;
+
+    uint32_t cur = DMA_CH(n, 0x10);
+    if (cur < g_buf_phys || cur >= g_buf_phys + g_buf_bytes)
+        return g_last_pos;
+
+    g_last_pos = cur - g_buf_phys;
+    return g_last_pos;
 }
 
 void h3_dma_audio_start(void)

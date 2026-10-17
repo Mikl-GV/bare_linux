@@ -1,7 +1,9 @@
 # WiFi (RTL8189FTV) на Orange Pi Lite — аппаратная справка
 
 > Источник: схема платы `Orange_pi-lite-v1_1.pdf` (в корне проекта) + даташит H3.
-> Дата: 2026-10-11. Этап проекта: поднимаем WiFi.
+> Эталон: распакованный рабочий образ `ref/Lakka-Allwinner.orangepi_lite.arm-2.3.1.image`
+> и его dtb `sun8i-h3-orangepi-lite.dtb` (4-bit SDIO, шина mmc1, drive-strength/pull-up).
+> Дата: 2026-10-16. Этап проекта: поднимаем WiFi.
 
 ## Чип
 
@@ -45,27 +47,31 @@ WIFI_EN — обычный GPIO (порт L, R_PIO), HIGHT — чип включ
 
 ---
 
-## Статус работ (2026-10-11) — актуально, FW vW.040+
+## Статус работ — актуально
 
 ### Готово (проверено на стенде)
 - Схема платы изучена: чип RTL8189FTV, SDC1 (SD/MMC1 = 0x01C10000), PG0-5, WIFI_EN=PL7.
-- Драйвер rtl8189fs (Linux) — в `tools/wifi/rtl8189fs/` (референс, не в репозитории):
-  прошивка, power-seq, регистры чипа.
+- Драйвер rtl8189fs (Linux v4.3.24) — в `tools/wifi/rtl8189fs/` (референс, не в репозитории):
+  прошивка, power-seq, регистры чипа; соответствует драйверу в эталоне (образ 2.3.1).
 - Собственный SDC1-драйвер `src/h3_sdc.c` + `include/h3_sdc.h`.
 - SDIO-обмен работает: CMD5→CMD3→CMD7, CMD52 (обе функции), CMD53-блок-запись.
 - Чтение CIS: адрес 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek).
-- 4-bit режим: CCCR 0x07 [2:0]=010 + SDC_CTYPE=1.
-- Power-on чипа: PowerSeq CARDEMU→ACTIVE, чип просыпается (sdio100=0x07).
-- Первая загрузка прошивки: протокол MCUFWDL реализован (`h3_wifi_download_fw`),
-  прошивка встроена в бинарь (`src/fw_blob.S` + `fw_nic.bin`).
+- 4-bit режим по эталону (dtb): CCCR 0x07 bit1=1 + SDC_CTYPE=1 +
+  pinctrl drive-strength=30/pull-up (регистры DRV/PUL порта G).
+- Такт: OSC24M/2/2 = 6 МГц (фазы output/sample по таблице sunxi-mmc).
+- Reset контроллера: 20 мс стабилизации (патч u-boot 0015).
+- Power-on чипа: PowerSeq CARDEMU→ACTIVE (WIFI_EN=PL7).
+- Загрузка прошивки: протокол MCUFWDL (`h3_wifi_download_fw`), FW встроена
+  в бинарь (`src/fw_blob.S` + `fw_nic.bin`), загрузка на 4-bit/6 МГц.
+- RF-калибровка LCK, RX-тест, probe request (механика 802.11, TX FIFO HIQ).
 
 ### В работе
-- Довести загрузку прошивки до конца (W.046 давал `rc=-19` на записи первой
-  страницы — разбираемся). Ключевые наблюдения:
+- Завершить RX: счётчик принятых пакетов (RXPKT_NUM) — цель.
+- Ключевые наблюдения по SDC1:
   - Для data-команд SDC1 не взводит CMD_DONE — ждать DATA_DONE.
   - Шина MMC1 — OLD mode (бит30=0), иначе карта не отвечает.
   - SDIO-local регистры — device id 0, WLAN IOREG — device id 8.
-- Далее: инициализация MAC/RF, 802.11, WPA2, TCP/IP, SMB/HTTP.
+- Далее: приём beacon/probe-response, ассоциация, 802.11-стек.
 
 ### Снимок JTAG (когда был нужен)
 - После U-Boot (SD): PG0-3 уже function 2 (SDC1), такт MMC1 включён, но WIFI_EN
