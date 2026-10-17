@@ -2257,18 +2257,14 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
           локальное SDIO-пространство, device 0) — на SDIO-чипах это
           единственный признак прихода пакета в RX FIFO (sdio_ops.c:2196),
           а не «pktnum» (USB-регистр). Свип каналов 1 → 6 → 11. */
-    for (t = 0; t < 12; t++) {
+    for (t = 0; t < 13; t++) {
         uint32_t ch;
         uint16_t rxlen = 0;
-        /* Канал в [7:0] + BW20 биты. Эталон (живой чип, rtl8189fs-live-snapshot.md):
-           RF 0x18 = 0x0C04 на канале 4 = BIT11|BIT10 (BW20, 0xC00) + канал.
-           Драйвер (PHY_RF6052SetBandwidth: 0x18[11:10]=2'b11) держит 0xC00 как
-           ширину, а phy_SwChnl8188F маской 0x3FF меняет только канал в [7:0].
-           Раньше мы писали 0x201/0x206/0x20B — ставили bit9 (не BW20!), RF
-           стоял не той полосой -> cca статичен. Исправляем на BW20: 0xC00|ch. */
-        if (t < 4)      ch = 0xC01u;
-        else if (t < 8) ch = 0xC06u;
-        else            ch = 0xC0Bu;
+        /* Канал [7:0] + BW20 (0xC00). Эталон: PHY_RF6052SetBandwidth держит
+           0xC00, phy_SwChnl8188F маской 0x3FF меняет только канал в [7:0].
+           Свип ВСЕХ 13 каналов как 2.4G план драйвера (RTW_RD_2G_WORLD =
+           {1..13}, rtw_mlme_ext.c:148), NOT 1/6/11 (W.280 ошибочно). */
+        ch = 0xC00u | (uint32_t)(t + 1u);
         rf_write(0x18, ch);
         udelay(50000);   /* 50 мс на перестройку синтезатора */
 
@@ -2341,30 +2337,99 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
            block-mode из device 7 (WLAN_RX0FF_DEVICE_ID), адрес (7<<13)|seq&3,
            длина RND4(rxlen), seq инкрементится как SdioRxFIFOCnt. После
            чтения FW освобождает FIFO и RX0_REQ_LEN обнуляется. */
+        /* W.304: правильная выдача RX FIFO по эталону.
+           sdio_read_port(pintfhdl, WLAN_RX0FF_DEVICE_ID=7, cnt, mem)
+             → HalSdioGetCmdAddr8188FSdio(7, cnt, &addr) → addr=(7<<13)|(cnt&3)
+             → _sd_read(func=1, addr, cnt) → sdio_memcpy_fromio(func=1, addr, cnt)
+           ИТОГ: CMD53 function 1, адрес (7<<13)|(seq&3), читаем ВЕСЬ rxlen
+           одним CMD53 (block mode через blks для >511, byte/block для <512).
+           НЕ function 7+addr0 (даёт нули — W.280 баг). seq++ один раз за приём. */
+        static uint32_t rx_seq = 0;
+        static uint8_t rxbuf[0x4000 + 512];
         if (rxlen > 0) {
-            static uint32_t rx_seq = 0;
-            uint8_t rxpkt[520];
-            uint32_t rdlen = ((uint32_t)rxlen + 3u) & ~3u;
-            if (rdlen > 512) rdlen = 512;
-            for (uint32_t ri = 0; ri < rdlen; ri++) rxpkt[ri] = 0;
-            int frc = h3_sdc_cmd53_read(7, 0x0000 | (rx_seq & 3u), 1, rxpkt);
-            rx_seq++;
+            uint32_t acc = 0;
+            /* W.307: накопленный пакет (rxlen до 0x4000) читается одним
+               окном: seq фиксирован на окно, чанками по 4096 внутри. */
+            uint32_t total = (uint32_t)rxlen;
+            if (total > 0x4000) total = 0x4000;
+            uint32_t off_read = 0;
+            int frc = 0;
+            /* W.307: одно окно на пакет — как эталон sdio_read_port → _sd_read:
+               адрес (7<<13)|(SdioRxFIFOCnt&3) ФИКСИРОВАН, seq инкрементится ОДИН
+               раз за окно (sdio_ops.c:776). Внутри окна читаем чанками по 4096
+               (8 блоков — проверенный рабочий размер W.285) БЕЗ rx_seq++ на
+               каждый чанк. Накопленный пакет (rxlen=0x3BCF) выгребается всё в
+               ТОМ ЖЕ окне, затем seq++ один раз. */
+            uint32_t blk_chunk = 8;                       /* 8 блоков = 4096 байт */
+            while (off_read < total) {
+                uint32_t want = total - off_read;
+                uint32_t blocks = (want + 511u) / 512u;
+                if (blocks > blk_chunk) blocks = blk_chunk;
+                uint32_t addr = (7u << 13) | (rx_seq & 3u);
+                frc = h3_sdc_cmd53_read(1, addr, blocks, rxbuf + off_read);
+                uart_print(" seg blks=");
+                uart_print_int((int)blocks);
+                uart_print(" rc=");
+                uart_print_int(frc);
+                if (frc != 0) break;
+                off_read += blocks * 512u;
+            }
+            rx_seq++;                                     /* seq ОДИН раз за окно (после чтения) */
             uart_print(" fifo_rd rc=");
             uart_print_int(frc);
-            if (frc == 0) {
-                /* rxdesc: [0:1]=rxlen, [2:3]=rxoff, байт 3 bit7=RX, бит21+ = CRC32 */
-                uart_print(" d0=0x");
-                uart_print_hex((uint32_t)rxpkt[0]);
-                uart_print(" d1=0x");
-                uart_print_hex((uint32_t)rxpkt[1]);
-                uart_print(" d2=0x");
-                uart_print_hex((uint32_t)rxpkt[2]);
-                uart_print(" d3=0x");
-                uart_print_hex((uint32_t)rxpkt[3]);
-                uart_print(" d4=0x");
-                uart_print_hex((uint32_t)rxpkt[4]);
-                uart_print(" d5=0x");
-                uart_print_hex((uint32_t)rxpkt[5]);
+            uart_print(" read=0x");
+            uart_print_hex(off_read);
+            acc = (total < off_read) ? total : off_read;
+            if (frc == 0 && acc > 0) {
+                /* Парсер: off += 24 + drvinfo + plen, round 8.
+                   SSID из beacon (fc=0x80 0x00), IE обход после 36. */
+                uint32_t off = 0;
+                int pkts = 0;
+                while (off + 24 <= acc && pkts < 64) {
+                    uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
+                    uint32_t drvsz = (uint32_t)((rxbuf[off+2] & 0x0F)) << 3;
+                    {
+                        uint32_t d1 = (uint32_t)rxbuf[off+4] | ((uint32_t)rxbuf[off+5] << 8)
+                                   | ((uint32_t)rxbuf[off+6] << 16) | ((uint32_t)rxbuf[off+7] << 24);
+                        uint32_t dv = ((d1 >> 28) & 0xFu) << 3;
+                        if (dv == 0) dv = 4;
+                        drvsz = dv;
+                    }
+                    uint32_t pkt_total = 24u + drvsz + plen;
+                    if (plen == 0 || plen > 0x2000 || off + pkt_total > acc) break;
+                    uint32_t fr = off + 24u + drvsz;
+                    if (fr + 40 <= acc && rxbuf[fr] == 0x80 && rxbuf[fr+1] == 0x00) {
+                        uart_print(" BCN plen=0x");
+                        uart_print_hex(plen);
+                        uart_print(" ch=");
+                        uart_print_int((int)(ch & 0xFF));
+                        uart_print(" ssid=");
+                        uint32_t ie = fr + 36u;
+                        int got = 0;
+                        while (ie + 2 <= fr + 24u + plen && ie + 2 <= acc) {
+                            uint8_t id = rxbuf[ie];
+                            uint8_t len = rxbuf[ie+1];
+                            if (id == 0x00 && len >= 1 && len <= 32 && ie + 2 + len <= fr + 24u + plen) {
+                                int ok = 1;
+                                for (uint32_t j = 0; j < len; j++) {
+                                    uint8_t cc = rxbuf[ie+2+j];
+                                    if (cc < 0x20 || cc > 0x7E) { ok = 0; break; }
+                                }
+                                if (ok) {
+                                    for (uint32_t j = 0; j < len; j++) uart_putc((char)rxbuf[ie+2+j]);
+                                    got = 1;
+                                }
+                                break;
+                            }
+                            ie += 2u + len;
+                        }
+                        if (!got) uart_print("-");
+                        uart_print("\r\n");
+                        pkts++;
+                    }
+                    off += pkt_total;
+                    off = (off + 7u) & ~7u;
+                }
             }
             /* После выдачи проверить, что RX0_REQ_LEN сбросился. */
             {
