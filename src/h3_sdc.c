@@ -38,6 +38,16 @@ uint32_t sdc_diag_pseq_cmd  = 0;
 uint32_t sdc_diag_pseq_val  = 0;   /* прочитанное значение при ошибке */
 uint32_t sdc_diag_fw_mcufwdl = 0;  /* REG_MCUFWDL при падении FreeToGo */
 
+/* JOINBSS: целевая сеть для host-ассоциации (SSID + BSSID/channel из скана).
+   Определена в начале, т.к. используется из парсера RX-скана. */
+static struct {
+    char ssid[H3_WIFI_SSID_MAX + 1];
+    uint8_t ssid_len;
+    uint8_t bssid[6];
+    uint8_t channel;
+    uint8_t bssid_captured;   /* 1 = BSSID/channel найдены в скане */
+} join_target;
+
 /* SD/MMC хост-контроллер H3 (SDC1) — низкоуровневый доступ.
  *
  * Используется для SDIO-связи с WiFi-чипом RTL8189FTV. Реализация опирается
@@ -1658,30 +1668,54 @@ void h3_wifi_rf_rx_test(void)
         uart_print(" (cpu_en=");
         uart_print_int((int)((sf16 >> 2) & 1));
         uart_print(")\r\n");
-        /* CPWM текущий (toggle) — как HW_VAR_CPWM у драйвера. */
-        h3_sdc_cmd52_read(0, 0x0038, &cpwm_orig);
+        /* CPWM текущий (toggle) — как HW_VAR_CPWM у драйвера.
+           ВАЖНО (W.320): RPWM/CPWM — это SDIO-local регистры (device id 0),
+           и драйвер обращается к ним через fn1 (SdioLocalCmd52Read/Write,
+           _sdio_local_read/write, sdio_ops.c:1056/1117 → HalSdioGetCmdAddr=fn1
+           c адресом (0<<13)|offset). Раньше писали через fn0 — мимо FW,
+           FW не получала запрос S4 и не переходила в ACTIVE (cpwm=0). */
+        h3_sdc_cmd52_read(1, 0x0038, &cpwm_orig);
         /* rpwm ПО ДРАЙВЕРУ (rtw_set_rpwm, rtw_pwrctrl.c:586-591):
              rpwm = pslv | tog, pslv=PS_STATE_S4=0x0C (PS_ST_ACTIVE|PS_ALL_ON),
              + PS_ACK(0x40) только при переходе из S0/S1 в S2+.
            Маска записи 0xC1 (HW_VAR_SET_RPWM, sdio_halinit.c:1690-1697)
-           сохраняет биты 0,6,7: clock(bit0), ACK(bit6), toggle(bit7).
-           Раньше писали 0x0C|0x40|0x80 = 0xCC & 0xC1 = 0xC0 — теряли
-           сам запрос S4 (биты 2-3), FW видела только toggle+ACK и не
-           переходила в активный режим (отсюда hiq_free=0 в W.238). */
+           сохраняет биты 0,6,7: clock(bit0), ACK(bit6), toggle(bit7). */
         tog &= 0x80u;
         rpwm = (uint8_t)((0x0Cu | tog) & 0xC1u);            /* S4|toggle, маска 0xC1 */
         if (((cpwm_orig & 0x0Fu)) < 2u)                     /* cpwm < S2? */
             rpwm = (uint8_t)(rpwm | 0x40u);                 /* +PS_ACK */
-        h3_sdc_cmd52_write(0, 0x0080, rpwm);
+        h3_sdc_cmd52_write(1, 0x0080, rpwm);                /* fn1 (SDIO-local) */
         tog += 0x80u;                                        /* накопление toggle */
         uart_print("  rx: rpwm=0x");
         uart_print_hex((uint32_t)rpwm);
-        uart_print("\r\n");
+        uart_print(" (write masked, per driver)\r\n");
+
+        /* W.337 замер показал rb=0xCC (регистр принимает полный байт).
+           Финальный аппаратный эксперимент: пишем 0xCC (S4|ACK|toggle, с
+           state) и смотрим в CPWM — меняются ли state[3:0] и появляется ли
+           реальный переход в S4. Если cpwm_after state==0x0C — FW вышла в
+           ACTIVE; если 0x00 при этом — подтверждается точка зрения драйвера. */
+        {
+            uint8_t exp_state_before = (uint8_t)(cpwm_orig & 0x0Fu);
+            h3_sdc_cmd52_write(1, 0x0080, 0xCC);
+            udelay(5000);
+            uint8_t cpwm_after = 0;
+            h3_sdc_cmd52_read(1, 0x0038, &cpwm_after);
+            uart_print("  rx: rpwm_exp w=0xCC cpwm=0x");
+            uart_print_hex((uint32_t)cpwm_after);
+            uart_print(" (state_before=0x");
+            uart_print_hex((uint32_t)exp_state_before);
+            uart_print(" state_after=0x");
+            uart_print_hex((uint32_t)(cpwm_after & 0x0Fu));
+            uart_print(")\r\n");
+            /* Вернуть к штатному rpwm (не ломать поллинг ниже). */
+            h3_sdc_cmd52_write(1, 0x0080, rpwm);
+        }
         /* Поллим CPWM: ждём смену toggle bit7 (как драйвер :630). */
         wt = 0;
         do {
             udelay(1000);
-            h3_sdc_cmd52_read(0, 0x0038, &cpwm_now);
+            h3_sdc_cmd52_read(1, 0x0038, &cpwm_now);
         } while (!((cpwm_orig ^ cpwm_now) & 0x80u) && (++wt < 100));
         uart_print("  rx: cpwm=0x");
         uart_print_hex((uint32_t)cpwm_now);
@@ -2094,16 +2128,18 @@ h3_sdc_write_wlan_reg32(0x0440, 0x000FFFF1u);
            старые биты 0x07). Драйвер пишет HIMR 4-байтно через
            sdio_local_write (sdio_ops.c:1781, CMD53). Пишем так же. */
     {
+        /* W.320b: HIMR (0x0014) — SDIO-local, доступ только через fn1
+           (sdio_local_write, sdio_ops.c:1781 CMD53). Раньше писали fn0,
+           HIMR не применялся (readback старые биты 0x07). */
         uint8_t himr4[4] = { 0x01, 0x00, 0x00, 0x00 };  /* RX_REQUEST только */
-        h3_sdc_cmd53_write_bytes(0, 0x0014, 4, himr4);
+        h3_sdc_cmd53_write_bytes(1, 0x0014, 4, himr4);
     }
-    h3_sdc_cmd52_write(0, 0x0018, 0xFF);   /* HISR: clear (write-1-clear) */
-    h3_sdc_cmd52_read(0, 0x0014, &num);
+    h3_sdc_cmd52_write(1, 0x0018, 0xFF);   /* HISR: clear (write-1-clear), fn1 */
+    h3_sdc_cmd53_read_bytes(1, 0x0014, 4, (uint8_t *)&num);
     uart_print("  rx: himr_lo=0x");
-    uart_print_hex((uint32_t)num);
-    h3_sdc_cmd52_read(0, 0x0016, &num);
+    uart_print_hex(num & 0xFF);
     uart_print(" hi=0x");
-    uart_print_hex((uint32_t)num);
+    uart_print_hex((num >> 8) & 0xFF);
     uart_print("\r\n");
 
     /* 4e) Диагностика (W.165): drvinfo, RXDMA_CTRL, C2H_EVT (firmware
@@ -2119,7 +2155,7 @@ h3_sdc_write_wlan_reg32(0x0440, 0x000FFFF1u);
     uart_print("  rx: c2h_evt=0x");
     uart_print_hex(d);
     uart_print("\r\n");
-h3_sdc_cmd52_read(0, 0x0018, &num);
+h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
     uart_print("  rx: hisr_before=0x");
     uart_print_hex((uint32_t)num);
     uart_print("\r\n");
@@ -2451,6 +2487,8 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                         uart_print(" ssid=");
                         uint32_t ie = fr + 36u;
                         int got = 0;
+                        /* BSSID = addr3 кадра (fr+16), для захвата целевой сети. */
+                        uint8_t *p_bssid = &rxbuf[fr + 16];
                         while (ie + 2 <= fr + 24u + plen && ie + 2 <= acc) {
                             uint8_t id = rxbuf[ie];
                             uint8_t len = rxbuf[ie+1];
@@ -2463,6 +2501,16 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                                 if (ok) {
                                     for (uint32_t j = 0; j < len; j++) uart_putc((char)rxbuf[ie+2+j]);
                                     got = 1;
+                                    /* Захват BSSID/channel целевой сети (для
+                                       JOINBSS): если SSID совпал и сеть ещё не
+                                       захвачена. */
+                                    if (join_target.ssid_len == len) {
+                                        int same = 1;
+                                        for (uint32_t j = 0; j < len; j++)
+                                            if (rxbuf[ie+2+j] != (uint8_t)join_target.ssid[j]) { same = 0; break; }
+                                        if (same && !join_target.bssid_captured)
+                                            h3_wifi_scan_capture_target(p_bssid, (uint8_t)(ch & 0xFF));
+                                    }
                                 }
                                 break;
                             }
@@ -3293,24 +3341,165 @@ int h3_sdio_set_bus_width(int four_bit)
 
 /* ---- Передача probe request (механика 802.11) ----
  *
- * 1:1 с драйвером rtl8189fs:
  *  - tx_desc 40 байт: rtl8188f_fill_default_txdesc (MGNT_FRAMETAG,
  *    rtl8188f_hal_init.c:4819-4903):
- *      PKT_SIZE  [0:15], OFFSET=40 [16:23], BMC=1 [24] (broadcast),
+ *      PKT_SIZE [0:15], OFFSET=40 [16:23], BMC=1 [24] (broadcast),
  *      MACID=0 (pattrib->mac_id), QUEUE_SEL=QSLT_MGNT=0x12 (bits[8:12] dw1),
- *      RATE_ID, USE_RATE=1 (dw3 bit8), TX_RATE=DESC_RATE1M=0x00 (dw4 [0:7]),
+ *      USE_RATE=1 (dw3 bit8), TX_RATE=DESC_RATE1M=0x00 (dw4 [0:7]),
  *      RETRY_LIMIT_ENABLE=1 (dw4 bit17), DATA_RETRY_LIMIT=12 (dw4 bits[18:23]),
  *      MBSSID=0 (dw6 bits[12:15]), HWSEQ_EN=1 (dw9 бит, non-QoS mgmt).
  *  - кадр: 802.11 mgmt probe request (frame_ctl=0x0040, sub=0x04),
  *    addr1/addr3=FF:FF:FF:FF:FF:FF, addr2=наш MAC, seq=счётчик;
  *    SSID IE (пустой), Supported Rates IE, DS Set IE (канал).
- *  - запись: sdio_write_port — CMD53 block write на
+*  - запись: sdio_write_port — CMD53 block write на
  *    addr = (WLAN_TX_HIQ_DEVICE_ID<<13)|((len/4)&0x1FFF), HIQ=4
  *    (WLAN_TX_HIQ_DEVICE_ID 4, см. hal_com_reg.h:1580).
  *
- * Возвращает 0 при успехе. */
+ *  Возвращает 0 при успехе. */
 #define TXDESC_SIZE_W220    40u
 #define WLAN_TX_HIQ_DEVICE_ID_W220 4u
+
+/* ===== JOINBSS: передача Auth/Assoc кадров =====
+   Драйвер НЕ использует H2C 0x23 (это H2C_8188F_P2P_LPS_PARAM) — ассоциацию
+   STA в 8189fs делает сам host: issue_auth (opensystem) -> issue_assocreq,
+   ждёт Auth/AssocResp в RX (rtw_mlme_ext.c:8284 / 8669). Состояние целевой
+   сети (join_target) и функции ниже. */
+
+void h3_wifi_set_target(const char *ssid, uint8_t ssid_len)
+{
+    if (ssid_len > H3_WIFI_SSID_MAX) ssid_len = H3_WIFI_SSID_MAX;
+    join_target.ssid_len = ssid_len;
+    for (uint8_t i = 0; i < ssid_len; i++) join_target.ssid[i] = ssid[i];
+    join_target.ssid[ssid_len] = 0;
+    join_target.bssid_captured = 0;   /* сброс до следующего скана */
+}
+
+int h3_wifi_target_is_set(void)
+{
+    return join_target.ssid_len > 0;
+}
+
+/* Захват BSSID/channel целевой сети из принятого beacon (вызывается из
+   парсера RX-скана при совпадении SSID). */
+void h3_wifi_scan_capture_target(const uint8_t *bssid, uint8_t channel)
+{
+    if (join_target.ssid_len == 0) return;
+    for (int i = 0; i < 6; i++) join_target.bssid[i] = bssid[i];
+    join_target.channel = channel;
+    join_target.bssid_captured = 1;
+}
+
+int h3_wifi_target_captured(uint8_t bssid[6], uint8_t *channel)
+{
+    if (!join_target.bssid_captured) return -1;
+    for (int i = 0; i < 6; i++) bssid[i] = join_target.bssid[i];
+    if (channel) *channel = join_target.channel;
+    return 0;
+}
+
+/* Внутренний общий отправитель управляющего кадра (tx_desc MGNT + кадр).
+   Кадр собран в buf+40. Возвращает 0 при успехе. */
+static int tx_mgnt_cmd(uint8_t *frame, uint32_t plen)
+{
+    uint8_t buf[40 + 200];
+    uint32_t i;
+
+    for (i = 0; i < 40; i++) buf[i] = 0;
+    buf[2] = 40u;                                  /* OFFSET = 40 */
+    buf[3] = (uint8_t)((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7)); /* BMC|LAST|FIRST|OWN */
+    buf[5] = 0x12u;                                /* QUEUE_SEL = QSLT_MGNT */
+    buf[13] = (uint8_t)(1u << 0);                  /* USE_RATE */
+    buf[16] = 0x00;                                /* TX_RATE 1M */
+    buf[18] = (uint8_t)((1u << 1) | (12u << 2));   /* RETRY_LIMIT_EN + lim 12 */
+
+    if (plen > 200) plen = 200;
+    for (i = 0; i < plen; i++) buf[40 + i] = frame[i];
+
+    buf[0] = (uint8_t)(plen & 0xFF);
+    buf[1] = (uint8_t)((plen >> 8) & 0xFF);
+
+    /* Дождаться свободной страницы HIQ. */
+    int fp = -1;
+    for (int t = 0; t < 100; t++) {
+        fp = h3_wifi_tx_free_pages_hiq();
+        if (fp >= 1) break;
+        udelay(1000);
+    }
+    if (fp < 1) return -2;
+
+    uint32_t total = (40 + plen + 3) & ~3u;
+    uint32_t fifo_addr = (WLAN_TX_HIQ_DEVICE_ID_W220 << 13)
+                       | ((total / 4) & 0x1FFFu);
+    return h3_sdc_cmd53_write_bytes(1, fifo_addr, total, buf);
+}
+
+/* Authentication (opensystem) к целевому BSSID.
+   Кадр: fc=0xB0, addr1/3=BSSID, addr2=наш MAC, alg=0, seq=1, status=0. */
+int h3_wifi_tx_auth(void)
+{
+    if (!join_target.bssid_captured) return -3;
+
+    uint8_t f[48];
+    uint8_t m[6];
+    /* MAC — из REG_MACID (как tx_probe). */
+    h3_sdc_read_wlan_reg8(0x610, &m[0]);
+    h3_sdc_read_wlan_reg8(0x611, &m[1]);
+    h3_sdc_read_wlan_reg8(0x612, &m[2]);
+    h3_sdc_read_wlan_reg8(0x613, &m[3]);
+    h3_sdc_read_wlan_reg8(0x614, &m[4]);
+    h3_sdc_read_wlan_reg8(0x615, &m[5]);
+
+    f[0] = 0xB0; f[1] = 0x00;              /* Auth */
+    for (int i = 0; i < 6; i++) { f[4 + i] = join_target.bssid[i]; f[10 + i] = m[i]; f[16 + i] = join_target.bssid[i]; }
+    f[22] = 0; f[23] = 0;                   /* seq (0 — не ведём) */
+    f[24] = 0x00; f[25] = 0x00;             /* Auth algo: OPEN */
+    f[26] = 0x01; f[27] = 0x00;             /* Auth seq = 1 */
+    f[28] = 0x00; f[29] = 0x00;             /* Status = 0 */
+    return tx_mgnt_cmd(f, 30);
+}
+
+/* Association Request к целевому BSSID (SSID + rates + capability). */
+int h3_wifi_tx_assoc_req(uint8_t channel)
+{
+    if (!join_target.bssid_captured) return -3;
+
+    uint8_t f[120];
+    uint8_t m[6];
+    h3_sdc_read_wlan_reg8(0x610, &m[0]);
+    h3_sdc_read_wlan_reg8(0x611, &m[1]);
+    h3_sdc_read_wlan_reg8(0x612, &m[2]);
+    h3_sdc_read_wlan_reg8(0x613, &m[3]);
+    h3_sdc_read_wlan_reg8(0x614, &m[4]);
+    h3_sdc_read_wlan_reg8(0x615, &m[5]);
+
+    f[0] = 0x00; f[1] = 0x00;              /* AssocReq */
+    for (int i = 0; i < 6; i++) { f[4 + i] = join_target.bssid[i]; f[10 + i] = m[i]; f[16 + i] = join_target.bssid[i]; }
+    f[22] = 0; f[23] = 0;
+    uint32_t p = 24;
+    /* capability: ESS|privacy=0 (открытая), short slot — по эталону берём из
+       network.IEs, здесь упрощённо бит ESS(0x0001). */
+    f[p++] = 0x01; f[p++] = 0x00;
+    f[p++] = 0x03; f[p++] = 0x00;          /* listen interval = 3 */
+    /* SSID IE */
+    f[p++] = 0x00; f[p++] = join_target.ssid_len;
+    for (uint32_t i = 0; i < join_target.ssid_len; i++) f[p++] = (uint8_t)join_target.ssid[i];
+    /* Supported Rates (CCK+OFDM basic) */
+    f[p++] = 0x01; f[p++] = 0x08;
+    f[p++] = 0x82; f[p++] = 0x84; f[p++] = 0x8B; f[p++] = 0x96; /* 1/2/5.5/11 basic */
+    f[p++] = 0x0C; f[p++] = 0x12; f[p++] = 0x18; f[p++] = 0x24; /* 6/9/12/18 */
+    return tx_mgnt_cmd(f, p);
+}
+
+/* Полная host-ассоциация: Auth opensystem, пауза, затем AssocReq.
+   (Ожидание ответов и обработка AssocResp — следующий этап.) */
+int h3_wifi_join_ap(void)
+{
+    if (!join_target.bssid_captured) return -3;
+    int rc = h3_wifi_tx_auth();
+    if (rc != 0) return rc;
+    udelay(50000);
+    return h3_wifi_tx_assoc_req(join_target.channel);
+}
 
 int h3_wifi_tx_probe_req(uint8_t channel)
 {

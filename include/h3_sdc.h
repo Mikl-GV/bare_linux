@@ -267,6 +267,36 @@ void h3_wifi_rf_rx_test(void);
    запись CMD53 block в TX FIFO (WLAN_TX_HIQ_DEVICE_ID). Возвращает 0/не-0. */
 int h3_wifi_tx_probe_req(uint8_t channel);
 
+/* ===== JOINBSS (host-ассоциация): передача Auth/Assoc кадров =====
+   Драйвер НЕ использует H2C 0x23 (это P2P_LPS_PARAM) — ассоциацию host
+   шлёт сам: issue_auth (opensystem) -> issue_assocreq, ждёт Auth/AssocResp
+   в RX. Здесь: целевая сеть для подключения + результат скана. */
+
+#define H3_WIFI_SSID_MAX 32
+
+/* Целевая сеть: SSID + (заполняется из RX-скана) BSSID и канал. */
+void h3_wifi_set_target(const char *ssid, uint8_t ssid_len);
+/* Занять целевая сеть? */
+int h3_wifi_target_is_set(void);
+/* Внутренний: захват BSSID/channel целевой сети из принятого beacon
+   (вызывается из парсера RX-скана при совпадении SSID). */
+void h3_wifi_scan_capture_target(const uint8_t *bssid, uint8_t channel);
+/* Вернуть захваченные BSSID/channel целевой сети (после скана). */
+int h3_wifi_target_captured(uint8_t bssid[6], uint8_t *channel);
+
+/* Передать Authentication (opensystem) к целевому BSSID на канале.
+   Кадр: frame_ctl=0xB0, addr1/3=BSSID, addr2=наш MAC, alg=0, seq, status=0. */
+int h3_wifi_tx_auth(void);
+
+/* Передать Association Request к целевому BSSID.
+   Кадр: frame_ctl=0x00, capability, listen interval, SSID IE, supported rates. */
+int h3_wifi_tx_assoc_req(uint8_t channel);
+
+/* Выполнить полную host-ассоциацию к целевой сети (пошагово вызывается из
+   слоя; драйверный эквивалент issue_auth->issue_assocreq + ожидание ответа).
+   Возвращает код состояния (0 = auth принят, далее assoc; см. реализацию). */
+int h3_wifi_join_ap(void);
+
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080
 #define FW_8188F_START       0x1000

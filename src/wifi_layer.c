@@ -213,9 +213,53 @@ int wifi_layer_start(void)
                     }
                 }
 
-                /* RF-калибровка LCK, затем RX-тест. */
+                /* RF-калибровка LCK. */
                 h3_wifi_rf_lck();
-                h3_wifi_rf_rx_test();
+
+                /* JOINBSS: целевая сеть ДО скана (фикс. SSID для проверки движка
+                   host-Auth/Assoc; ввод пароля — отдельно). Парсер RX-скана
+                   захватит BSSID/channel при совпадении SSID. */
+                {
+                    /* midea_b8_6515 стабильно виден в W.334 на 5 каналах
+                       (ch2,3,5,6,7,11) — в отличие от MTS_GPON_b4d378
+                       на границе видимости (был только в W.333 на ch9). */
+                    static const char tgt_ssid[] = "midea_b8_6515";
+                    h3_wifi_set_target(tgt_ssid, (uint8_t)(sizeof(tgt_ssid) - 1));
+                    uart_print("join: target=");
+                    uart_print(tgt_ssid);
+                    uart_print("\r\n");
+                }
+
+                /* Retry: до 3 сканов, если целевая сеть не поймалась
+                   (AP может быть на границе видимости). */
+                int jrc = 0;
+                {
+                    uint8_t bssid[6];
+                    uint8_t ch = 0;
+                    int tries;
+                    for (tries = 0; tries < 3; tries++) {
+                        h3_wifi_rf_rx_test();
+                        if (h3_wifi_target_captured(bssid, &ch) == 0) break;
+                        uart_print("join: target not found, retry ");
+                        uart_print_int(tries + 1);
+                        uart_print("/3\r\n");
+                        udelay(500000);
+                    }
+
+                    if (tries < 3) {
+                        uart_print("join: bssid=");
+                        for (int k = 0; k < 6; k++) { print_u8_hex(bssid[k]); if (k < 5) uart_print(":"); }
+                        uart_print(" ch="); uart_print_int((int)ch);
+                        uart_print("\r\n");
+                        jrc = h3_wifi_join_ap();
+                    } else {
+                        uart_print("join: target not found after 3 scans\r\n");
+                        jrc = -4;
+                    }
+                }
+                uart_print("join: rc=");
+                uart_print_int(jrc);
+                uart_print("\r\n");
 
                 uart_print("\r\n");
             }
