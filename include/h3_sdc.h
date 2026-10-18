@@ -324,6 +324,10 @@ struct h3_wifi_ap {
     uint8_t bssid[6];
     int rssi_lvl;    /* уровень сигнала (источник: RX-дескриптор, если доступен;
                         иначе 0) */
+    /* WPA2: RSN IE из beacon'а (id=0x30) этой сети; rsn_len=0 если открытая.
+       Нужен для AssocReq с Privacy+RSN, иначе WPA2-AP даёт rc=-6. */
+    uint8_t rsn_ie[64];
+    uint8_t rsn_len;
 };
 
 /* Сколько сетей найдено в последнем скане. */
@@ -334,6 +338,10 @@ int h3_wifi_scan_ap_get(int i, struct h3_wifi_ap *ap);
 void h3_wifi_scan_ap_reset(void);
 /* Внутренний: добавить сеть в список (вызывается парсером RX-скана). */
 void h3_wifi_scan_ap_add(struct h3_wifi_ap *ap);
+
+/* Установить RSN IE (WPA2) целевой сети из структуры AP (для UI-пути,
+   где RSN не заполняется полным beacon-парсером). */
+void h3_wifi_set_target_rsn(const struct h3_wifi_ap *ap);
 
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080

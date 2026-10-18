@@ -8,15 +8,15 @@
 к WiFi-чипу RTL8189FTV (приём эфира, сканирование beacon/SSID)**. В планах —
 превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние (W.338): RTL8189FTV полностью инициализирован
-> (PowerSeq → загрузка FW → программный MAC → BB/RF-конфиг → LCK → IQK,
-> RPWM/CPWM/HIMR через fn1), **RX-приём работает на всех 13 каналах**: чип
-> принимает beacon'ы, парсер извлекает SSID (в логе `BCN plen=0x10F ch=2
-> ssid=...`). Выдача из RX FIFO — по 1 блоку (512 б) за CMD53, потому что
-> host-контроллер H3 не тянет многоблочный SDIO read (30 блоков → `rc=-1`).
-> Реализован JOINBSS-движок (host Auth/AssocReq кадры, захват BSSID+channel
-> из скана, Retry). Шина SDIO — 1-bit/50 МГц (4-bit ломает
-> data-фазу CMD53 на этом стенде).
+> Рабочее состояние (W.391): **полная host-ассоциация к открытой сети A05s
+> работает end-to-end** (AuthResp=0 → AssocReq → AssocResp=0 → MSR=STA, rc=0),
+> к сети WPA2 (MTS_GPON_9290e0) assoc принят (cap=0x0011, RSN IE 22 байта) и
+> AP инициировал 4-way — в RX приходят EAPOL-Key msg1 (etype=0x888E). В эфире
+> подтверждён приём data-кадров (ARP/IPv6). Реализованы: скан 13 каналов
+> (канал AP берётся из DS Parameter Set IE, а не из свипа), криптоядро WPA2
+> host-supplicant (SHA-1/HMAC-SHA1/PBKDF2/PRF/MIC — проверено), фикса
+> недетерминизма повторных join. Шина SDIO — 1-bit/50 МГц (4-bit ломает
+> data-фазу CMD53). host не тянет многоблочный SDIO read (только 1 блок/CMD53).
 
 ---
 
@@ -26,7 +26,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 в разработке | Скан 13 каналов работает (beacon/SSID); JOINBSS-движок (Auth/AssocReq) готов; до ап-ассоциации (обработка AssocResp). |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join к открытой A05s (rc=0, MSR=STA); assoc к WPA2 принят (EAPOL msg1 приходит); data-приём в эфире; дальше DHCP/dтатik IP + WPA2 handshake. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -65,9 +65,10 @@
   эту версию — см. п.6). Ассоциация идёт host-кадрами Auth/Assoc через RX-путь,
   C2H понадобится позже (для JOINBSS-подтверждения/WPA).
 
-Дальше — обработка Auth/AssocResp из RX-пути для подтверждения ассоциации,
-затем TCP/IP-стек (фикс IP 192.168.x.199) для цели «эмулятор + сетевой доступ
-к ROM на SD». Подробности: `NEXT-CHAT-PROMPT.md`, `HARDWARE-REF.md`.
+Дальше — DHCP/статический IP на открытой A05s (IP авто `x.x.x.199` для пинга
+с компа), затем WPA2 4-way handshake к MTS_GPON_9290e0 (криптоядро готово).
+Цель — «эмулятор + сетевой доступ к ROM на SD». Подробности:
+`NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
 
 ---
 

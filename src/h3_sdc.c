@@ -48,6 +48,11 @@ static struct {
     uint8_t bssid[6];
     uint8_t channel;
     uint8_t bssid_captured;   /* 1 = BSSID/channel найдены в скане */
+    /* WPA2: RSN IE из beacon'а AP (W.373) — включаем в AssocReq, чтобы
+       WPA2-AP принял ассоциацию (без него MTS_GPON_9290e0 даёт rc=-6).
+       rsn_len=0 если сеть открытая (без RSN). */
+    uint8_t rsn_ie[64];
+    uint8_t rsn_len;
 } join_target;
 
 /* Список найденных сетей для UI «Transfer» (заполняется парсером RX-скана). */
@@ -71,7 +76,18 @@ void h3_wifi_scan_ap_add(struct h3_wifi_ap *ap)
             if (scan_aps[i].bssid[j] != ap->bssid[j]) { same = 0; break; }
         if (same) return;   /* тот же физический AP уже есть */
     }
-    scan_aps[scan_ap_count] = *ap;
+    /* Пофайловое копирование (не `= *ap`): большая struct (rsn_ie[64]) уходит
+       в memcpy, а bare-metal линкуется без libc. */
+    {
+        struct h3_wifi_ap *dst = &scan_aps[scan_ap_count];
+        for (int j = 0; j < H3_WIFI_SSID_MAX + 1; j++) dst->ssid[j] = ap->ssid[j];
+        dst->ssid_len = ap->ssid_len;
+        dst->channel = ap->channel;
+        for (int j = 0; j < 6; j++) dst->bssid[j] = ap->bssid[j];
+        dst->rssi_lvl = ap->rssi_lvl;
+        dst->rsn_len = ap->rsn_len;
+        for (int j = 0; j < 64; j++) dst->rsn_ie[j] = ap->rsn_ie[j];
+    }
     scan_ap_count++;
 }
 
@@ -83,7 +99,17 @@ int h3_wifi_scan_ap_count(void)
 int h3_wifi_scan_ap_get(int i, struct h3_wifi_ap *ap)
 {
     if (i < 0 || i >= scan_ap_count) return -1;
-    *ap = scan_aps[i];
+    /* Пофайловое копирование, не `= scan_aps[i]` — см. h3_wifi_scan_ap_add. */
+    {
+        const struct h3_wifi_ap *src = &scan_aps[i];
+        for (int j = 0; j < H3_WIFI_SSID_MAX + 1; j++) ap->ssid[j] = src->ssid[j];
+        ap->ssid_len = src->ssid_len;
+        ap->channel = src->channel;
+        for (int j = 0; j < 6; j++) ap->bssid[j] = src->bssid[j];
+        ap->rssi_lvl = src->rssi_lvl;
+        ap->rsn_len = src->rsn_len;
+        for (int j = 0; j < 64; j++) ap->rsn_ie[j] = src->rsn_ie[j];
+    }
     return 0;
 }
 
@@ -684,6 +710,17 @@ int h3_wifi_tx_free_pages_hiq(void)
 
     if (sdio_local_read_bytes(0x0020u, buf, 8) != 0) return -1;
     return (int)((uint32_t)buf[0] | ((uint32_t)buf[1] << 8));
+}
+
+/* Свободные страницы LOW-очереди (BE/data, байт [4][5] FREE_TXPG).
+   Используется для отправки data-фреймов (DHCP/ARP/IP) — они идут не в HIQ
+   (mgmt), а в LOQ (device 6, BE). W.389. */
+int h3_wifi_tx_free_pages_loq(void)
+{
+    uint8_t buf[8];
+
+    if (sdio_local_read_bytes(0x0020u, buf, 8) != 0) return -1;
+    return (int)((uint32_t)buf[4] | ((uint32_t)buf[5] << 8));
 }
 
 /* Полный power-on чипа: тянет карту из CARDEMU в ACTIVE. */
@@ -2618,6 +2655,26 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                            если он есть — свип ловит off-channel (один BSSID на ch1/5/9/10/11),
                            auth на неверной частоте тонет (rc=-4, W.368). */
                         uint8_t ap_ch = (uint8_t)(ch & 0xFF);
+                        /* WPA2: RSN IE (id=0x30) этого BSSID (W.373) — сохраняем
+                           локально, включим в AssocReq, если сеть станет целью.
+                           Емкость 64 байта (хватит для стандартного RSN). */
+                        uint8_t bcn_rsn[64];
+                        uint8_t bcn_rsn_len = 0;
+                        {
+                            uint32_t ie2 = fr + 36u;
+                            while (ie2 + 2 <= fr + 24u + plen && ie2 + 2 <= acc) {
+                                uint8_t id2 = rxbuf[ie2];
+                                uint8_t len2 = rxbuf[ie2+1];
+                                if (id2 == 0x30 && len2 >= 2 && len2 <= 62 &&
+                                    ie2 + 2 + len2 <= fr + 24u + plen) {
+                                    bcn_rsn_len = (uint8_t)(len2 + 2); /* + header id,len */
+                                    for (uint32_t j = 0; j < bcn_rsn_len && j < 64; j++)
+                                        bcn_rsn[j] = rxbuf[ie2 + j];
+                                    break;
+                                }
+                                ie2 += 2u + len2;
+                            }
+                        }
                         while (ie + 2 <= fr + 24u + plen && ie + 2 <= acc) {
                             uint8_t id = rxbuf[ie];
                             uint8_t len = rxbuf[ie+1];
@@ -2653,6 +2710,11 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                                         ap.channel = ap_ch;
                                         for (int k = 0; k < 6; k++) ap.bssid[k] = p_bssid[k];
                                         ap.rssi_lvl = 0;
+                                        /* WPA2: RSN IE (id=0x30) этой сети — чтобы
+                                           UI-connect мог передать его в AssocReq. */
+                                        ap.rsn_len = bcn_rsn_len;
+                                        for (uint32_t j = 0; j < bcn_rsn_len; j++)
+                                            ap.rsn_ie[j] = bcn_rsn[j];
                                         h3_wifi_scan_ap_add(&ap);
                                     }
                                     /* Захват BSSID/channel целевой сети (для
@@ -2670,6 +2732,10 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                                                 join_target.ssid[j] = (uint8_t)rxbuf[ie+2+j];
                                             join_target.ssid_len = (uint8_t)len;
                                             join_target.ssid[len] = 0;
+                                            /* RSN IE (WPA2) этого BSSID — для AssocReq. */
+                                            join_target.rsn_len = bcn_rsn_len;
+                                            for (uint32_t j = 0; j < bcn_rsn_len; j++)
+                                                join_target.rsn_ie[j] = bcn_rsn[j];
                                             h3_wifi_scan_capture_target(p_bssid, ap_ch);
                                         }
                                     }
@@ -3574,6 +3640,17 @@ int h3_wifi_target_captured(uint8_t bssid[6], uint8_t *channel)
     return 0;
 }
 
+/* Установить RSN IE (WPA2) целевой сети — вызывается из UI-пути
+   (wifi_layer_connect) после h3_wifi_scan_capture_target, т.к. там не
+   проходит полного beacon-парсера, и RSN в join_target иначе останется 0.
+   Копирует из структуры сети (из скана). W.374. */
+void h3_wifi_set_target_rsn(const struct h3_wifi_ap *ap)
+{
+    join_target.rsn_len = ap->rsn_len;
+    for (uint32_t i = 0; i < ap->rsn_len && i < 64; i++)
+        join_target.rsn_ie[i] = ap->rsn_ie[i];
+}
+
 /* Внутренний общий отправитель управляющего кадра (tx_desc MGNT + кадр).
    Кадр собран в buf+40. Возвращает 0 при успехе. */
 static int tx_mgnt_cmd(uint8_t *frame, uint32_t plen)
@@ -3615,9 +3692,14 @@ static int tx_mgnt_cmd(uint8_t *frame, uint32_t plen)
    собственным seq, возвращает размер фактически прочитанного в *out_acc
    (0 = пакета не было). Переиспользуется для ожидания Auth/AssocResp
    в h3_wifi_join_ap. seq изолирован от скан-цикла (свой static). */
+/* W.385: seq приёма RX FIFO для join (auth/assoc). Вынесен из static
+   локального в file-static, чтобы можно было сбросить перед ожиданием
+   AuthResp — после смены канала/скана host-seq должен быть согласован с
+   чипом, иначе AuthResp читается из неверного окна (flaky auth rc=-4). */
+static uint32_t rxp_seq = 0;
+
 static int rx_read_packet(uint8_t *buf, uint32_t cap, uint32_t *out_acc)
 {
-    static uint32_t rxp_seq = 0;
     uint8_t rxl4[4] = {0, 0, 0, 0};
     uint32_t rxlen, total, off_read = 0;
     int frc = 0;
@@ -3664,6 +3746,10 @@ int h3_wifi_tx_auth(void)
     h3_sdc_read_wlan_reg8(0x614, &m[4]);
     h3_sdc_read_wlan_reg8(0x615, &m[5]);
 
+    /* W.380: обнуление буфера — поле duration [2],[3] иначе остаётся
+       стековым мусором; строгий WPA2-AP молча дропает кадр с битым
+       duration (A05s принимает, MTS_GPON молчит). */
+    for (int i = 0; i < 48; i++) f[i] = 0;
     f[0] = 0xB0; f[1] = 0x00;              /* Auth */
     for (int i = 0; i < 6; i++) { f[4 + i] = join_target.bssid[i]; f[10 + i] = m[i]; f[16 + i] = join_target.bssid[i]; }
     f[22] = 0; f[23] = 0;                   /* seq (0 — не ведём) */
@@ -3680,6 +3766,9 @@ int h3_wifi_tx_assoc_req(void)
 
     uint8_t f[120];
     uint8_t m[6];
+    /* W.380: обнуление — duration [2],[3] иначе стековый мусор, строгий
+       WPA2-AP молча дропает такой кадр. (Аналог fix в h3_wifi_tx_auth.) */
+    for (int i = 0; i < 120; i++) f[i] = 0;
     h3_sdc_read_wlan_reg8(0x610, &m[0]);
     h3_sdc_read_wlan_reg8(0x611, &m[1]);
     h3_sdc_read_wlan_reg8(0x612, &m[2]);
@@ -3691,9 +3780,11 @@ int h3_wifi_tx_assoc_req(void)
     for (int i = 0; i < 6; i++) { f[4 + i] = join_target.bssid[i]; f[10 + i] = m[i]; f[16 + i] = join_target.bssid[i]; }
     f[22] = 0; f[23] = 0;
     uint32_t p = 24;
-    /* capability: ESS|privacy=0 (открытая), short slot — по эталону берём из
-       network.IEs, здесь упрощённо бит ESS(0x0001). */
-    f[p++] = 0x01; f[p++] = 0x00;
+    /* capability: ESS(0x0001) всегда + Privacy(0x0010) если сеть WPA2 (есть RSN IE).
+       Без Privacy-bit WPA2-AP (MTS_GPON_9290e0) отвечает AssocResp status!=0 -> rc=-6. */
+    uint16_t cap = 0x0001;
+    if (join_target.rsn_len > 0) cap |= 0x0010;   /* Privacy */
+    f[p++] = (uint8_t)(cap & 0xFF); f[p++] = (uint8_t)(cap >> 8);
     f[p++] = 0x03; f[p++] = 0x00;          /* listen interval = 3 */
     /* SSID IE */
     f[p++] = 0x00; f[p++] = join_target.ssid_len;
@@ -3702,6 +3793,20 @@ int h3_wifi_tx_assoc_req(void)
     f[p++] = 0x01; f[p++] = 0x08;
     f[p++] = 0x82; f[p++] = 0x84; f[p++] = 0x8B; f[p++] = 0x96; /* 1/2/5.5/11 basic */
     f[p++] = 0x0C; f[p++] = 0x12; f[p++] = 0x18; f[p++] = 0x24; /* 6/9/12/18 */
+    /* RSN IE (WPA2) — копируем побайтово из beacon'а цели (W.373). */
+    for (uint32_t i = 0; i < join_target.rsn_len && p < 120; i++)
+        f[p++] = join_target.rsn_ie[i];
+    /* W.379: полный hex-дамп готового AssocReq-фрейма (без tx_desc), чтобы
+       увидеть фактические байты, которые уходят в эфир — RSN-дамп не показал
+       повреждения, но AP молчит именно с RSN IE (W.378). p = длина кадра. */
+    uart_print("  join: assoc-frm len=");
+    uart_print_int((int)p);
+    uart_print(":");
+    for (uint32_t i = 0; i < p && i < 96; i++) {
+        uart_print(" ");
+        uart_print_hex((uint32_t)f[i]);
+    }
+    uart_print("\r\n");
     return tx_mgnt_cmd(f, p);
 }
 
@@ -3711,14 +3816,56 @@ int h3_wifi_join_ap(void)
 {
     if (!join_target.bssid_captured) return -3;
 
+    /* W.391 (join_prepare): сбросить накопленное состояние между join.
+       Без этого 2-й и последующие join наследуют от первого (data-rx остался
+       в RCR/RXFLTMAP, rxp_seq накоплен). НЕ делаем flush RX FIFO здесь:
+       h3_sdc_cmd53_read с blks>1/dummy[4096] загонял SDIO в bad state и
+       rf_read после зависал (W.390). Только безопасные регистровые записи. */
+    {
+        /* 1) restore scan-mode RCR/RXFLTMAP (на случай data-rx наследия). */
+        h3_sdc_write_wlan_reg32(0x0608, 0x7000604Eu);
+        h3_sdc_write_wlan_reg16(0x06A0, 0xFFFF);
+        h3_sdc_write_wlan_reg16(0x06A2, 0x0400);
+        h3_sdc_write_wlan_reg16(0x06A4, 0x0000);
+        /* 2) разморозить RX DMA: если RW_RELEASE_EN (RXPKTBUF 0x284[18]) остался
+           взведён после data-rx, FW не выкладывает новые пакеты в SDIO FIFO
+           (auth response приходит по RF, но зависает в FW) — причина rc=-4 на
+           повторных join. Аналог сброса в h3_sdc.c:2257 (init). */
+        {
+            uint32_t rxpk = 0;
+            if (h3_sdc_read_wlan_reg32(0x0284, &rxpk) == 0) {
+                int was18 = (rxpk >> 18) & 1;
+                rxpk &= ~(1u << 18);                       /* RW_RELEASE_EN=0 */
+                h3_sdc_write_wlan_reg32(0x0284, rxpk);
+                /* 3) clear HISR (SDIO-local): гасим все pending RX-прерывания. */
+                h3_sdc_cmd52_write(1, 0x0018, 0xFF);
+                udelay(1000);
+                uart_print("  join: prepare rxpk b18=");
+                uart_print_int(was18);
+                uart_print(" -> reset\r\n");
+            }
+        }
+        /* 4) сбросить seq чтения RX FIFO для join. */
+        rxp_seq = 0;
+        uart_print("  join: prepare (scan-mode on, rxp_seq=0, rx-dma unfrozen)\r\n");
+    }
+
     /* Перед ассоциацией переключить RF на канал целевой сети. Свип оставил
        RF на канале 13 (последний), а Auth/Assoc идут к BSSID на его канале —
        иначе кадры уходят в пустоту (rc=-4 из-за этого). */
     rf_write(0x18, 0xC00u | (uint32_t)(join_target.channel & 0xFF));
     udelay(50000);   /* 50 мс на перестройку синтезатора (как в свипе) */
+    uart_print("  join: rf18=0x");
+    uart_print_hex(rf_read(0x18));
+    uart_print(" (want 0x");
+    uart_print_hex(0xC00u | (uint32_t)(join_target.channel & 0xFF));
+    uart_print(")\r\n");
 
     /* Шаг 1: Auth (opensystem, seq=1). */
     int rc = h3_wifi_tx_auth();
+    uart_print("  join: auth tx rc=");
+    uart_print_int(rc);
+    uart_print("\r\n");
     if (rc != 0) return rc;
 
     /* Шаг 2: ждать AuthResp (fc 0xB0, seq=2, status=0) от целевого BSSID. */
@@ -3727,9 +3874,18 @@ int h3_wifi_join_ap(void)
         uint32_t acc = 0;
         int tries;
         int got_auth = 0;
-        for (tries = 0; tries < 40; tries++) {   /* ~80 мс ожидания */
-            if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); continue; }
-            if (acc == 0) { udelay(2000); continue; }
+        /* W.385: сброс seq чтения RX FIFO — после смены канала/скана host-seq
+           должен стартовать с начала, иначе AuthResp читается из неверного окна
+           (flaky auth rc=-4, auth-запрос уходит но ответ не распознаётся). */
+        /* W.386: таймаут AuthResp ~80 мс был слишком мал — AP отвечает за
+           сотни мс, поэтому rc=-4 флейкался (auth tx rc=0, но ответ не успевал).
+           Ждём до ~1000 мс, как ассо. */
+        rxp_seq = 0;
+        {
+            int waited_auth = 0;
+            for (tries = 0; tries < 500 && waited_auth < 1000; tries++) {
+                if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited_auth += 2; continue; }
+                if (acc == 0) { udelay(2000); waited_auth += 2; continue; }
             uint32_t off = 0;
             while (off + 26 <= acc) {
                 uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
@@ -3741,7 +3897,8 @@ int h3_wifi_join_ap(void)
                    маскировал auth/assoc, поэтому скрыто за WIFI_VERBOSE_LOG (W.367);
                    раскомментируй #define WIFI_VERBOSE_LOG 1 в h3_sdc.h — вернётся
                    полный вывод. */
-#ifdef WIFI_VERBOSE_LOG
+/* W.392: диагностика приёма AuthResp вкл. безусловно — увидеть, что реально
+                   приходит в RX FIFO при ожидании auth (когда auth timeout). */
                 if (fr + 30 <= acc) {
                     uint16_t fcfc = (uint16_t)(rxbuf[fr] | (rxbuf[fr+1] << 8));
                     if ((fcfc & 0x000C) == 0x0000 && (rxbuf[fr+10] & 0x01) == 0) {
@@ -3756,7 +3913,6 @@ int h3_wifi_join_ap(void)
                         uart_print("\r\n");
                     }
                 }
-#endif
                 /* AuthResp: subtype=0xB0, status на +26 (после 3addr 24 + alg2+seq2). */
                 if (fr + 30 <= acc && rxbuf[fr] == 0xB0 && rxbuf[fr+1] == 0x00) {
                     int same = 1;
@@ -3775,6 +3931,8 @@ int h3_wifi_join_ap(void)
             }
             if (got_auth) break;
             udelay(2000);
+                waited_auth += 2;
+            }
         }
         if (!got_auth) return -4;   /* AuthResp не получена/отказ */
         uart_print("  join: auth resp rcvd (rx pkt fc=0xB0, BSSID match)\r\n");
@@ -3784,8 +3942,11 @@ int h3_wifi_join_ap(void)
     rc = h3_wifi_tx_assoc_req();
     uart_print("  join: assocreq tx rc=");
     uart_print_int(rc);
+    uart_print(" rsn_len=");
+    uart_print_int((int)join_target.rsn_len);
     uart_print(" cap=");
-    uart_print_hex((uint32_t)(join_target.ssid_len > 0 ? 0x0001 : 0));
+    /* Фактический cap, согласованный с h3_wifi_tx_assoc_req (W.376): не хардкод! */
+    uart_print_hex((uint32_t)((join_target.rsn_len > 0) ? 0x0011 : 0x0001));
     uart_print("\r\n");
     if (rc != 0) return rc;
 
@@ -3795,15 +3956,36 @@ int h3_wifi_join_ap(void)
         uint32_t acc = 0;
         int tries;
         int got_assoc = 0;
-        for (tries = 0; tries < 40; tries++) {
-            if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); continue; }
-            if (acc == 0) { udelay(2000); continue; }
+        int waited = 0;
+        /* W.377: ассос к WPA2-AP отвечает до сотен мс. Ждём до ~1200 мс. */
+        for (tries = 0; tries < 600 && waited < 1200; tries++) {
+            if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
+            if (acc == 0) { udelay(2000); waited += 2; continue; }
             uint32_t off = 0;
             while (off + 26 <= acc) {
                 uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
                 if (plen == 0 || plen > 0x2000) break;
                 uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
                 uint32_t fr = off + 24u + drvsz;
+                /* W.381: диагностика Action-фреймов (fc=0xD0) от целевого BSSID
+                   при ожидании AssocResp убрана за WIFI_VERBOSE_LOG — спам fрrecеймов
+                   заваливал UART (Action-фреймы идут от многих AP). Видимым остался
+                   только assocresp status ниже. */
+#ifdef WIFI_VERBOSE_LOG
+                if (fr + 2 <= acc && (rxbuf[fr+10] == join_target.bssid[0]) &&
+                    rxbuf[fr+11] == join_target.bssid[1] &&
+                    rxbuf[fr+12] == join_target.bssid[2] &&
+                    rxbuf[fr+13] == join_target.bssid[3] &&
+                    rxbuf[fr+14] == join_target.bssid[4] &&
+                    rxbuf[fr+15] == join_target.bssid[5]) {
+                    uint16_t mfc = (uint16_t)(rxbuf[fr] | (rxbuf[fr+1] << 8));
+                    uart_print("  join: waitassoc mgmt fc=0x");
+                    uart_print_hex((uint32_t)mfc);
+                    uart_print(" sub=");
+                    uart_print_hex((uint32_t)((mfc >> 4) & 0xF));
+                    uart_print("\r\n");
+                }
+#endif
                 /* AssocResp: subtype=0x10, addr2=AP, status на +26. */
                 if (fr + 30 <= acc && rxbuf[fr] == 0x10 && rxbuf[fr+1] == 0x00) {
                     int same = 1;
@@ -3822,6 +4004,7 @@ int h3_wifi_join_ap(void)
             }
             if (got_assoc) break;
             udelay(2000);
+            waited += 2;
         }
         if (!got_assoc) return -6;   /* AssocResp не получена/отказ */
         uart_print("  join: assoc resp OK (associated)\r\n");
@@ -3849,6 +4032,80 @@ int h3_wifi_join_ap(void)
         }
         uart_print(ok ? " OK\r\n" : " MISMATCH\r\n");
         if (!ok) return -7;
+    }
+
+    /* W.383: ассоциация состоялась — перевести приём из site-survey в
+       connected: принимать data-кадры (RXFLTMAP2=0xFFFF, эталон rtl8188f
+       rtl8188f_hal_init.c:5580). Без этого data (ARP/ICMP/DHCP) до нас не дойдут. */
+    {
+        h3_sdc_write_wlan_reg16(0x06A4, 0xFFFF);   /* RXFLTMAP2: data on */
+        /* RCR: вернуть CBSSID_DATA (bit6) чтобы фильтроваться по BSSID и
+           при BSSID-filter на пакеты данных от нашего AP. */
+        uint32_t rcr = 0;
+        h3_sdc_read_wlan_reg32(0x0608, &rcr);
+        h3_sdc_write_wlan_reg32(0x0608, rcr | (1u << 6));   /* RCR_CBSSID_DATA */
+        uart_print("  join: data-rx ON (rxfltmap2=ffff, rcr cbssid_data)\r\n");
+    }
+
+    /* W.384: диагностика приёма data-кадров после включения data-rx.
+       Опрашиваем RX FIFO ~2 с и печатаем каждый пришедший data-кадр
+       (fc type=2) с EtherType в payload — доказательство, что чип принимает
+       data после переключения из site-survey (ARP/ICMP/DHCP до нас доходят). */
+    {
+        uint8_t rxbuf[0x4000 + 512];
+        uint32_t acc = 0;
+        int waited = 0;
+        uart_print("  join: data-rx poll start (2s)\r\n");
+        while (waited < 2000) {
+            if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
+            if (acc == 0) { udelay(2000); waited += 2; continue; }
+            uint32_t off = 0;
+            while (off + 26 <= acc) {
+                uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
+                if (plen == 0 || plen > 0x2000) break;
+                uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
+                uint32_t fr = off + 24u + drvsz;
+                if (fr + 30 <= acc) {
+                    uint16_t fcfc = (uint16_t)(rxbuf[fr] | (rxbuf[fr+1] << 8));
+                    uint32_t ftype = (fcfc >> 2) & 0x3;      /* 0=mgmt, 1=ctrl, 2=data */
+                    if (ftype == 2) {
+                        /* data header: 3addr(24) + QoS-ctl(2, bit7=0x0080) + 4addr
+                           (+6, когда и ToDS(bit3) и FromDS(bit2) разны/поставлены).
+                           Потом LLC/SNAP 8 байт (AA AA 03 00 00 00) + EtherType 2.
+                           Раньше тест (fcfc&0x0003) брал Protocol-Version (всегда 0)
+                           -> wrong offset -> битый etype (0x00000008). W.387. */
+                        uint32_t dp = fr + 24 + ((fcfc & 0x0080) ? 2 : 0)
+                                    + (((fcfc & 0x000C) == 0x000C) ? 6 : 0);
+                        uint16_t etype = (uint16_t)(rxbuf[dp+6] | (rxbuf[dp+7] << 8));
+                        uart_print("  join: rx DATA etype=0x");
+                        uart_print_hex((uint32_t)etype);
+                        uart_print(" plen=");
+                        uart_print_int((int)plen);
+                        uart_print("\r\n");
+                    }
+                }
+                off += 24u + drvsz + plen;
+                off = (off + 7u) & ~7u;
+            }
+            udelay(2000);
+            waited += 2;
+        }
+        uart_print("  join: data-rx poll done\r\n");
+    }
+
+    /* W.388: вернуть приём в scan-режим после data-rx poll. Без этого
+       следующий join наследует data-режим (RCR CBSSID_DATA, RXFLTMAP2=ffff),
+       и mgmt/auth ответы фильтруются → недетерминизм (success→2-5 fails→success).
+       Scan-mode = исходные значения из site-survey (RCR 0x7000604E,
+       RXFLTMAP0=ffff mgmt, RXFLTMAP1=0400 ps-poll, RXFLTMAP2=0000 no-data). */
+    {
+        h3_sdc_write_wlan_reg32(0x0608, 0x7000604Eu);
+        h3_sdc_write_wlan_reg16(0x06A0, 0xFFFF);
+        h3_sdc_write_wlan_reg16(0x06A2, 0x0400);
+        h3_sdc_write_wlan_reg16(0x06A4, 0x0000);
+        rxp_seq = 0;   /* сброс seq чтения RX — следующий join стартует ровно */
+        udelay(1000);
+        uart_print("  join: scan-mode restored (rcr=7000604E, rxflt data off, rxp_seq=0)\r\n");
     }
 
     return 0;   /* ассоциация подтверждена */

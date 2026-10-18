@@ -303,8 +303,15 @@ int wifi_layer_connect(int index)
     for (int k = 0; k < ap.ssid_len; k++) uart_putc(ap.ssid[k]);
     uart_print("\r\n");
 
-    /* Захватить BSSID/channel выбранной сети как цель ассоциации. */
+    /* Захватить выбранную сеть как цель ассоциации — полностью (SSID, BSSID,
+       канал). Без установки SSID join_target остаётся от старого таргета (A05s
+       из kmain), и AssocReq к другой сети несёт чужой SSID — AP молча дропает
+       (rc=-6, W.382). */
+    h3_wifi_set_target(ap.ssid, ap.ssid_len);
     h3_wifi_scan_capture_target(ap.bssid, ap.channel);
+    /* WPA2: передать RSN IE выбранной сети в цель — иначе AssocReq к
+       WPA2-AP уходит без Privacy+RSN (cap=1) и AP не ассоциирует (rc=-6). */
+    h3_wifi_set_target_rsn(&ap);
 
     rc = h3_wifi_join_ap();
     uart_print("join: rc=");
