@@ -3,20 +3,19 @@
 #include "sys.h"
 #include "h3_mmu.h"
 #include "font8x8.h"
+#include "h3_display.h"
+#include "display_timing.h"
+#include <string.h>
 
-/* U-Boot уже настроил HDMI/DE2 (показывает свой лог). Берём его готовый
-   фреймбуфер: читаем адрес и pitch у DE2 (UI-канал), пишем прямо туда.
-   НЕ переинициализируем DE/HDMI/TCON — это ломало картинку. */
-
-/* Адреса DE2 MUX0 / UI-канал (H3 datasheet / reference h3_de2.h). */
-#define DE_BASE H3_DE_BASE              /* 0x01000000 */
-#define MUX0     (DE_BASE + 0x100000)   /* 0x01100000 */
-#define UI_BASE  (MUX0 + 0x3000)        /* 0x01103000: chan1 (UI) */
-#define UI_PITCH     (*(volatile uint32_t *)(UI_BASE + 0x0C))
-#define UI_TOP_LADDR (*(volatile uint32_t *)(UI_BASE + 0x10))
+/* Самостоятельная инициализация дисплея: DE2 + TCON1 + HDMI (референс
+   pico-retro-new-gen/h3_bare/platform/fb/). U-Boot больше не настраивает
+   DE/HDMI при FEL-загрузке, поэтому инициализируем сами. 
+   FB — своя секция из линкера (_fb_hdmi_start, 1024x600 XRGB8888). */
 
 volatile uint32_t *fb;
 uint32_t fb_pitch = FB_STRIDE;
+
+extern unsigned char _fb_hdmi_start[];
 
 /* Принудительно сбросить D-cache для диапазона (после записи в FB). */
 void fb_clean(void)
@@ -30,26 +29,26 @@ void fb_clean(void)
 
 int display_init(void)
 {
-    uint32_t laddr = UI_TOP_LADDR;
-    uint32_t pitch = UI_PITCH;
+    struct display_timing timing;
 
-    /* Принимаем любой DRAM-адрес (U-Boot кладёт консольный FB в 0x5E/0x5F). */
-    if (laddr >= 0x40000000u && laddr < 0x60000000u) {
-        fb = (volatile uint32_t *)laddr;
-        if (pitch >= FB_STRIDE && pitch <= 8192)
-            fb_pitch = pitch;
-        else
-            fb_pitch = FB_STRIDE;
-        /* DE читает физическую память: пометить буфер uncached, иначе D-cache
-           держит свежезаписанные строки и DE видит старое. */
-        mmu_mark_uncached(laddr);
-        fb_clean();
-    } else {
-        extern unsigned char _fb_hdmi_start[];
-        fb = (volatile uint32_t *)(uintptr_t)_fb_hdmi_start;
-        fb_pitch = FB_STRIDE;
-    }
-    return 0;
+    /* Тайминги 1024×600 — взяты из pico-retro-new-gen main.c. */
+    memset(&timing, 0, sizeof(timing));
+    timing.hdmi_monitor = 0;
+    timing.pixelclock.typ  = 51200000;
+    timing.hactive.typ     = 1024; timing.hfront_porch.typ = 40;
+    timing.hback_porch.typ = 248;  timing.hsync_len.typ = 32;
+    timing.vactive.typ     = 600;  timing.vfront_porch.typ = 1;
+    timing.vback_porch.typ = 31;   timing.vsync_len.typ = 3;
+    timing.flags = (DISPLAY_FLAGS_HSYNC_LOW | DISPLAY_FLAGS_VSYNC_HIGH);
+
+    fb = (volatile uint32_t *)(uintptr_t)_fb_hdmi_start;
+    fb_pitch = FB_STRIDE;
+
+    /* DE читает физическую память: свой буфер должен быть uncached. */
+    mmu_mark_uncached((uint32_t)(uintptr_t)fb);
+    fb_clean();
+
+    return h3_display_init(&timing, (uint32_t)(uintptr_t)fb);
 }
 
 /* ================= Рендер (в найденный FB) ================= */

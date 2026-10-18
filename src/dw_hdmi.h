@@ -1,0 +1,286 @@
+#ifndef DW_HDMI_H
+#define DW_HDMI_H
+
+#include <stdint.h>
+#include "display_timing.h"
+
+/* DW-HDMI контроллер (0x01EE0000) — регистры и битовые поля.
+   Источник: ref/pico-retro-new-gen dw_hdmi.h (Google/Rockchip/Skrabec). */
+
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef unsigned int uint;
+
+#define HDMI_EDID_BLOCK_SIZE  128
+
+/* Identification */
+#define HDMI_DESIGN_ID           0x0000
+#define HDMI_REVISION_ID         0x0001
+#define HDMI_PRODUCT_ID0         0x0002
+#define HDMI_PRODUCT_ID1         0x0003
+
+/* Interrupt */
+#define HDMI_IH_FC_STAT0         0x0100
+#define HDMI_IH_I2CM_STAT0       0x0105
+#define HDMI_IH_MUTE             0x01FF
+
+/* Video Sample */
+#define HDMI_TX_INVID0           0x0200
+#define HDMI_TX_INSTUFFING       0x0201
+#define HDMI_TX_GYDATA0          0x0202
+#define HDMI_TX_GYDATA1          0x0203
+#define HDMI_TX_RCRDATA0         0x0204
+#define HDMI_TX_RCRDATA1         0x0205
+#define HDMI_TX_BCBDATA0         0x0206
+#define HDMI_TX_BCBDATA1         0x0207
+
+/* Video Packetizer */
+#define HDMI_VP_PR_CD            0x0801
+#define HDMI_VP_STUFF            0x0802
+#define HDMI_VP_REMAP            0x0803
+#define HDMI_VP_CONF             0x0804
+
+/* Frame Composer */
+#define HDMI_FC_INVIDCONF        0x1000
+#define HDMI_FC_INHACTV0         0x1001
+#define HDMI_FC_INHACTV1         0x1002
+#define HDMI_FC_INHBLANK0        0x1003
+#define HDMI_FC_INHBLANK1        0x1004
+#define HDMI_FC_INVACTV0         0x1005
+#define HDMI_FC_INVACTV1         0x1006
+#define HDMI_FC_INVBLANK         0x1007
+#define HDMI_FC_HSYNCINDELAY0    0x1008
+#define HDMI_FC_HSYNCINDELAY1    0x1009
+#define HDMI_FC_HSYNCINWIDTH0    0x100A
+#define HDMI_FC_HSYNCINWIDTH1    0x100B
+#define HDMI_FC_VSYNCINDELAY     0x100C
+#define HDMI_FC_VSYNCINWIDTH     0x100D
+#define HDMI_FC_CTRLDUR          0x1011
+#define HDMI_FC_EXCTRLDUR        0x1012
+#define HDMI_FC_EXCTRLSPAC       0x1013
+#define HDMI_FC_CH0PREAM         0x1014
+#define HDMI_FC_CH1PREAM         0x1015
+#define HDMI_FC_CH2PREAM         0x1016
+#define HDMI_FC_AVICONF3         0x1017
+#define HDMI_FC_AVICONF0         0x1019
+#define HDMI_FC_AVICONF1         0x101A
+#define HDMI_FC_AVICONF2         0x101B
+#define HDMI_FC_DATAUTO0         0x102B
+
+/* Color Space Converter */
+#define HDMI_CSC_CFG             0x4100
+#define HDMI_CSC_SCALE           0x4101
+#define HDMI_CSC_COEF_A1_MSB     0x4102
+#define HDMI_CSC_COEF_A1_LSB     0x4103
+#define HDMI_CSC_COEF_A2_MSB     0x4104
+#define HDMI_CSC_COEF_A2_LSB     0x4105
+#define HDMI_CSC_COEF_A3_MSB     0x4106
+#define HDMI_CSC_COEF_A3_LSB     0x4107
+#define HDMI_CSC_COEF_A4_MSB     0x4108
+#define HDMI_CSC_COEF_A4_LSB     0x4109
+#define HDMI_CSC_COEF_B1_MSB     0x410A
+#define HDMI_CSC_COEF_B1_LSB     0x410B
+#define HDMI_CSC_COEF_B2_MSB     0x410C
+#define HDMI_CSC_COEF_B2_LSB     0x410D
+#define HDMI_CSC_COEF_B3_MSB     0x410E
+#define HDMI_CSC_COEF_B3_LSB     0x410F
+#define HDMI_CSC_COEF_B4_MSB     0x4110
+#define HDMI_CSC_COEF_B4_LSB     0x4111
+#define HDMI_CSC_COEF_C1_MSB     0x4112
+#define HDMI_CSC_COEF_C1_LSB     0x4113
+#define HDMI_CSC_COEF_C2_MSB     0x4114
+#define HDMI_CSC_COEF_C2_LSB     0x4115
+#define HDMI_CSC_COEF_C3_MSB     0x4116
+#define HDMI_CSC_COEF_C3_LSB     0x4117
+#define HDMI_CSC_COEF_C4_MSB     0x4118
+#define HDMI_CSC_COEF_C4_LSB     0x4119
+
+/* I2C Master (EDID DDC) */
+#define HDMI_I2CM_SLAVE          0x7E00
+#define HDMI_I2CM_ADDRESS        0x7E01
+#define HDMI_I2CM_DATAI          0x7E03
+#define HDMI_I2CM_OPERATION      0x7E04
+#define HDMI_I2CM_INT            0x7E05
+#define HDMI_I2CM_CTLINT         0x7E06
+#define HDMI_I2CM_DIV            0x7E07
+#define HDMI_I2CM_SEGADDR        0x7E08
+#define HDMI_I2CM_SOFTRSTZ       0x7E09
+#define HDMI_I2CM_SEGPTR         0x7E0A
+#define HDMI_I2CM_SS_SCL_HCNT_0  0x7E0C
+#define HDMI_I2CM_SS_SCL_LCNT_0  0x7E0E
+
+/* Main Controller */
+#define HDMI_MC_CLKDIS           0x4001
+#define HDMI_MC_SWRSTZ           0x4002
+#define HDMI_MC_FLOWCTRL         0x4004
+
+/* ==== битовые поля ==== */
+enum {
+    HDMI_IH_MUTE_MUTE_WAKEUP_INTERRUPT      = 0x2,
+    HDMI_IH_MUTE_MUTE_ALL_INTERRUPT         = 0x1,
+
+    HDMI_TX_INVID0_INTERNAL_DE_GENERATOR_DISABLE = 0x00,
+    HDMI_TX_INVID0_VIDEO_MAPPING_MASK       = 0x1F,
+    HDMI_TX_INVID0_VIDEO_MAPPING_OFFSET     = 0,
+
+    HDMI_TX_INSTUFFING_BDBDATA_STUFFING_ENABLE = 0x4,
+    HDMI_TX_INSTUFFING_RCRDATA_STUFFING_ENABLE = 0x2,
+    HDMI_TX_INSTUFFING_GYDATA_STUFFING_ENABLE  = 0x1,
+
+    HDMI_VP_PR_CD_COLOR_DEPTH_MASK          = 0xF0,
+    HDMI_VP_PR_CD_COLOR_DEPTH_OFFSET        = 4,
+    HDMI_VP_PR_CD_DESIRED_PR_FACTOR_MASK    = 0x0F,
+    HDMI_VP_PR_CD_DESIRED_PR_FACTOR_OFFSET  = 0,
+
+    HDMI_VP_STUFF_IDEFAULT_PHASE_MASK       = 0x20,
+    HDMI_VP_STUFF_IDEFAULT_PHASE_OFFSET     = 5,
+    HDMI_VP_STUFF_YCC422_STUFFING_MASK      = 0x4,
+    HDMI_VP_STUFF_YCC422_STUFFING_STUFFING_MODE = 0x4,
+    HDMI_VP_STUFF_PP_STUFFING_MASK          = 0x2,
+    HDMI_VP_STUFF_PP_STUFFING_STUFFING_MODE = 0x2,
+    HDMI_VP_STUFF_PR_STUFFING_MASK          = 0x1,
+    HDMI_VP_STUFF_PR_STUFFING_STUFFING_MODE = 0x1,
+
+    HDMI_VP_CONF_BYPASS_EN_MASK             = 0x40,
+    HDMI_VP_CONF_BYPASS_EN_ENABLE           = 0x40,
+    HDMI_VP_CONF_PP_EN_ENMASK               = 0x20,
+    HDMI_VP_CONF_PP_EN_DISABLE              = 0x00,
+    HDMI_VP_CONF_PR_EN_MASK                 = 0x10,
+    HDMI_VP_CONF_PR_EN_DISABLE              = 0x00,
+    HDMI_VP_CONF_YCC422_EN_MASK             = 0x8,
+    HDMI_VP_CONF_YCC422_EN_DISABLE          = 0x0,
+    HDMI_VP_CONF_BYPASS_SELECT_MASK         = 0x4,
+    HDMI_VP_CONF_BYPASS_SELECT_VID_PACKETIZER = 0x4,
+    HDMI_VP_CONF_OUTPUT_SELECTOR_MASK       = 0x3,
+    HDMI_VP_CONF_OUTPUT_SELECTOR_BYPASS     = 0x3,
+
+    HDMI_VP_REMAP_YCC422_16BIT              = 0x0,
+
+    HDMI_FC_INVIDCONF_HDCP_KEEPOUT_MASK     = 0x80,
+    HDMI_FC_INVIDCONF_HDCP_KEEPOUT_INACTIVE = 0x00,
+    HDMI_FC_INVIDCONF_VSYNC_IN_POLARITY_MASK = 0x40,
+    HDMI_FC_INVIDCONF_VSYNC_IN_POLARITY_ACTIVE_HIGH = 0x40,
+    HDMI_FC_INVIDCONF_VSYNC_IN_POLARITY_ACTIVE_LOW  = 0x00,
+    HDMI_FC_INVIDCONF_HSYNC_IN_POLARITY_MASK = 0x20,
+    HDMI_FC_INVIDCONF_HSYNC_IN_POLARITY_ACTIVE_HIGH = 0x20,
+    HDMI_FC_INVIDCONF_HSYNC_IN_POLARITY_ACTIVE_LOW  = 0x00,
+    HDMI_FC_INVIDCONF_DE_IN_POLARITY_MASK   = 0x10,
+    HDMI_FC_INVIDCONF_DE_IN_POLARITY_ACTIVE_HIGH = 0x10,
+    HDMI_FC_INVIDCONF_DE_IN_POLARITY_ACTIVE_LOW  = 0x00,
+    HDMI_FC_INVIDCONF_DVI_MODEZ_MASK        = 0x8,
+    HDMI_FC_INVIDCONF_DVI_MODEZ_HDMI_MODE   = 0x8,
+    HDMI_FC_INVIDCONF_DVI_MODEZ_DVI_MODE    = 0x0,
+    HDMI_FC_INVIDCONF_R_V_BLANK_IN_OSC_MASK = 0x2,
+    HDMI_FC_INVIDCONF_R_V_BLANK_IN_OSC_ACTIVE_LOW = 0x0,
+    HDMI_FC_INVIDCONF_IN_I_P_MASK           = 0x1,
+    HDMI_FC_INVIDCONF_IN_I_P_PROGRESSIVE    = 0x0,
+
+    HDMI_FC_AVICONF0_PIX_FMT_MASK           = 0x03,
+    HDMI_FC_AVICONF0_PIX_FMT_RGB            = 0x00,
+    HDMI_FC_AVICONF0_ACTIVE_FMT_MASK        = 0x40,
+    HDMI_FC_AVICONF0_ACTIVE_FMT_INFO_PRESENT = 0x40,
+    HDMI_FC_AVICONF0_BAR_DATA_MASK          = 0x0C,
+    HDMI_FC_AVICONF0_BAR_DATA_NO_DATA       = 0x00,
+    HDMI_FC_AVICONF0_SCAN_INFO_MASK         = 0x30,
+    HDMI_FC_AVICONF0_SCAN_INFO_NODATA       = 0x00,
+
+    HDMI_FC_AVICONF1_ACTIVE_ASPECT_RATIO_MASK = 0x0F,
+    HDMI_FC_AVICONF1_ACTIVE_ASPECT_RATIO_16_9 = 0x0A,
+    HDMI_FC_AVICONF1_CODED_ASPECT_RATIO_MASK = 0x30,
+    HDMI_FC_AVICONF1_CODED_ASPECT_RATIO_16_9 = 0x20,
+    HDMI_FC_AVICONF1_COLORIMETRY_MASK       = 0xC0,
+    HDMI_FC_AVICONF1_COLORIMETRY_NO_DATA    = 0x00,
+
+    HDMI_FC_AVICONF2_SCALING_MASK           = 0x03,
+    HDMI_FC_AVICONF2_SCALING_NONE           = 0x00,
+    HDMI_FC_AVICONF2_RGB_QUANT_MASK         = 0x0C,
+    HDMI_FC_AVICONF2_RGB_QUANT_FULL_RANGE   = 0x08,
+    HDMI_FC_AVICONF2_IT_CONTENT_MASK        = 0x80,
+    HDMI_FC_AVICONF2_IT_CONTENT_VALID       = 0x80,
+
+    HDMI_FC_AVICONF3_IT_CONTENT_TYPE_MASK   = 0x03,
+    HDMI_FC_AVICONF3_IT_CONTENT_TYPE_GRAPHICS = 0x00,
+    HDMI_FC_AVICONF3_QUANT_RANGE_MASK       = 0x0C,
+    HDMI_FC_AVICONF3_QUANT_RANGE_FULL       = 0x04,
+
+    HDMI_MC_CLKDIS_HDCPCLK_DISABLE          = 0x40,
+    HDMI_MC_CLKDIS_CECCLK_DISABLE           = 0x20,
+    HDMI_MC_CLKDIS_CSCCLK_DISABLE           = 0x10,
+    HDMI_MC_CLKDIS_AUDCLK_DISABLE           = 0x8,
+    HDMI_MC_CLKDIS_PREPCLK_DISABLE          = 0x4,
+    HDMI_MC_CLKDIS_TMDSCLK_DISABLE          = 0x2,
+    HDMI_MC_CLKDIS_PIXELCLK_DISABLE         = 0x1,
+
+    HDMI_MC_SWRSTZ_TMDSSWRST_REQ            = 0x02,
+
+    HDMI_MC_FLOWCTRL_FEED_THROUGH_OFF_CSC_IN_PATH = 0x1,
+    HDMI_MC_FLOWCTRL_FEED_THROUGH_OFF_CSC_BYPASS  = 0x0,
+
+    HDMI_IH_I2CM_STAT0_DONE                 = 0x2,
+};
+
+#define HDMI_FC_AVICONF2_EXT_COLORIMETRY_MASK  0x70
+#define HDMI_FC_AVICONF2_RGB_QUANT_DEFAULT     0x00
+#define HDMI_FC_AVICONF2_IT_CONTENT_NO_DATA    0x00
+#define HDMI_FC_AVICONF3_IT_CONTENT_TYPE_PHOTO 0x01
+
+/* CSC SCALE поля. */
+#define HDMI_CSC_SCALE_CSC_COLORDE_PTH_MASK 0xF0
+#define HDMI_CSC_SCALE_CSC_COLORDE_PTH_24BPP 0x00
+#define HDMI_CSC_SCALE_CSC_COLORDE_PTH_30BPP 0x50
+#define HDMI_CSC_SCALE_CSC_COLORDE_PTH_36BPP 0x60
+#define HDMI_CSC_SCALE_CSC_COLORDE_PTH_48BPP 0x70
+#define HDMI_CSC_SCALE_CSCSCALE_MASK         0x03
+
+#define HDMI_CSC_CFG_INTMODE_MASK           0x30
+#define HDMI_CSC_CFG_INTMODE_DISABLE        0x00
+#define HDMI_CSC_CFG_INTMODE_CHROMA_INT_FORMULA1 0x10
+#define HDMI_CSC_CFG_DECMODE_MASK           0x03
+#define HDMI_CSC_CFG_DECMODE_DISABLE        0x0
+#define HDMI_CSC_CFG_DECMODE_CHROMA_INT_FORMULA3 0x3
+
+/* I2C master поля. */
+#define HDMI_I2CM_SLAVE_DDC_ADDR            0x50
+#define HDMI_I2CM_SEGADDR_DDC               0x30
+#define HDMI_I2CM_OP_RD8                    0x1
+#define HDMI_I2CM_OP_RD8_EXT                0x2
+#define HDMI_I2CM_DIV_STD_MODE              0x0
+#define HDMI_I2CM_SOFTRSTZ_MASK             0x1
+
+/* media_bus_format.h (аналог) */
+#define MEDIA_BUS_FMT_RGB888_1X24           0x1009
+#define MEDIA_BUS_FMT_RGB101010_1X30        0x100a
+#define MEDIA_BUS_FMT_RGB121212_1X36        0x100f
+#define MEDIA_BUS_FMT_RGB161616_1X48        0x1010
+#define MEDIA_BUS_FMT_YUV8_1X24             0x2008
+#define MEDIA_BUS_FMT_YUV10_1X30            0x2009
+#define MEDIA_BUS_FMT_YUV12_1X36            0x200a
+#define MEDIA_BUS_FMT_YUV16_1X48            0x200b
+#define MEDIA_BUS_FMT_UYVY8_1X16            0x2015
+#define MEDIA_BUS_FMT_UYVY10_1X20           0x2016
+#define MEDIA_BUS_FMT_UYVY12_1X24           0x2017
+#define MEDIA_BUS_FMT_UYYVYY8_0_5X24        0x2018
+#define MEDIA_BUS_FMT_UYYVYY10_0_5X30       0x2019
+#define MEDIA_BUS_FMT_UYYVYY12_0_5X36       0x201a
+#define MEDIA_BUS_FMT_UYYVYY16_0_5X48       0x201b
+
+/* Ядро DW-HDMI (см. dw_hdmi.c). */
+struct hdmi_data_info {
+    unsigned int enc_in_bus_format;
+    unsigned int enc_out_bus_format;
+};
+
+struct dw_hdmi {
+    unsigned long ioaddr;
+    u8 i2c_clk_high;
+    u8 i2c_clk_low;
+    u8 reg_io_width;
+    struct hdmi_data_info hdmi_data;
+    int (*phy_set)(struct dw_hdmi *hdmi, unsigned int mpixelclock);
+};
+
+int dw_hdmi_enable(struct dw_hdmi *hdmi, const struct display_timing *edid);
+void dw_hdmi_init(struct dw_hdmi *hdmi);
+
+#endif /* DW_HDMI_H */

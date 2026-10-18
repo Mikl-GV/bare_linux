@@ -56,4 +56,62 @@
 /* Port L always-on: APB0 gating (в R_PRCM). */
 #define H3_APB0_CLK_GATING   (*(volatile uint32_t *)(H3_R_PRCM_BASE + 0x28))
 
+/* ==== Драйвер дисплея: CCU (GATING1/RST1, PLL_DE, DE/TCON0/HDMI такты) ==== */
+
+/* BUS_CLK_GATING1 (0x064), BUS_SOFT_RESET1 (0x2C4). */
+#define H3_CCU_GATING1   (*(volatile uint32_t *)(H3_CCU_BASE + 0x064))
+#define H3_CCU_RST1      (*(volatile uint32_t *)(H3_CCU_BASE + 0x2C4))
+
+/* PLL_VIDEO (0x010) и PLL_DE (0x048) — контрольные регистры. */
+#define H3_CCU_PLL_VIDEO_CTRL (*(volatile uint32_t *)(H3_CCU_BASE + 0x010))
+#define H3_CCU_PLL_DE_CTRL    (*(volatile uint32_t *)(H3_CCU_BASE + 0x048))
+
+/* DE (Display Engine) такт 0x104, TCON0 такт 0x118, HDMI такты 0x150/0x154. */
+#define H3_CCU_DE_CLK     (*(volatile uint32_t *)(H3_CCU_BASE + 0x104))
+#define H3_CCU_TCON0_CLK  (*(volatile uint32_t *)(H3_CCU_BASE + 0x118))
+#define H3_CCU_HDMI_CLK   (*(volatile uint32_t *)(H3_CCU_BASE + 0x150))
+#define H3_CCU_HDMI_SLOW_CLK (*(volatile uint32_t *)(H3_CCU_BASE + 0x154))
+
+/* Биты GATING1 (bus gate). */
+#define H3_CCU_GATING1_TCON0  (1u << 3)
+#define H3_CCU_GATING1_HDMI   (1u << 11)
+#define H3_CCU_GATING1_DE     (1u << 12)
+
+/* Биты RST1 (bus soft reset). */
+#define H3_CCU_RST1_TCON0   (1u << 3)
+#define H3_CCU_RST1_HDMI2   (1u << 10)
+#define H3_CCU_RST1_HDMI    (1u << 11)
+#define H3_CCU_RST1_DE      (1u << 12)
+
+/* PLL_DE: EN(31), LOCK(28), integer mode(24), N[14:8], M[3:0]. */
+#define H3_PLL_DE_ENABLE        (1u << 31)
+#define H3_PLL_DE_LOCK          (1u << 28)
+#define H3_PLL_DE_INTEGER_MODE  (1u << 24)
+#define H3_PLL_DE_N(n)          ((((n) - 1) & 0x7F) << 8)
+#define H3_PLL_DE_M(n)          ((((n) - 1) & 0x0F) << 0)
+
+/* DE_CLK (0x104): sclk gate(31), CLK_SRC_SEL[25:24] (1=PLL_DE). */
+#define H3_DE_CLK_GATE        (1u << 31)
+#define H3_DE_CLK_SRC_MASK    (3u << 24)
+#define H3_DE_CLK_SRC_PLL_DE  (1u << 24)
+
+/* TCON0_CLK (0x118): sclk gate(31), M[3:0] divider. */
+#define H3_TCON0_CLK_GATE (1u << 31)
+#define H3_TCON0_CLK_M(n) ((((n) - 1) & 0x0F) << 0)
+
+/* HDMI_CLK (0x150): sclk gate(31), PLL_SRC_SEL[25:24] (0=PLL_VIDEO). */
+#define H3_HDMI_CLK_GATE       (1u << 31)
+#define H3_HDMI_CLK_PLL_MASK   (3u << 24)
+#define H3_HDMI_CLK_PLL_VIDEO  (0u << 24)
+
+/* HDMI_SLOW_CLK (0x154): DDC gate(31). */
+#define H3_HDMI_SLOW_DDC_GATE  (1u << 31)
+
+/* PLL_VIDEO (0x010): EN(31), LOCK(28), integer(24), N[14:8], M[3:0]. */
+#define H3_PLL_VIDEO_EN        (1u << 31)
+#define H3_PLL_VIDEO_LOCK      (1u << 28)
+#define H3_PLL_VIDEO_INTEGER   (1u << 24)
+#define H3_PLL_VIDEO_N(n)      ((((n) - 1) & 0x7F) << 8)
+#define H3_PLL_VIDEO_M(n)      ((((n) - 1) & 0x0F) << 0)
+
 #endif /* H3_CCU_H */

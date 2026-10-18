@@ -8,11 +8,8 @@
 #include "secure.h"
 #include "gic.h"
 #include "h3_sdc.h"
+#include "wifi_layer.h"
 #include "version.h"
-
-/* Встроенная прошивка чипа (из fw_blob.S, инклудит fw_nic.bin). */
-extern const unsigned char fw_blob_start[];
-extern const unsigned char fw_blob_end[];
 
 /* ================= Состояние ================= */
 
@@ -21,17 +18,20 @@ enum {
     SCR_MAIN = 0,   /* главное меню */
     SCR_TONE,       /* подменю «Тест звука» (выбор частоты) */
     SCR_SETTINGS,   /* подменю «Настройки» */
+    SCR_TRANSFER,   /* подменю «Transfer»: WiFi-слой (передача ROM по WiFi) */
     SCR_COUNT
 };
 
 /* Пункты главного меню. */
 enum {
     MITEM_SOUND = 0,
+    MITEM_TRANSFER,   /* вызов WiFi-слоя */
     MITEM_SETTINGS,
     MITEM_COUNT
 };
 static const char *main_items[MITEM_COUNT] = {
     "Sound test",
+    "Transfer (WiFi)",
     "Settings"
 };
 
@@ -61,16 +61,8 @@ static uint32_t led_last = 0;
 static int led_state = 0;
 
 /* Глобальный флаг: WiFi-режим активирован (устанавливается при успешном
-   sdio_init). Используется для значка на главном экране. */
-int wifi_active = 0;
-
-/* Печать байта как %02X (две hex-цифры). */
-static void print_u8_hex(uint8_t v)
-{
-    static const char hexd[] = "0123456789ABCDEF";
-    uart_putc(hexd[(v >> 4) & 0xF]);
-    uart_putc(hexd[v & 0xF]);
-}
+   sdio_init слоем wifi_layer). Используется для значка на главном экране. */
+extern int wifi_active;
 
 static void led_heartbeat(void)
 {
@@ -161,6 +153,16 @@ static void draw_ui(void)
         fb_text(60, 200, "Settings (coming soon)", 0x00FFFFFF, 0x000D1A33);
         fb_text(60, 240, "B=back", 0x00A0C0D0, 0x000D1A33);
     }
+    else if (screen == SCR_TRANSFER) {
+        /* --- Подменю «Transfer»: отдельный WiFi-слой --- */
+        fb_text(60, 160, "Transfer over WiFi", 0x00FFFFFF, 0x000D1A33);
+        if (wifi_layer_started())
+            fb_text(60, 200, "WiFi layer: running", 0x0000FF00, 0x000D1A33);
+        else
+            fb_text(60, 200, "WiFi layer: idle", 0x00888888, 0x000D1A33);
+        fb_text(60, 240,
+                "A=start/stop WiFi  B=back", 0x00A0C0D0, 0x000D1A33);
+    }
 
     /* Версия прошивки — нижний правый угол. */
     fb_text(FB_W - 8 * 11 - 8, FB_H - 8 - 4, "FW v" FW_VERSION_STR,
@@ -185,6 +187,7 @@ static void handle_buttons(uint32_t btns)
             draw_ui();
         } else if (pressed & BTN_A) {
             if (main_sel == MITEM_SOUND) screen = SCR_TONE;
+            else if (main_sel == MITEM_TRANSFER) screen = SCR_TRANSFER;
             else if (main_sel == MITEM_SETTINGS) screen = SCR_SETTINGS;
             draw_ui();
         }
@@ -220,6 +223,22 @@ static void handle_buttons(uint32_t btns)
             draw_ui();
         }
     }
+    /* В подменю Transfer: WiFi-слой */
+    else if (screen == SCR_TRANSFER) {
+        if (pressed & BTN_A) {
+            /* Запустить отдельный WiFi-слой (прошивка чипа + скан). */
+            if (!wifi_layer_started()) {
+                uart_print("transfer: wifi layer start...\r\n");
+                wifi_layer_start();
+            } else {
+                uart_print("transfer: wifi layer already running\r\n");
+            }
+            draw_ui();
+        } else if (pressed & BTN_B) {
+            screen = SCR_MAIN;
+            draw_ui();
+        }
+    }
 }
 
 void kmain(void)
@@ -237,6 +256,13 @@ void kmain(void)
 
     /* LED на PL10 — индикатор «я жив». */
     set_led(1);
+
+    /* Дисплей поднимаем первым (до I2C/звука/WiFi — это занимает время и
+       сдвигает вывод; экран должен гореть с самого старта). */
+    uart_print("display init...\r\n");
+    display_init();
+    draw_ui();
+    uart_print("display ok\r\n");
 
     /* PA0-3 = JTAG (RMW, не трогать PA4 UART-TX). */
     volatile uint32_t *pio_cfg0 = (volatile uint32_t *)0x01C20800;
@@ -256,213 +282,11 @@ void kmain(void)
         uart_print("i2s ok\r\n");
     }
 
-    /* WiFi: включить чип (WIFI_EN=PL7), инициализировать SDC1 и SDIO-карту.
-       При успехе выставить wifi_active=1 (для индикатора) и прочитать CCID. */
-    uart_print("wifi init...\r\n");
-    uart_print("  pl_before=0x"); uart_print_hex(*(volatile uint32_t *)0x01F02C10);
-    uart_print("\r\n");
-    h3_sdc1_init();
-    uart_print("  pl_after=0x"); uart_print_hex(*(volatile uint32_t *)0x01F02C10);
-    uart_print("\r\n");
-    /* Диагностика после инициализации контроллера. */
-    uart_print("  gctl=0x"); uart_print_hex(*(volatile uint32_t *)0x01C10000);
-    uart_print(" ckcr=0x");  uart_print_hex(*(volatile uint32_t *)0x01C10004);
-    uart_print(" sclk=0x");  uart_print_hex(*(volatile uint32_t *)0x01C2008C);
-    uart_print(" star=0x");  uart_print_hex(*(volatile uint32_t *)0x01C1003C);
-    uart_print(" rst0=0x");  uart_print_hex(*(volatile uint32_t *)0x01C202C0);
-    uart_print(" pg_cfg0=0x");uart_print_hex(*(volatile uint32_t *)0x01C208D8);
-    uart_print(" pg_cfg1=0x");uart_print_hex(*(volatile uint32_t *)0x01C208DC);
-    uart_print(" pl_cfg=0x");uart_print_hex(*(volatile uint32_t *)0x01F02C00);
-    uart_print(" pl_dat=0x");uart_print_hex(*(volatile uint32_t *)0x01F02C10);
-    uart_print("\r\n");
-    /* Ручной probe CMD5 (диагностика контроллера). */
-    {
-        volatile uint32_t *SDC = (volatile uint32_t *)0x01C10000;
-        SDC[0x38/4] = 0xFFFFFFFF;               /* очистить RISR */
-        SDC[0x1C/4] = 0x00E00000;               /* ARG: 3.0-3.6V */
-        SDC[0x18/4] = (1u<<31) | 5u | (1u<<6);  /* START|CMD5|RESP_RCV */
-        for (int w = 0; w < 1000000; w++)
-            if (SDC[0x38/4] & (1u<<2)) break;   /* CMD_DONE */
-        uart_print("  cmdr=0x"); uart_print_hex(SDC[0x18/4]);
-        uart_print(" risr=0x");  uart_print_hex(SDC[0x38/4]);
-        uart_print(" resp0=0x"); uart_print_hex(SDC[0x20/4]);
-        uart_print("\r\n");
-    }
-    {
-        int rc = h3_sdio_init_chip();
-        uart_print("  sdio_init rc=");
-        uart_print_int(rc);
-        uart_print("\r\n");
-        if (rc == 0) {
-            wifi_active = 1;
-            uint8_t ccid0 = 0, ccid1 = 0;
-            h3_sdc_cmd52_read(0, 0x00, &ccid0);   /* CCCR/SDIO revision */
-            h3_sdc_cmd52_read(0, 0x01, &ccid1);   /* SDIO function info */
-            uart_print("  ccid0=0x");
-            uart_print_hex(ccid0);
-            uart_print(" ccid1=0x");
-            uart_print_hex(ccid1);
-            uart_print("\r\n");
-
-            /* ID чипа из CIS: manf (0x024C Realtek) + card PID (0xF179 8189F). */
-            {
-                uint16_t manf = 0, card = 0;
-                int id_rc = h3_sdio_read_chip_id(&manf, &card);
-                uart_print("  chip_id rc=");
-                uart_print_int(id_rc);
-                if (id_rc == 0) {
-                    uart_print(" manf=0x");
-                    uart_print_hex(manf);
-                    uart_print(" card=0x");
-                    uart_print_hex(card);
-                }
-                uart_print("\r\n");
-            }
-
-            /* Power-on чипа: перевести из CARDEMU в ACTIVE (PowerSeq CARDEMU_TO_ACT).
-               Выполняется ДО включения Function 1 (в драйвере Linux 8189fs это
-               _InitPowerOn в rtl8188fs_hal_init, идёт до sdio_enable_func).
-               Без CARDEMU→ACTIVE CMD53-write к функции 1 срывается (rc=-2,
-               risr=0) — подтверждено на стенде. */
-            {
-                int pon = h3_wifi_power_on_chip();
-                uart_print("  pwon rc=");
-                uart_print_int(pon);
-                if (pon != 0) {
-                    uart_print(" step=");
-                    uart_print_int((int)sdc_diag_pseq_step);
-                    uart_print(" base=");
-                    uart_print_int((int)sdc_diag_pseq_base);
-                    uart_print(" off=0x");
-                    uart_print_hex((uint32_t)sdc_diag_pseq_off);
-                    uart_print(" val=0x");
-                    uart_print_hex((uint32_t)sdc_diag_pseq_val);
-                }
-                uart_print("\r\n");
-            }
-
-            /* Этап 3: включить I/O-функцию 1 (CCCR 0x02, бит IOEx=0x02). */
-            {
-                uint8_t ioen;
-                h3_sdc_cmd52_read(0, 0x02, &ioen);
-                h3_sdc_cmd52_write(0, 0x02, (uint8_t)(ioen | 0x02));
-                h3_sdc_cmd52_read(0, 0x02, &ioen);
-                uart_print("  fn1 ioen=0x");
-                uart_print_hex(ioen);
-                uart_print("\r\n");
-            }
-
-            /* Этап 4: загрузка прошивки чипа (NIC firmware, встроена в fw_nic.bin). */
-            {
-                uint32_t fwlen = (uint32_t)(fw_blob_end - fw_blob_start);
-                int frc = h3_wifi_download_fw(fw_blob_start, fwlen);
-                uart_print("  fwdl rc=");
-                uart_print_int(frc);
-                uart_print(" len=0x");
-                uart_print_hex(fwlen);
-                if (frc != 0) {
-                    uart_print(" blk=");
-                    uart_print_int(sdc_diag_fail_blk);
-                    uart_print(" cmd=");
-                    uart_print_hex(sdc_diag_cmd);
-                    uart_print(" arg=0x");
-                    uart_print_hex(sdc_diag_arg);
-                    uart_print(" cmdr=0x");
-                    uart_print_hex(sdc_diag_cmdr);
-                    uart_print(" risr=");
-                    uart_print_hex(sdc_diag_risr);
-                    uart_print(" sta=");
-                    uart_print_hex(sdc_diag_sta);
-                    if (frc == -33) {
-                        uart_print(" mcufwdl=0x");
-                        uart_print_hex((uint32_t)sdc_diag_fw_mcufwdl);
-                    }
-                } else {
-                    /* Этап 5: сразу после FW читаем eFuse (заводской MAC, 0x11A).
-                       На Orange Pi Lite eFuse пуст (FF:..) — тогда MAC задаём
-                       программно (как драйвер 8189fs) и пишем в REG_MACID. */
-                    uint8_t mac[6];
-                    int erc = h3_wifi_efuse_read_mac(mac);
-                    uart_print("  efuse rc=");
-                    uart_print_int(erc);
-                    if (erc == 0) {
-                        int valid = 1;
-                        for (int k = 0; k < 6; k++)
-                            if (mac[k] == 0xFF || mac[k] == 0x00) { valid = 0; break; }
-                        if (!valid) {
-                            /* eFuse пуст — генерируем локально-администрируемый MAC.
-                               Префикс 02:00:00 + младшие байты таймера (уник.). */
-                            uint32_t t = micros();
-                            mac[0] = 0x02; mac[1] = 0x00; mac[2] = 0x00;
-                            mac[3] = (uint8_t)(t >> 16);
-                            mac[4] = (uint8_t)(t >> 8);
-                            mac[5] = (uint8_t)(t);
-                        }
-                    }
-                    uart_print(" mac=");
-                    for (int k = 0; k < 6; k++) {
-                        print_u8_hex(mac[k]);
-                        if (k < 5) uart_print(":");
-                    }
-                    uart_print("\r\n");
-
-                    /* Запись MAC в REG_MACID (0x610-0x615) — через слой WiFi
-                       (h3_sdc.c): сначала инкрементный путь как у драйвера,
-                       при несовпадении чтения — откат на запись без инкремента. */
-                    {
-                        int wk = h3_wifi_set_mac(mac);
-                        uart_print("  mac_set=");
-                        uart_print(wk == 0 ? "OK" : "FAIL");
-                        uart_print("\r\n");
-                    }
-
-                    /* Пауза, затем чтение REG_MACID обратно двумя CMD53 (inc=0). */
-                    udelay(10000);
-                    {
-                        uint32_t re_lo = 0, re_hi = 0;
-                        uint32_t base = (8u << 13) | (0x610u & 0x7FFFu);
-                        int rrc = 0;
-                        if (h3_sdc_cmd53_read_bytes_noinc(1, base, 4, &re_lo) != 0) rrc = -1;
-                        if (h3_sdc_cmd53_read_bytes_noinc(1, base + 4, 2, &re_hi) != 0) rrc = -1;
-                        uart_print("  macid_re=");
-                        if (rrc == 0) {
-                            print_u8_hex((uint8_t)(re_lo & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_lo >> 8) & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_lo >> 16) & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_lo >> 24) & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)(re_hi & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_hi >> 8) & 0xFF));
-                        } else uart_print("FAIL");
-                        uart_print("\r\n");
-                    }
-                }
-
-                /* Этап 1: RF-калибровка LCK, затем RX-тест.
-                   IQK вызывается внутри h3_wifi_rf_rx_test (после включения
-                   MAC, как драйвер: sdio_halinit.c:1238 → :1273 LCK → :1277-1288
-                   H2C 0x6D + poll 0x1E7 + PHY_IQCalibrate), с H2C-обвязкой
-                   0x6D (BT_WLAN_CALIBRATION) до и после калибровки. */
-                h3_wifi_rf_lck();
-                h3_wifi_rf_rx_test();
-
-                uart_print("\r\n");
-            }
-        }
-    }
-    uart_print("wifi ok\r\n");
-
-    /* Дисплей: переиспользуем фреймбуфер U-Boot */
-    uart_print("display init...\r\n");
-    display_init();
-    draw_ui();
-    uart_print("display ok\r\n");
+    /* WiFi больше не инициализируется при старте — это отдельный слой,
+       вызываемый из пункта меню "Transfer" (wifi_layer_start). */
 
     /* Главный цикл */
+    draw_ui();
     for (;;) {
         led_heartbeat();         /* мигать PL10 — индикатор «я жив» */
         uint32_t btns = pcf8574_read();

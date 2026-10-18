@@ -15,7 +15,9 @@
 #define H3_I2S0_TX_FIFO   0x01C22020u   /* регистр TX FIFO (sun8i) */
 #define H3_HSTMR_BASE     0x01C60000u
 #define H3_DE_BASE        0x01000000u
+#define H3_LCD_BASE       0x01C0C000u
 #define H3_HDMI_BASE      0x01EE0000u
+#define H3_HDMI_PHY_BASE  (H3_HDMI_BASE + 0x10000u)   /* HDMI PHY (0x01EF0000) */
 
 /* SD/MMC хост-контроллеры (WiFi чип RTL8189FTV сидит на SDC1). */
 #define H3_SDC0_BASE      0x01C0F000u
@@ -23,5 +25,34 @@
 #define H3_SDC2_BASE      0x01C11000u
 
 #define DRAM_BASE         0x40000000u
+
+/* TCON LCD0 (0x01C0C000) — регистры, используемые драйвером дисплея. */
+#define H3_LCD0_TCON1_CTL     (*(volatile uint32_t *)(H3_LCD_BASE + 0x090))
+#define H3_LCD0_TCON1_BASIC0  (*(volatile uint32_t *)(H3_LCD_BASE + 0x094))
+#define H3_LCD0_TCON1_BASIC1  (*(volatile uint32_t *)(H3_LCD_BASE + 0x098))
+#define H3_LCD0_TCON1_BASIC2  (*(volatile uint32_t *)(H3_LCD_BASE + 0x09C))
+#define H3_LCD0_TCON1_BASIC3  (*(volatile uint32_t *)(H3_LCD_BASE + 0x0A0))
+#define H3_LCD0_TCON1_BASIC4  (*(volatile uint32_t *)(H3_LCD_BASE + 0x0A4))
+#define H3_LCD0_TCON1_BASIC5  (*(volatile uint32_t *)(H3_LCD_BASE + 0x0A8))
+#define H3_LCD0_GCTL          (*(volatile uint32_t *)(H3_LCD_BASE + 0x000))
+#define H3_LCD0_GINT0         (*(volatile uint32_t *)(H3_LCD_BASE + 0x004))
+#define H3_LCD0_TCON0_DCLK    (*(volatile uint32_t *)(H3_LCD_BASE + 0x044))
+#define H3_LCD0_TCON0_IO_TRI  (*(volatile uint32_t *)(H3_LCD_BASE + 0x08C))
+#define H3_LCD0_TCON1_IO_TRI  (*(volatile uint32_t *)(H3_LCD_BASE + 0x0F4))
+
+/* HDMI PHY (0x01EF0000) — регистры PHY (black-magic значения из BSP). */
+#define H3_HDMI_PHY_POL       (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x00))
+#define H3_HDMI_PHY_READ_EN   (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x10))
+#define H3_HDMI_PHY_UNSCRAMBL (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x14))
+#define H3_HDMI_PHY_CTRL      (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x20))
+#define H3_HDMI_PHY_UNK1      (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x24))
+#define H3_HDMI_PHY_UNK2      (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x28))
+#define H3_HDMI_PHY_PLL       (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x2C))
+#define H3_HDMI_PHY_CLK       (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x30))
+#define H3_HDMI_PHY_UNK3      (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x34))
+#define H3_HDMI_PHY_STATUS    (*(volatile uint32_t *)(H3_HDMI_PHY_BASE + 0x38))
+
+/* DW-HDMI (0x01EE0000) — байтовые регистры ядра (см. dw_hdmi.h). */
+#define H3_HDMI_BYTE(off)     (*(volatile uint8_t *)(H3_HDMI_BASE + (off)))
 
 #endif /* H3_H */
