@@ -213,6 +213,15 @@ int wifi_layer_start(void)
                     }
                 }
 
+                /* W.345: A0 (power state) сразу после fwdl+mac. Если упал
+                   с 3 (после pwon) до 0 — FW ушла в RESET на этапе fwdl/мак. */
+                {
+                    int a0ps = h3_wifi_power_state();
+                    uart_print("  a0_post_fw=0x");
+                    uart_print_hex((uint32_t)(a0ps & 0xFF));
+                    uart_print("\r\n");
+                }
+
                 /* RF-калибровка LCK. */
                 h3_wifi_rf_lck();
 
@@ -269,4 +278,36 @@ int wifi_layer_start(void)
     uart_print("wifi ok\r\n");
     wifi_started = 1;
     return 0;
+}
+
+/* Подключение к ВЫБРАННОЙ сети из списка (UI «Transfer»): по индексу
+   берём её BSSID/channel из буфера scan_aps[] (заполнен парсером скана
+   в h3_wifi_rf_rx_test) и захватываем как цель JOINBSS-движка
+   (h3_wifi_scan_capture_target -> h3_wifi_join_ap БЕЗ повторного скана).
+   Возвращает: 0 = ассоциация подтверждена; -1 = плохой индекс; иначе
+   код от h3_wifi_join_ap (например -4 — AuthResp не пришла). */
+int wifi_layer_connect(int index)
+{
+    struct h3_wifi_ap ap;
+    int rc;
+
+    if (!wifi_started)
+        return -2;                       /* слой не инициализирован */
+    if (index < 0 || h3_wifi_scan_ap_get(index, &ap) != 0)
+        return -1;                       /* нет такой сети */
+
+    uart_print("join: sel=");
+    uart_print_int(index);
+    uart_print(" ssid=");
+    for (int k = 0; k < ap.ssid_len; k++) uart_putc(ap.ssid[k]);
+    uart_print("\r\n");
+
+    /* Захватить BSSID/channel выбранной сети как цель ассоциации. */
+    h3_wifi_scan_capture_target(ap.bssid, ap.channel);
+
+    rc = h3_wifi_join_ap();
+    uart_print("join: rc=");
+    uart_print_int(rc);
+    uart_print("\r\n");
+    return rc;
 }

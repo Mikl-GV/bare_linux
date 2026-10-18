@@ -53,6 +53,7 @@ static int screen = SCR_MAIN;     /* текущий экран */
 static int main_sel = MITEM_SOUND; /* выбранный пункт главного меню */
 static int tone_sel = TONE_440;    /* выбранная частота в подменю */
 static int testing = 0;            /* идёт ли тест звука */
+static int transfer_sel = 0;       /* выбранная сеть в подменю Transfer */
 
 static uint32_t prev_buttons = 0;
 
@@ -167,13 +168,20 @@ static void draw_ui(void)
             fb_text(60, 204, "(scan not run yet — press A)", 0x00888888, 0x000D1A33);
         } else {
             if (n > 8) n = 8;   /* помещается на экран */
+            if (transfer_sel >= n) transfer_sel = n - 1;
             for (int i = 0; i < n; i++) {
                 struct h3_wifi_ap ap;
                 if (h3_wifi_scan_ap_get(i, &ap) != 0) break;
-                fb_text(60, 204 + i * 22, ap.ssid, 0x00FFFFFF, 0x000D1A33);
+                uint32_t col = (i == transfer_sel) ? 0x0000FF00 : 0x00FFFFFF;
+                /* Маркер выбора. */
+                fb_text(32, 204 + i * 22, (i == transfer_sel) ? ">" : " ", col, 0x000D1A33);
+                fb_text(48, 204 + i * 22, ap.ssid, col, 0x000D1A33);
             }
         }
-        fb_text(60, 420, "A=start WiFi  B=back", 0x00A0C0D0, 0x000D1A33);
+        if (wifi_layer_started() && n > 0)
+            fb_text(60, 420, "A=connect  B=back", 0x00A0C0D0, 0x000D1A33);
+        else
+            fb_text(60, 420, "A=start WiFi  B=back", 0x00A0C0D0, 0x000D1A33);
     }
 
     /* Версия прошивки — нижний правый угол. */
@@ -237,13 +245,29 @@ static void handle_buttons(uint32_t btns)
     }
     /* В подменю Transfer: WiFi-слой */
     else if (screen == SCR_TRANSFER) {
-        if (pressed & BTN_A) {
-            /* Запустить отдельный WiFi-слой (прошивка чипа + скан). */
+        int n = h3_wifi_scan_ap_count();
+        if (pressed & BTN_UP) {
+            if (wifi_layer_started() && n > 0) {
+                if (transfer_sel <= 0) transfer_sel = n > 8 ? 7 : n - 1;
+                else transfer_sel--;
+            }
+            draw_ui();
+        } else if (pressed & BTN_DOWN) {
+            if (wifi_layer_started() && n > 0) {
+                int max = n > 8 ? 8 : n;
+                transfer_sel = (transfer_sel + 1) % max;
+            }
+            draw_ui();
+        } else if (pressed & BTN_A) {
             if (!wifi_layer_started()) {
                 uart_print("transfer: wifi layer start...\r\n");
                 wifi_layer_start();
-            } else {
-                uart_print("transfer: wifi layer already running\r\n");
+            } else if (n > 0) {
+                /* Подключиться к выбранной сети. */
+                uart_print("transfer: connect sel=");
+                uart_print_int(transfer_sel);
+                uart_print("\r\n");
+                wifi_layer_connect(transfer_sel);
             }
             draw_ui();
         } else if (pressed & BTN_B) {

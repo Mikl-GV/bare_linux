@@ -15,4 +15,10 @@ int wifi_layer_start(void);
 /* Уже был запущен в этой сессии? */
 int wifi_layer_started(void);
 
+/* Подключиться к выбранной сети из списка (UI «Transfer»): по индексу из
+   буфера найденных сетей захватывает BSSID/channel как цель и запускает
+   host-ассоциацию (JOINBSS). 0 = ассоциация подтверждена, иначе код
+   (см. h3_wifi_join_ap; -4 — AuthResp не пришла). */
+int wifi_layer_connect(int index);
+
 #endif /* WIFI_LAYER_H */
