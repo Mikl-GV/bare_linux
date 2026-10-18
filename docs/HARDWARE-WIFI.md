@@ -62,16 +62,21 @@ WIFI_EN — обычный GPIO (порт L, R_PIO), HIGHT — чип включ
 - Reset контроллера: 20 мс стабилизации (патч u-boot 0015).
 - Power-on чипа: PowerSeq CARDEMU→ACTIVE (WIFI_EN=PL7).
 - Загрузка прошивки: протокол MCUFWDL (`h3_wifi_download_fw`), FW встроена
-  в бинарь (`src/fw_blob.S` + `fw_nic.bin`), загрузка на 4-bit/6 МГц.
-- RF-калибровка LCK, RX-тест, probe request (механика 802.11, TX FIFO HIQ).
+  в бинарь (`src/fw_blob.S` + `fw_nic.bin`), загрузка на 1-bit/50 МГц
+  (4-bit ломает data-фазу CMD53 на этом стенде).
+- RF-калибровки LCK/IQK, RX-приём (beacon/SSID), probe request (TX FIFO HIQ).
 
-### В работе
-- Завершить RX: счётчик принятых пакетов (RXPKT_NUM) — цель.
-- Ключевые наблюдения по SDC1:
+### В работе (W.316+)
+- **RX-приём работает**: чип принимает beacon'ы эфира, парсер извлекает SSID
+  (`BCN plen= ch= ssid=`). Хост-чтение RX-FIFO — по 1 блоку (512 б)/CMD53.
+- Наблюдения по SDC1:
   - Для data-команд SDC1 не взводит CMD_DONE — ждать DATA_DONE.
   - Шина MMC1 — OLD mode (бит30=0), иначе карта не отвечает.
-  - SDIO-local регистры — device id 0, WLAN IOREG — device id 8.
-- Далее: приём beacon/probe-response, ассоциация, 802.11-стек.
+  - SDIO-local регистры — device id 0, WLAN IOREG — device id 8, RX FIFO — id 7.
+  - **Host SDIO H3 не тянет многоблочный read CMD53** (30 блоков → rc=-1);
+    только 1 блок (512 б) за CMD53.
+- Далее: подключение к AP (H2C JOIN/CONNECT), C2H, 802.11-стек, TCP/IP —
+  цель «эмулятор + сетевой доступ к ROM на SD».
 
 ### Снимок JTAG (когда был нужен)
 - После U-Boot (SD): PG0-3 уже function 2 (SDC1), такт MMC1 включён, но WIFI_EN

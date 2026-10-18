@@ -536,21 +536,25 @@ I2C bit-bang: SCL=PG9, SDA=PG8, PCF8574 @0x27. Детект нажатий — �
 
 ---
 
-## 7. Поток выполнения WiFi-этапа (сводно, по логу W.269)
+## 7. Поток выполнения WiFi-этапа (сводно, актуально на W.316)
 
 ```
 SDIO CMD5→3→7 → CCCR → chip_id 0x024C:F179 → PowerSeq CARDEMU→ACTIVE
  → Fn1 enable → FW download (5 страниц, chksum OK, MCUFWDL=0xC6)
  → eFuse/MAC (программный 02:00:00:xx) → REG_MACID verify
- → LCD: MAC(101)+BB(207)+AGC(66)+RF(136) → LCK (70 мс)
+ → LCD: MAC(101)+BB(207)+AGC(66)+RF(136) → LCK
  → RX: FW active (RPWM/CPWM), H2C SET_PWR_MODE, IGI/MSR, FBR/CCCR,
    RFMOD, RQPN/LLT/bndy, antenna_sel, BWOPMODE, CR=0x206FF
- → IQK: H2C 0x6D, PI, Tx/Rx one-shot, LOK_Result, restore, H2C 0x6D={0}
- → RX-sweep ch 1/6/11, probe request, диагностика
- → C2H-ping (H2C 0x43, детект 0x1A0/HISR/RXPKT) → C2H-ABSENT (см. NEXT-CHAT-PROMPT)
+ → IQK: PI, Tx/Rx one-shot, LOK_Result, restore
+ → RX-sweep ch 1..13, probe request, чтение RX FIFO по 1 блоку
+   → парсер beacon → SSID (W.316: BCN plen= ch= ssid=)
+ → C2H-ping (H2C 0x43) → C2H-ABSENT (см. NEXT-CHAT-PROMPT)
 ```
 
-**Текущий статус (W.269):** вся хост-инициализация 1:1 с драйвером, 8051
-исполняет FW (WINTINI_RDY=1), H2C 0x20 принимается, но RX-механизм FW не
-запущен (RX FIFO пуст, C2H не идёт). Проблема локализована во внутреннем
-состоянии прошивки 8051 — дальнейшие шаги в `NEXT-CHAT-PROMPT.md`.
+**Текущий статус (W.316):** хост-инициализация 1:1 с драйвером, **RX-приём
+работает** — чип принимает beacon'ы, парсер извлекает SSID из реального эфира.
+Хост-чтение RX-FIFO по 1 блоку (512 б)/CMD53 (host H3 не тянет многоблок).
+Осталось: `power_state=3`/`cpwm=0`/`C2H-ABSENT` (FW не подтверждает ACTIVE по
+RPWM/CPWM — приём не блокирует, но TX/H2C/C2H отсутствуют), затем подключение
+к AP (H2C JOIN/CONNECT) для цели «эмулятор + сетевой доступ к ROM на SD».
+Дальнейшие шаги — в `NEXT-CHAT-PROMPT.md`.
