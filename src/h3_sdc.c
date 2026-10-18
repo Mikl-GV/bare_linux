@@ -2386,55 +2386,43 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             if (total > 0x4000) total = 0x4000;
             uint32_t off_read = 0;
             int frc = 0;
-            /* W.314: эталонный drain (sdio_ops.c:2196-2223): читаем 0x1C,
-               одним CMD53 вычитываем РОВНО size (до блока), seq++ ОДИН раз
-               за пакет (sdio_ops.c:776). W.311 (по 512 с seq++ на блок) был
-               неверен: сдвигал SEQ на блок и не вычитывал весь пакет. */
-            for (;;) {
+            /* W.316: читаем строго по 1 блоку (512) за CMD53 — host не тянет
+               многоблочный read (30 блоков → rc=-1 и зависание). Дренаж идёт
+               в цикле по 1 блоку, seq++ на блок, пока RX0_REQ_LEN>0.
+               Парсер (ниже) работает по acc>0. */
+            for (uint32_t g = 0; g < 64 && off_read < 0x4000u; g++) {
                 uint8_t r[4] = {0, 0, 0, 0};
                 if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, r) != 0) break;
-                uint32_t size = r[0] | ((uint32_t)r[1] << 8);
-                if (size == 0) break;
-                if (off_read + size > 0x4000) size = 0x4000 - off_read;
-                if (size == 0) break;
-                uint32_t blocks = (size + 511u) / 512u;
+                if (!(r[0] | r[1])) break;                 /* RX0_REQ_LEN == 0 — пусто */
                 uint32_t addr = (7u << 13) | (rx_seq & 3u);
-                frc = h3_sdc_cmd53_read(1, addr, blocks, rxbuf + off_read);
-                uart_print(" seg blks=");
-                uart_print_int((int)blocks);
-                uart_print(" rc=");
+                frc = h3_sdc_cmd53_read(1, addr, 1, rxbuf + off_read);
+                uart_print(" blk rc=");
                 uart_print_int(frc);
                 if (frc != 0) break;
-                off_read += blocks * 512u;
-                rx_seq++;                                 /* ОДИН раз за пакет */
-                if (off_read >= 0x4000) break;
+                off_read += 512u;
+                rx_seq++;                                 /* seq++ на блок */
             }
             uart_print(" fifo_rd rc=");
             uart_print_int(frc);
             uart_print(" read=0x");
             uart_print_hex(off_read);
             acc = (total < off_read) ? total : off_read;
-            if (t == 0) { /* W.312 диагностика: содержимое первого блока RX */
-                uart_print(" rxbuf0:");
-                uint32_t nd = (acc > 64) ? 64 : acc;
-                for (uint32_t j = 0; j < nd; j++) {
-                    uart_print_hex((uint32_t)rxbuf[j]);
-                    uart_print(" ");
-                    if ((j & 7u) == 7u) uart_print("\r\n");
-                }
-            }
-            if (frc == 0 && acc > 0) {
+            /* W.315: парсер работает по наличию данных (acc>0), а не по
+               frc==0. Лишняя попытка дочитать накопленный объём может
+               вернуть rc=-1, но валидно прочитанный первый пакет уже лежит
+               в rxbuf — его и разбираем. Ошибку только логируем. */
+            if (acc > 0) {
                 /* Парсер: off += 24 + drvinfo + plen, round 8.
                    SSID из beacon (fc=0x80 0x00), IE обход после 36. */
                 uint32_t off = 0;
                 int pkts = 0;
                 while (off + 24 <= acc && pkts < 64) {
                     uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
-                    /* W.313: 8188F RX-дескриптор = 24 байта rx_status; из дампа rxbuf0
-                       видно: кадр (fc=0x80 0x00, beacon) лежит на off+24,
-                       drvinfo_field = 0 (байт[2]=0) — данных drvinfo нет.
-                       Поэтому drvsz из поля (0), fr = off+24+drvsz = off+24.
-                       Fallback НЕ применяем — поле достоверно. */
+                    /* W.316: drvinfo из GET_RX_STATUS_DESC_DRVINFO_SIZE_8188F =
+                       LE_BITS_TO_4BYTE(pdesc,16,4) = rxbuf[off+2] & 0x0F, <<3.
+                       По дампу rxbuf0: fc=0x80 0x00 на off+24, drvinfo_field=0
+                       (данных drvinfo нет) → drvsz=0, fr=off+24. БЕЗ fallback:
+                       fallback 4 сдвигает fr на 28 и теряет beacon. */
                     uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
                     uint32_t pkt_total = 24u + drvsz + plen;
                     if (plen == 0 || plen > 0x2000 || off + pkt_total > acc) break;
@@ -2637,7 +2625,7 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             uart_print(" C2H-ABSENT");
         uart_print("\r\n");
 
-        /* Закрыть C2H-событие: CLEAR (0x1AF) = C2H_EVT_HOST_CLOSE (0x00). */
+        /* Захватилить C2H: CLEAR (0x1AF) = C2H_EVT_HOST_CLOSE (0x00). */
         h3_sdc_write_wlan_reg8(0x01AF, 0x00);
     }
 
@@ -2649,8 +2637,7 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
  * Протокол (из rtl8188f_hal_init.c):
  *   1) _FWDownloadEnable(1): REG_SYS_FUNC_EN[1]|=0x04 (8051 enable),
  *      REG_MCUFWDL(0x80) |= 0x01, REG_MCUFWDL[2] &= 0xf7 (8051 reset).
- *   2) Записать прошивку постранично byte-mode CMD53 по 4 байта начиная
- *      с FW_START=0x1000.
+ *   2) Записать прошивку блоками CMD53 (block write) начиная с FW_START=0x1000.
  *   3) _FWFreeToGo: REG_MCUFWDL[0] |= MCUFWDL_RDY(bit1), &= ~WINTINI_RDY(bit6),
  *      8051 reset, затем поллить FW ready (WINTINI_RDY|FWDL_ChkSum_rpt|MCUFWDL_RDY).
  *
