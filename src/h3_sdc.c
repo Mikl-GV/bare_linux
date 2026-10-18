@@ -48,6 +48,43 @@ static struct {
     uint8_t bssid_captured;   /* 1 = BSSID/channel найдены в скане */
 } join_target;
 
+/* Список найденных сетей для UI «Transfer» (заполняется парсером RX-скана). */
+static struct h3_wifi_ap scan_aps[H3_WIFI_AP_MAX];
+static int scan_ap_count = 0;
+
+void h3_wifi_scan_ap_reset(void)
+{
+    scan_ap_count = 0;
+}
+
+void h3_wifi_scan_ap_add(struct h3_wifi_ap *ap)
+{
+    if (scan_ap_count >= H3_WIFI_AP_MAX) return;
+    /* Пропускаем дубликаты по SSID (без учёта регистра — как в реальных сетях). */
+    for (int i = 0; i < scan_ap_count; i++) {
+        if (scan_aps[i].ssid_len == ap->ssid_len) {
+            int same = 1;
+            for (int j = 0; j < ap->ssid_len; j++)
+                if (scan_aps[i].ssid[j] != ap->ssid[j]) { same = 0; break; }
+            if (same) return;   /* уже есть */
+        }
+    }
+    scan_aps[scan_ap_count] = *ap;
+    scan_ap_count++;
+}
+
+int h3_wifi_scan_ap_count(void)
+{
+    return scan_ap_count;
+}
+
+int h3_wifi_scan_ap_get(int i, struct h3_wifi_ap *ap)
+{
+    if (i < 0 || i >= scan_ap_count) return -1;
+    *ap = scan_aps[i];
+    return 0;
+}
+
 /* SD/MMC хост-контроллер H3 (SDC1) — низкоуровневый доступ.
  *
  * Используется для SDIO-связи с WiFi-чипом RTL8189FTV. Реализация опирается
@@ -2501,6 +2538,20 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                                 if (ok) {
                                     for (uint32_t j = 0; j < len; j++) uart_putc((char)rxbuf[ie+2+j]);
                                     got = 1;
+                                    /* Добавить сеть в список для UI «Transfer»
+                                       (SSID, канал, BSSID; rssi из дескриптора
+                                       пока не берём). */
+                                    {
+                                        struct h3_wifi_ap ap;
+                                        ap.ssid_len = (uint8_t)len;
+                                        for (uint32_t j = 0; j < len; j++)
+                                            ap.ssid[j] = (char)rxbuf[ie+2+j];
+                                        ap.ssid[len] = 0;
+                                        ap.channel = (uint8_t)(ch & 0xFF);
+                                        for (int k = 0; k < 6; k++) ap.bssid[k] = p_bssid[k];
+                                        ap.rssi_lvl = 0;
+                                        h3_wifi_scan_ap_add(&ap);
+                                    }
                                     /* Захват BSSID/channel целевой сети (для
                                        JOINBSS): если SSID совпал и сеть ещё не
                                        захвачена. */
@@ -3433,6 +3484,44 @@ static int tx_mgnt_cmd(uint8_t *frame, uint32_t plen)
     return h3_sdc_cmd53_write_bytes(1, fifo_addr, total, buf);
 }
 
+/* Прочитать один накопленный пакет из RX FIFO (аналог drain-цикла скана):
+   берёт RX0_REQ_LEN (0x1C), читает данные CMD53 по 1 блоку (512 б) с
+   собственным seq, возвращает размер фактически прочитанного в *out_acc
+   (0 = пакета не было). Переиспользуется для ожидания Auth/AssocResp
+   в h3_wifi_join_ap. seq изолирован от скан-цикла (свой static). */
+static int rx_read_packet(uint8_t *buf, uint32_t cap, uint32_t *out_acc)
+{
+    static uint32_t rxp_seq = 0;
+    uint8_t rxl4[4] = {0, 0, 0, 0};
+    uint32_t rxlen, total, off_read = 0;
+    int frc = 0;
+
+    *out_acc = 0;
+    if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, rxl4) != 0)
+        return -1;
+    rxlen = (uint32_t)(rxl4[0] | ((uint16_t)rxl4[1] << 8));
+    if (rxlen == 0)
+        return 0;
+
+    total = (rxlen > cap) ? cap : rxlen;
+    if (total > 0x4000) total = 0x4000;
+    uint32_t seq_cur = rxp_seq;
+    /* Читаем по 1 блоку (512 б)/CMD53 — host H3 не тянет многоблок. */
+    for (uint32_t g = 0; g < 64 && off_read < total; g++) {
+        uint32_t addr = (7u << 13) | (seq_cur & 3u);
+        frc = h3_sdc_cmd53_read(1, addr, 1, buf + off_read);
+        if (frc != 0) break;
+        off_read += 512u;
+    }
+    if (frc == 0 && off_read >= total) {
+        uint8_t r2[4] = {0,0,0,0};
+        if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, r2) == 0 && (r2[0] | r2[1]) == 0)
+            rxp_seq = (seq_cur + 1) & 0xFFFFFFFFu;   /* пакет ушёл → seq++ */
+    }
+    *out_acc = (total < off_read) ? total : off_read;
+    return (frc == 0) ? 0 : -2;
+}
+
 /* Authentication (opensystem) к целевому BSSID.
    Кадр: fc=0xB0, addr1/3=BSSID, addr2=наш MAC, alg=0, seq=1, status=0. */
 int h3_wifi_tx_auth(void)
@@ -3459,7 +3548,7 @@ int h3_wifi_tx_auth(void)
 }
 
 /* Association Request к целевому BSSID (SSID + rates + capability). */
-int h3_wifi_tx_assoc_req(uint8_t channel)
+int h3_wifi_tx_assoc_req(void)
 {
     if (!join_target.bssid_captured) return -3;
 
@@ -3495,10 +3584,117 @@ int h3_wifi_tx_assoc_req(uint8_t channel)
 int h3_wifi_join_ap(void)
 {
     if (!join_target.bssid_captured) return -3;
+
+    /* Перед ассоциацией переключить RF на канал целевой сети. Свип оставил
+       RF на канале 13 (последний), а Auth/Assoc идут к BSSID на его канале —
+       иначе кадры уходят в пустоту (rc=-4 из-за этого). */
+    rf_write(0x18, 0xC00u | (uint32_t)(join_target.channel & 0xFF));
+    udelay(50000);   /* 50 мс на перестройку синтезатора (как в свипе) */
+
+    /* Шаг 1: Auth (opensystem, seq=1). */
     int rc = h3_wifi_tx_auth();
     if (rc != 0) return rc;
-    udelay(50000);
-    return h3_wifi_tx_assoc_req(join_target.channel);
+
+    /* Шаг 2: ждать AuthResp (fc 0xB0, seq=2, status=0) от целевого BSSID. */
+    {
+        uint8_t rxbuf[0x4000 + 512];
+        uint32_t acc = 0;
+        int tries;
+        int got_auth = 0;
+        for (tries = 0; tries < 40; tries++) {   /* ~80 мс ожидания */
+            if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); continue; }
+            if (acc == 0) { udelay(2000); continue; }
+            uint32_t off = 0;
+            while (off + 26 <= acc) {
+                uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
+                if (plen == 0 || plen > 0x2000) break;
+                uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
+                uint32_t fr = off + 24u + drvsz;
+                /* AuthResp: subtype=0xB0, status на +26 (после 3addr 24 + alg2+seq2). */
+                if (fr + 30 <= acc && rxbuf[fr] == 0xB0 && rxbuf[fr+1] == 0x00) {
+                    /* addr2 (отправитель) → fr+10 == целевой BSSID? */
+                    int same = 1;
+                    for (int k = 0; k < 6; k++)
+                        if (rxbuf[fr+10+k] != join_target.bssid[k]) { same = 0; break; }
+                    if (same) {
+                        uint16_t status = (uint16_t)(rxbuf[fr+28] | (rxbuf[fr+29] << 8));
+                        if (status == 0) { got_auth = 1; break; }
+                    }
+                }
+                off += 24u + drvsz + plen;
+                off = (off + 7u) & ~7u;
+            }
+            if (got_auth) break;
+            udelay(2000);
+        }
+        if (!got_auth) return -4;   /* AuthResp не получена/отказ */
+        uart_print("  join: auth resp OK (BSSID confirmed)\r\n");
+    }
+
+    /* Шаг 3: на тот же целевой BSSID — AssocReq. */
+    rc = h3_wifi_tx_assoc_req();
+    if (rc != 0) return rc;
+
+    /* Шаг 4: ждать AssocResp (fc 0x10, status на +26 после 3addr + cap2) от BSSID. */
+    {
+        uint8_t rxbuf[0x4000 + 512];
+        uint32_t acc = 0;
+        int tries;
+        int got_assoc = 0;
+        for (tries = 0; tries < 40; tries++) {
+            if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); continue; }
+            if (acc == 0) { udelay(2000); continue; }
+            uint32_t off = 0;
+            while (off + 26 <= acc) {
+                uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
+                if (plen == 0 || plen > 0x2000) break;
+                uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
+                uint32_t fr = off + 24u + drvsz;
+                /* AssocResp: subtype=0x10, addr2=AP, status на +26. */
+                if (fr + 30 <= acc && rxbuf[fr] == 0x10 && rxbuf[fr+1] == 0x00) {
+                    int same = 1;
+                    for (int k = 0; k < 6; k++)
+                        if (rxbuf[fr+10+k] != join_target.bssid[k]) { same = 0; break; }
+                    if (same) {
+                        uint16_t status = (uint16_t)(rxbuf[fr+26] | (rxbuf[fr+27] << 8));
+                        if (status == 0) { got_assoc = 1; break; }
+                    }
+                }
+                off += 24u + drvsz + plen;
+                off = (off + 7u) & ~7u;
+            }
+            if (got_assoc) break;
+            udelay(2000);
+        }
+        if (!got_assoc) return -6;   /* AssocResp не получена/отказ */
+        uart_print("  join: assoc resp OK (associated)\r\n");
+    }
+
+    /* Шаг 5: перевести в STA-режим и записать BSSID AP (ассоциация состоялась). */
+    {
+        /* MSR (0x0102) = 0x01 (STA mode) — до этого был NETTYPE_AP (0x02). */
+        h3_sdc_write_wlan_reg8(0x0102, 0x01);
+        /* REG_BSSID (0x618..0x61D) = BSSID выбранного AP (для связанного кадра). */
+        for (int k = 0; k < 6; k++)
+            h3_sdc_write_wlan_reg8(0x0618 + k, join_target.bssid[k]);
+        /* Readback-подтверждение. */
+        uint8_t rb[6], msr;
+        for (int k = 0; k < 6; k++) h3_sdc_read_wlan_reg8(0x0618 + k, &rb[k]);
+        h3_sdc_read_wlan_reg8(0x0102, &msr);
+        uart_print("  join: msr=0x");
+        uart_print_hex((uint32_t)msr);
+        uart_print(" bssid_re=");
+        int ok = (msr == 0x01);
+        for (int k = 0; k < 6; k++) {
+            uart_print_hex((uint32_t)rb[k]);
+            if (k < 5) uart_print(":");
+            if (rb[k] != join_target.bssid[k]) ok = 0;
+        }
+        uart_print(ok ? " OK\r\n" : " MISMATCH\r\n");
+        if (!ok) return -7;
+    }
+
+    return 0;   /* ассоциация подтверждена */
 }
 
 int h3_wifi_tx_probe_req(uint8_t channel)

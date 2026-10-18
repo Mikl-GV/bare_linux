@@ -290,12 +290,35 @@ int h3_wifi_tx_auth(void);
 
 /* Передать Association Request к целевому BSSID.
    Кадр: frame_ctl=0x00, capability, listen interval, SSID IE, supported rates. */
-int h3_wifi_tx_assoc_req(uint8_t channel);
+int h3_wifi_tx_assoc_req(void);
 
 /* Выполнить полную host-ассоциацию к целевой сети (пошагово вызывается из
    слоя; драйверный эквивалент issue_auth->issue_assocreq + ожидание ответа).
    Возвращает код состояния (0 = auth принят, далее assoc; см. реализацию). */
 int h3_wifi_join_ap(void);
+
+/* ===== Список найденных сетей (для UI «Transfer») =====
+   Парсер RX-скана складывает уникальные SSID в буфер; UI читает их. */
+
+#define H3_WIFI_AP_MAX 16
+
+struct h3_wifi_ap {
+    char ssid[H3_WIFI_SSID_MAX + 1];
+    uint8_t ssid_len;
+    uint8_t channel;
+    uint8_t bssid[6];
+    int rssi_lvl;    /* уровень сигнала (источник: RX-дескриптор, если доступен;
+                        иначе 0) */
+};
+
+/* Сколько сетей найдено в последнем скане. */
+int h3_wifi_scan_ap_count(void);
+/* Копировать найденную сеть i в *ap. Возвращает 0 при успехе. */
+int h3_wifi_scan_ap_get(int i, struct h3_wifi_ap *ap);
+/* Очистить список (вызывается перед началом скана). */
+void h3_wifi_scan_ap_reset(void);
+/* Внутренний: добавить сеть в список (вызывается парсером RX-скана). */
+void h3_wifi_scan_ap_add(struct h3_wifi_ap *ap);
 
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080

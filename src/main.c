@@ -155,13 +155,25 @@ static void draw_ui(void)
     }
     else if (screen == SCR_TRANSFER) {
         /* --- Подменю «Transfer»: отдельный WiFi-слой --- */
-        fb_text(60, 160, "Transfer over WiFi", 0x00FFFFFF, 0x000D1A33);
+        fb_text(60, 120, "Transfer over WiFi", 0x00FFFFFF, 0x000D1A33);
         if (wifi_layer_started())
-            fb_text(60, 200, "WiFi layer: running", 0x0000FF00, 0x000D1A33);
+            fb_text(60, 148, "WiFi layer: running", 0x0000FF00, 0x000D1A33);
         else
-            fb_text(60, 200, "WiFi layer: idle", 0x00888888, 0x000D1A33);
-        fb_text(60, 240,
-                "A=start/stop WiFi  B=back", 0x00A0C0D0, 0x000D1A33);
+            fb_text(60, 148, "WiFi layer: idle", 0x00888888, 0x000D1A33);
+        /* Список найденных сетей (из скана). */
+        fb_text(60, 180, "Networks:", 0x00A0C0D0, 0x000D1A33);
+        int n = h3_wifi_scan_ap_count();
+        if (n == 0) {
+            fb_text(60, 204, "(scan not run yet — press A)", 0x00888888, 0x000D1A33);
+        } else {
+            if (n > 8) n = 8;   /* помещается на экран */
+            for (int i = 0; i < n; i++) {
+                struct h3_wifi_ap ap;
+                if (h3_wifi_scan_ap_get(i, &ap) != 0) break;
+                fb_text(60, 204 + i * 22, ap.ssid, 0x00FFFFFF, 0x000D1A33);
+            }
+        }
+        fb_text(60, 420, "A=start WiFi  B=back", 0x00A0C0D0, 0x000D1A33);
     }
 
     /* Версия прошивки — нижний правый угол. */
