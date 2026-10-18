@@ -51,8 +51,8 @@ RTL8189FTV (SDIO)** — от инициализации чипа до RF-кал�
 | Блок | Статус | Подробности |
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
-| **HDMI-меню 1024×600** | ✅ | Вывод на готовый FB U-Boot, кнопки PCF8574 (I2C-bitbang), LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 в разработке | SDC1 (MMC1), 4-bit, ~6 МГц (эталон dtb sun8i-h3-orangepi-lite); см. ниже «Этап WiFi». |
+| **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без FB U-Boot), кнопки PCF8574, LED PL10. |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 в разработке | Скан 13 каналов работает (beacon/SSID); RPWM/HIMR через fn1; JOINBSS-движок (Auth/AssocReq) готов; до ассоциации (обработка AssocResp). |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -65,11 +65,16 @@ RTL8189FTV (SDIO)** — от инициализации чипа до RF-кал�
 3. Загрузка прошивки чипа (fwdl rc=0), eFuse (на OPi Lite пуст),
    программный MAC в REG_MACID 0x610-0x615 (readback совпал).
 4. **RF-часть**: включение BB/RF по `PHY_BBConfig8188F`, загрузка полного
-   BB-конфига (209 рег.), **LSSI-доступ к RF-регистрам** (канал
-   читается/пишется), калибровка **LCK**.
+   BB-конфига (209 рег.), **LSSI-доступ к RF-регистрам**, калибровки **LCK/IQK**.
+5. **RX-приём** (W.329+): скан 13 каналов, парсер beacon/SSID. RPWM/CPWM/HIMR/
+   HISR через fn1. Эксперимент W.338: маска 0xC1 у драйвера не баг, C2H-ABSENT
+   не связана с RPWM.
+6. **JOINBSS-движок** (W.332+): host передаёт Auth/AssocReq кадры (не H2C 0x23),
+   захват BSSID+channel цели из скана, Retry.
 
-Дальше — IQK (калибровка I/Q) и RX-путь (скан эфира). Подробности и
-следующие шаги: `NEXT-CHAT-PROMPT.md`, `HARDWARE-REF.md`.
+Дальше — обработка Auth/AssocResp из RX-пути для подтверждения ассоциации,
+затем TCP/IP (фикс IP 192.168.x.199). Подробности и следующие шаги:
+`NEXT-CHAT-PROMPT.md`, `HARDWARE-REF.md`.
 
 ---
 
@@ -713,24 +718,29 @@ I2C bit-bang: SCL=PG9, SDA=PG8, PCF8574 @0x27. Детект нажатий — �
 
 ---
 
-## 7. Поток выполнения WiFi-этапа (сводно, по логу W.269)
+## 7. Поток выполнения WiFi-этапа (сводно, по логу W.338)
 
 ```
 SDIO CMD5→3→7 → CCCR → chip_id 0x024C:F179 → PowerSeq CARDEMU→ACTIVE
  → Fn1 enable → FW download (5 страниц, chksum OK, MCUFWDL=0xC6)
  → eFuse/MAC (программный 02:00:00:xx) → REG_MACID verify
- → LCD: MAC(101)+BB(207)+AGC(66)+RF(136) → LCK (70 мс)
- → RX: FW active (RPWM/CPWM), H2C SET_PWR_MODE, IGI/MSR, FBR/CCCR,
-   RFMOD, RQPN/LLT/bndy, antenna_sel, BWOPMODE, CR=0x206FF
- → IQK: H2C 0x6D, PI, Tx/Rx one-shot, LOK_Result, restore, H2C 0x6D={0}
- → RX-sweep ch 1/6/11, probe request, диагностика
- → C2H-ping (H2C 0x43, детект 0x1A0/HISR/RXPKT) → C2H-ABSENT (см. NEXT-CHAT-PROMPT)
+ → LCD: MAC(101)+BB(207)+AGC(66)+RF(136) → LCK
+ → RX: RPWM/CPWM/HIMR через fn1 (cpwm=0x80 tog_sw=1, HIMR=0x01),
+   H2C SET_PWR_MODE, IGI/MSR, FBR/CCCR, RFMOD, RQPN/LLT/bndy,
+   antenna_sel, BWOPMODE, CR=0x206FF
+ → IQK: PI, Tx/Rx one-shot, LOK_Result, restore
+ → RX-sweep ch 1..13, probe request, чтение RX FIFO по 1 блоку
+   → парсер beacon → SSID (W.329: BCN plen= ch= ssid= на всех 13 каналах)
+ → JOINBSS: захват BSSID+channel цели из скана, host Auth/AssocReq
+   (join: bssid=... ch=..., rc=0 — отправлены; подтверждение — след. шаг)
 ```
 
-**Текущий статус (W.269):** вся хост-инициализация 1:1 с драйвером, 8051
-исполняет FW (WINTINI_RDY=1), H2C 0x20 принимается, но RX-механизм FW не
-запущен (RX FIFO пуст, C2H не идёт). Проблема локализована во внутреннем
-состоянии прошивки 8051 — дальнейшие шаги в `NEXT-CHAT-PROMPT.md`.
+**Текущий статус (W.338):** хост-инициализация 1:1 с драйвером, **RX-приём
+работает** (beacon/SSID на 13 каналах). RPWM/CPWM/HIMR/HISR — через fn1;
+эксперимент W.338 показал: маска 0xC1 у драйвера не баг (0xCC не даёт state в
+CPWM), C2H-ABSENT не связана с RPWM. Реализован JOINBSS-движок (host
+Auth/AssocReq). Дальнейшие шаги (обработка Auth/AssocResp, TCP/IP) —
+в `NEXT-CHAT-PROMPT.md`.
 
 ======================================================================
 # ДОКУМЕНТ: H3-BAREMETAL-GUIDE.md

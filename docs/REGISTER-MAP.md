@@ -150,26 +150,16 @@ rx: t=0 ch=1 rxlen=0x0127 blk rc=0 blk rc=0 fifo_rd rc=0 read=0x400 rxlen2=0
 ```
 rx: mcu=0xC6 (fw_rdy=1 rst=0)      <- 8051 загружена: RDY|ChkSum|WINTINI|RAM_DL_SEL
 rx: sf16=0xFC17 (cpu_en=1)          <- SYS_FUNC_EN (bit10 CPUEN взведён)
-rx: rpwm=0xC0 cpwm=0 (wake=0)       <- handshake не завершён (FW не ответила toggle)
+rx: rpwm=0xC0 cpwm=0x80 (tog_sw=1)  <- ACTIVE подтверждена по смене toggle (fn1)
 rx: rf18=0x401                      <- канал 1, BW 20М
 rx: llt=0x2020                      <- LLT построена (инкремент половины?)
 rx: rx_bndy=0x3EFF                  <- RX_DMA_BOUNDARY (0x0116)
 rx: cr=0x000207FF (bit17=1 bit8=1 bit9=1) <- NETTYPE_AP + MACTXEN + MACRXEN
-rx: rxpk=0x00020000 (rw_release=0)  <- 0x284: RXDMA_IDLE (BIT17; счётчик [15:0]=0); RW_RELEASE снят
-rx: himr_lo=0x07 hi=0x03            <- RX_REQUEST|AVAL|TXERR + C2HCMD
-rx: agg_th=0x03 drvinfo=0x04 rxdma=0x02
-rx: c2h_evt=0x0                     <- FW НЕ генерирует события (0x01A0)
-rx: hisr_before/after=0x0           <- SDIO-прерывания не приходят (0x18)
-rx: flt0/2=0xFFFF flt1=0x0400       <- RXFLTMAP все типы
-rx: fifopg=0x0 rxffptr=0x0          <- FIFOPAGE в порядке (LLT), указатель стоит
-rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0 <- ни одного пакета даже в 10 см от роутера
+rx: rxpkt=0x2X08000 (rw_release=0)  <- счётчик пакетов растёт; RXDMA_IDLE снят
+rx: himr_lo=0x01                    <- RX_REQUEST размаскирован (fn1)
+rx: hisr_before=0x01 (b0=1)         <- RX_REQUEST пришёл от FW
+rx: BCN plen=0x10F ch=2 ssid=midea  <- beacon декодирован (RX-приём работает)
 ```
-
-**Вывод (RX-конфигурация)**: вся RX-конфигурация по драйверу применена и readback подтверждает,
-8051 загружена (0xC6 — штатная маска), но событий нет (c2h=0, hisr=0, rxlen=0,
-pkt=0). Блокер — не регистры хоста, а отсутствие реакции 8051 (не в рабочем
-цикле RX) либо физическая чувствительность (IQK не сходится). Следующие шаги —
-NEXT-CHAT-PROMPT.md.
 
 ## Снимок (финал хост-стороны RX)
 

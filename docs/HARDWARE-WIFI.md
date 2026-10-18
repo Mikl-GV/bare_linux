@@ -55,7 +55,7 @@ WIFI_EN — обычный GPIO (порт L, R_PIO), HIGHT — чип включ
   прошивка, power-seq, регистры чипа; соответствует драйверу в эталоне (образ 2.3.1).
 - Собственный SDC1-драйвер `src/h3_sdc.c` + `include/h3_sdc.h`.
 - SDIO-обмен работает: CMD5→CMD3→CMD7, CMD52 (обе функции), CMD53-блок-запись.
-- Чтение CIS: адрес 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek).
+- Чтение CIS: адрес 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek), PID 0xF179.
 - 4-bit режим по эталону (dtb): CCCR 0x07 bit1=1 + SDC_CTYPE=1 +
   pinctrl drive-strength=30/pull-up (регистры DRV/PUL порта G).
 - Такт: OSC24M/2/2 = 6 МГц (фазы output/sample по таблице sunxi-mmc).
@@ -66,17 +66,24 @@ WIFI_EN — обычный GPIO (порт L, R_PIO), HIGHT — чип включ
   (4-bit ломает data-фазу CMD53 на этом стенде).
 - RF-калибровки LCK/IQK, RX-приём (beacon/SSID), probe request (TX FIFO HIQ).
 
-### В работе (W.316+)
-- **RX-приём работает**: чип принимает beacon'ы эфира, парсер извлекает SSID
-  (`BCN plen= ch= ssid=`). Хост-чтение RX-FIFO — по 1 блоку (512 б)/CMD53.
+### В работе (W.329+)
+- **RX-приём работает**: чип принимает beacon'ы на всех 13 каналах, парсер
+  извлекает SSID (`BCN plen= ch= ssid=`), скан стабилен (5+ уникальных SSID).
+- **RPWM/CPWM/HIMR/HISR — через fn1** (SDIO-local, device id 0), не fn0.
+  С W.329 FW подтверждает переход в ACTIVE по смене toggle (cpwm=0x80, tog_sw=1),
+  HIMR=0x01. Эксперимент W.337/W.338: HRPWM1 принимает 0xCC (rb=0xCC), но
+  CPWM state[3:0] остаётся 0 — на связке чип/FW ACK идёт только через toggle;
+  маска 0xC1 в драйвере не баг, C2H-ABSENT не связана с RPWM.
 - Наблюдения по SDC1:
   - Для data-команд SDC1 не взводит CMD_DONE — ждать DATA_DONE.
   - Шина MMC1 — OLD mode (бит30=0), иначе карта не отвечает.
   - SDIO-local регистры — device id 0, WLAN IOREG — device id 8, RX FIFO — id 7.
   - **Host SDIO H3 не тянет многоблочный read CMD53** (30 блоков → rc=-1);
     только 1 блок (512 б) за CMD53.
-- Далее: подключение к AP (H2C JOIN/CONNECT), C2H, 802.11-стек, TCP/IP —
-  цель «эмулятор + сетевой доступ к ROM на SD».
+- JOINBSS-движок реализован (host Auth/AssocReq кадры; захват BSSID+channel
+  из скана; вызов из wifi_layer с Retry). Далее: обработка Auth/AssocResp из
+  RX-пути для подтверждения ассоциации, затем TCP/IP (фикс IP 192.168.x.199)
+  — цель «эмулятор + сетевой доступ к ROM на SD».
 
 ### Снимок JTAG (когда был нужен)
 - После U-Boot (SD): PG0-3 уже function 2 (SDC1), такт MMC1 включён, но WIFI_EN
