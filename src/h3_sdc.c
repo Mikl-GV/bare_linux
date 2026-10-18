@@ -36,11 +36,6 @@ uint32_t sdc_diag_pseq_base = 0;
 uint32_t sdc_diag_pseq_off  = 0;
 uint32_t sdc_diag_pseq_cmd  = 0;
 uint32_t sdc_diag_pseq_val  = 0;   /* прочитанное значение при ошибке */
-/* Диагностика IDMA. */
-uint32_t sdc_diag_idst = 0;   /* IDMA статус при ошибке */
-uint32_t sdc_diag_dmac = 0;   /* DMAC при ошибке */
-uint32_t sdc_diag_idma_used = 0;   /* счётчик: сколько передач через IDMA */
-uint32_t sdc_diag_pio_used  = 0;   /* счётчик: сколько через PIO */
 uint32_t sdc_diag_fw_mcufwdl = 0;  /* REG_MCUFWDL при падении FreeToGo */
 
 /* SD/MMC хост-контроллер H3 (SDC1) — низкоуровневый доступ.
@@ -2391,6 +2386,10 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             if (total > 0x4000) total = 0x4000;
             uint32_t off_read = 0;
             int frc = 0;
+            /* W.314: эталонный drain (sdio_ops.c:2196-2223): читаем 0x1C,
+               одним CMD53 вычитываем РОВНО size (до блока), seq++ ОДИН раз
+               за пакет (sdio_ops.c:776). W.311 (по 512 с seq++ на блок) был
+               неверен: сдвигал SEQ на блок и не вычитывал весь пакет. */
             for (;;) {
                 uint8_t r[4] = {0, 0, 0, 0};
                 if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, r) != 0) break;
@@ -2407,17 +2406,7 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                 uart_print_int(frc);
                 if (frc != 0) break;
                 off_read += blocks * 512u;
-                rx_seq++;                                 /* один раз за пакет (окно) */
-                /* W.310: гейт эталона (sdio_ops.c:2218-2222) — после чтения
-                   пакета читаем HISR (0x18, fn1) и продолжаем drain, ТОЛЬКО
-                   пока SDIO_HISR_RX_REQUEST(bit0) ещё взведён. Без этого после
-                   первого пакета FW уже не готова, а мы запрашиваем следующий
-                   блок(и) → rc=-1 / заморозка DMA. */
-                {
-                    uint8_t h4[4] = {0,0,0,0};
-                    if (h3_sdc_cmd53_read_bytes(1, 0x0018, 4, h4) != 0) break;
-                    if (!(h4[0] & 0x01u)) break;      /* RX_REQUEST снят — пакетов больше нет */
-                }
+                rx_seq++;                                 /* ОДИН раз за пакет */
                 if (off_read >= 0x4000) break;
             }
             uart_print(" fifo_rd rc=");
@@ -2425,6 +2414,15 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             uart_print(" read=0x");
             uart_print_hex(off_read);
             acc = (total < off_read) ? total : off_read;
+            if (t == 0) { /* W.312 диагностика: содержимое первого блока RX */
+                uart_print(" rxbuf0:");
+                uint32_t nd = (acc > 64) ? 64 : acc;
+                for (uint32_t j = 0; j < nd; j++) {
+                    uart_print_hex((uint32_t)rxbuf[j]);
+                    uart_print(" ");
+                    if ((j & 7u) == 7u) uart_print("\r\n");
+                }
+            }
             if (frc == 0 && acc > 0) {
                 /* Парсер: off += 24 + drvinfo + plen, round 8.
                    SSID из beacon (fc=0x80 0x00), IE обход после 36. */
@@ -2432,12 +2430,12 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                 int pkts = 0;
                 while (off + 24 <= acc && pkts < 64) {
                     uint32_t plen = (uint32_t)(rxbuf[off] | ((rxbuf[off+1] & 0x3F) << 8));
-                    /* W.310: drvinfo из GET_RX_STATUS_DESC_DRVINFO_SIZE_8188F =
-                       LE_BITS_TO_4BYTE(pdesc,16,4) = rxbuf[off+2] & 0x0F, <<3
-                       (rtl8188f_rxdesc.c:39). Убрана перезапись из off+4..7
-                       (второе dword, там drvinfo нет). Fallback 4, если поле=0. */
+                    /* W.313: 8188F RX-дескриптор = 24 байта rx_status; из дампа rxbuf0
+                       видно: кадр (fc=0x80 0x00, beacon) лежит на off+24,
+                       drvinfo_field = 0 (байт[2]=0) — данных drvinfo нет.
+                       Поэтому drvsz из поля (0), fr = off+24+drvsz = off+24.
+                       Fallback НЕ применяем — поле достоверно. */
                     uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
-                    if (drvsz == 0) drvsz = 4;
                     uint32_t pkt_total = 24u + drvsz + plen;
                     if (plen == 0 || plen > 0x2000 || off + pkt_total > acc) break;
                     uint32_t fr = off + 24u + drvsz;
@@ -2593,7 +2591,7 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
         uint32_t hisr = 0;
         uint32_t rxn = 0;
         uint32_t hmfr = 0;
-        uint32_t c2hid = 0, c2hseq = 0, c2hlen = 0, c2h0 = 0, c2h1 = 0;
+        uint32_t c2hid = 0, c2h0 = 0, c2h1 = 0;
 
         /* ждать, пока FW заберёт предыдущую H2C (valid==0). */
         do {
@@ -2639,7 +2637,7 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
             uart_print(" C2H-ABSENT");
         uart_print("\r\n");
 
-        /* Захватилить C2H: CLEAR (0x1AF) = C2H_EVT_HOST_CLOSE (0x00). */
+        /* Закрыть C2H-событие: CLEAR (0x1AF) = C2H_EVT_HOST_CLOSE (0x00). */
         h3_sdc_write_wlan_reg8(0x01AF, 0x00);
     }
 
@@ -2651,7 +2649,8 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
  * Протокол (из rtl8188f_hal_init.c):
  *   1) _FWDownloadEnable(1): REG_SYS_FUNC_EN[1]|=0x04 (8051 enable),
  *      REG_MCUFWDL(0x80) |= 0x01, REG_MCUFWDL[2] &= 0xf7 (8051 reset).
- *   2) Записать прошивку блоками CMD53 (block write) начиная с FW_START=0x1000.
+ *   2) Записать прошивку постранично byte-mode CMD53 по 4 байта начиная
+ *      с FW_START=0x1000.
  *   3) _FWFreeToGo: REG_MCUFWDL[0] |= MCUFWDL_RDY(bit1), &= ~WINTINI_RDY(bit6),
  *      8051 reset, затем поллить FW ready (WINTINI_RDY|FWDL_ChkSum_rpt|MCUFWDL_RDY).
  *
