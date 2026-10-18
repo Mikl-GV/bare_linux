@@ -2137,11 +2137,11 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
            aggBurstSize(0<<4) = 0x0C|0x02 = 0x0E. Раньше у нас было 0x06. */
     h3_sdc_write_wlan_reg8(0x0104, 0x11);          /* PBP 128+128 */
     h3_sdc_write_wlan_reg8(0x060F, 0x04);          /* RX_DRVINFO_SZ */
-    /* AGG_PG_TH (0x0280) полным 32-бит словом 0x2000010F — как живой чип
-       (rtl8189fs-live-snapshot.md:28): старший байт 0x20 (RXDMA_AGG) +
-       младшие 0x010F (time=1, len=15). Раньше писали 16-бит 0x010F —
-       старшие биты AGG оставались 0. */
-    h3_sdc_write_wlan_reg32(0x0280, 0x2000010Fu);
+    /* AGG_PG_TH (0x0280) полным 32-бит словом, RXDMA_AGG=0x20 (старший байт) +
+       младшие 0x0101 (time=1, len=1). W.317: len снижен с 15 до 1 — каждый
+       RX-пакет агрегируется не более чем до 1 страницы (≤512 б), чтобы
+       RX0_REQ_LEN не копил 13-Кбайт-агрегаты, которые host не дочитывает. */
+    h3_sdc_write_wlan_reg32(0x0280, 0x20000101u);
     /* W.252: REG_TRXDMA_CTRL (0x010C, 16-бит) — карта TX-очередей + RXDMA_AGG_EN.
        Раньше писали БАЙТ read8|BIT2 — ставили только RXDMA_AGG_EN и затирали
        карту очередей, из-за чего TX HIQ/MIQ/LOQ НЕ были примаплены в DMA-движок
@@ -2382,25 +2382,41 @@ h3_sdc_cmd52_read(0, 0x0018, &num);
                эталон читает size целиком (sd_recv_rxfifo). Это выгребает весь
                накопленный буфер (rxlen2 после ch1 = 0x26DC), а не бросает
                остаток в чужое окно след. канала. */
+            /* W.317: снимок total из rxlen (0x1C читается ОДИН раз, до цикла — как
+               эталон sdio_ops.c:2196-2202, где RX0_REQ_LEN берётся до чтения
+               порта). Читаем пакет по 1 блоку (host не тянет многоблок,
+               30 блоков → rc=-1), seq ПЕРЕД чтением фиксирован, seq++ —
+               только когда весь total вычитан и RX0_REQ_LEN подтвердил 0.
+               Если после чтения RX0_REQ_LEN не 0 — пакет не дочитан, повторим
+               с тем же seq (без seq++). */
             uint32_t total = (uint32_t)rxlen;
             if (total > 0x4000) total = 0x4000;
             uint32_t off_read = 0;
             int frc = 0;
-            /* W.316: читаем строго по 1 блоку (512) за CMD53 — host не тянет
-               многоблочный read (30 блоков → rc=-1 и зависание). Дренаж идёт
-               в цикле по 1 блоку, seq++ на блок, пока RX0_REQ_LEN>0.
-               Парсер (ниже) работает по acc>0. */
-            for (uint32_t g = 0; g < 64 && off_read < 0x4000u; g++) {
-                uint8_t r[4] = {0, 0, 0, 0};
-                if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, r) != 0) break;
-                if (!(r[0] | r[1])) break;                 /* RX0_REQ_LEN == 0 — пусто */
-                uint32_t addr = (7u << 13) | (rx_seq & 3u);
+            uint32_t seq_cur = rx_seq;      /* зафиксировать seq на пакет */
+            for (uint32_t g = 0; g < 64 && off_read < total; g++) {
+                /* W.319: host SDIO H3 умеет только 1 блок (512 б) за CMD53;
+                   многоблок (даже 2) даёт rc=-1 (DATA_STAR_TO). Читаем строго
+                   по 1 блоку, seq фиксирован на пакет, off_read накапливается. */
+                uint32_t addr = (7u << 13) | (seq_cur & 3u);
                 frc = h3_sdc_cmd53_read(1, addr, 1, rxbuf + off_read);
                 uart_print(" blk rc=");
                 uart_print_int(frc);
-                if (frc != 0) break;
+                if (frc != 0) {
+                    uart_print(" risr=0x");
+                    uart_print_hex(sdc_diag_risr);
+                    uart_print(" sta=0x");
+                    uart_print_hex(sdc_diag_sta);
+                    break;
+                }
                 off_read += 512u;
-                rx_seq++;                                 /* seq++ на блок */
+            }
+            if (frc == 0 && off_read >= total) {
+                /* Проверить, что FW подтвердила полное чтение пакета. */
+                uint8_t r2[4] = {0,0,0,0};
+                if (h3_sdc_cmd53_read_bytes(1, 0x001C, 4, r2) == 0 && (r2[0] | r2[1]) == 0)
+                    rx_seq = (seq_cur + 1) & 0xFFFFFFFFu;  /* пакет ушёл → seq++ */
+                /* иначе — seq не двигаем, повторим с тем же окном */
             }
             uart_print(" fifo_rd rc=");
             uart_print_int(frc);
