@@ -8,15 +8,17 @@
 к WiFi-чипу RTL8189FTV (приём эфира, сканирование beacon/SSID)**. В планах —
 превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние (W.391): **полная host-ассоциация к открытой сети A05s
-> работает end-to-end** (AuthResp=0 → AssocReq → AssocResp=0 → MSR=STA, rc=0),
-> к сети WPA2 (MTS_GPON_9290e0) assoc принят (cap=0x0011, RSN IE 22 байта) и
-> AP инициировал 4-way — в RX приходят EAPOL-Key msg1 (etype=0x888E). В эфире
-> подтверждён приём data-кадров (ARP/IPv6). Реализованы: скан 13 каналов
-> (канал AP берётся из DS Parameter Set IE, а не из свипа), криптоядро WPA2
-> host-supplicant (SHA-1/HMAC-SHA1/PBKDF2/PRF/MIC — проверено), фикса
-> недетерминизма повторных join. Шина SDIO — 1-bit/50 МГц (4-bit ломает
-> data-фазу CMD53). host не тянет многоблочный SDIO read (только 1 блок/CMD53).
+> Рабочее состояние (W.413): **полная host-ассоциация работает end-to-end**.
+> Ассоциация к любой сети из скана (AuthResp=0 → AssocReq → AssocResp=0 →
+> MSR=STA, rc=0), в т.ч. к открытой A05s и к WPA2 (MTS_GPON_9290e0, RSN IE 22
+> байта) — к WPA2 происходит assoc и AP инициирует 4-way (EAPOL-Key msg1 в RX,
+> etype=0x888E). Приём data-кадров после assoc (ARP/IPv6) подтверждён; ethertype
+> парсится big-endian. Отправка DHCP DISCOVER корректна (IP proto=UDP, len=278,
+> flags=0x8000). Криптоядро WPA2 host-supplicant (SHA-1/HMAC-SHA1/PBKDF2/PRF/MIC —
+> проверено на хосте). Реализованы: скан 13 каналов (канал AP из DS Parameter Set
+> IE), фикса недетерминизма повторных join (deauth при смене BSSID, drain RX FIFO).
+> Шина SDIO — 1-bit/50 МГц (4-bit ломает data-фазу CMD53). host не тянет
+> многоблочный SDIO read (только 1 блок/CMD53).
 
 ---
 
@@ -26,7 +28,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join к открытой A05s (rc=0, MSR=STA); assoc к WPA2 принят (EAPOL msg1 приходит); data-приём в эфире; дальше DHCP/dтатik IP + WPA2 handshake. |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join (rc=0, MSR=STA) к открытой и WPA2-сети; assoc к WPA2 принят (EAPOL msg1 приходит); data-приём после assoc (ARP/IPv6); DHCP DISCOVER уходит корректно; дальше WPA2 4-way handshake (для IP на WPA2-сети). |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -47,9 +49,18 @@
    подтверждает ACTIVE по смене toggle (cpwm=0x80, tog_sw=1), HIMR=0x01.
    Эксперимент W.338: запись 0xCC в HRPWM1 даёт readback 0xCC, но CPWM
    state[3:0] всё равно 0 — ACK на связке идёт только через toggle.
-7. **JOINBSS-движок** (W.332-W.338): host передаёт Auth/AssocReq кадры
+7. **JOINBSS-движок** (W.332-W.413): host передаёт Auth/AssocReq кадры
    (не H2C 0x23 — это P2P_LPS_PARAM); захват BSSID+channel из скана,
-   вызов из пункта меню Transfer с Retry (3 скана).
+   вызов из пункта меню Transfer с Retry (3 скана). Полная ассоциация
+   (rc=0, MSR=STA) к открытым и WPA2-сетям; при смене BSSID шлётся deauth
+   и выполняется drain RX FIFO перед новым auth (фикс flaky rc=-4).
+8. **DHCP (W.395-W.410)**: после assoc отправляется DHCP DISCOVER
+   (IP proto=UDP, broadcast, len=278); приём data-кадров после assoc
+   (ARP/IPv6) подтверждён; OFFER ожидается до 5 с. IP-цель — x.x.x.199.
+9. **WPA2 (W.412-W.413)**: криптоядро host-supplicant готово; к WPA2-сети
+   assoc принимается и AP инициирует 4-way (EAPOL-Key msg1 в RX, парсится
+   по RFC 4137: kinfo/keylen/ANonce). Сам 4-way handshake (msg2/msg3/msg4 +
+   ключи в CAM) — в работе.
 
 ### Известные ограничения (W.338+)
 
@@ -60,15 +71,18 @@
   размеру одного кадра; ориентиром для завершения служит сброс в 0 после выдачи.
 - **Парсер берёт 802.11-кадр на смещении off+24** (RX-дескриптор 24 байта,
   drvinfo в этом build равен 0). SSID из IE с id=0.
+- **IPv4/arp приём** — ethertype читается big-endian (0x0800/0x86DD/0x888E),
+  что соответствует порядку байт в проводе.
+- **RX-агрегация**: чип может выдавать несколько кадров в одном окне
+  RX FIFO; парсер проходит по цепочке кадров (24+drvsz+plen, round 8).
 - **C2H-ABSENT**: FW не отдаёт C2H-пакеты в scan/связанном состоянии по
-  причине, показывающей зависимость от power-state (эксперимент W.338 снял
-  эту версию — см. п.6). Ассоциация идёт host-кадрами Auth/Assoc через RX-путь,
-  C2H понадобится позже (для JOINBSS-подтверждения/WPA).
+  причине, зависящей от power-state. Ассоциация идёт host-кадрами
+  Auth/Assoc через RX-путь; C2H понадобится для WPA (подтверждение 4-way).
 
-Дальше — DHCP/статический IP на открытой A05s (IP авто `x.x.x.199` для пинга
-с компа), затем WPA2 4-way handshake к MTS_GPON_9290e0 (криптоядро готово).
-Цель — «эмулятор + сетевой доступ к ROM на SD». Подробности:
-`NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
+Ближайшие шаги: **WPA2 4-way handshake** к MTS_GPON_9290e0 (msg2/msg3/msg4 +
+установка PTK/GTK в CAM чипа; криптоядро готово), затем DHCP/IP на WPA2-сети
+(x.x.x.199) и пинг с ПК. Цель — «эмулятор + сетевой доступ к ROM на SD».
+Подробности: `NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
 
 ---
 

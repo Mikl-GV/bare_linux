@@ -299,6 +299,10 @@ int wifi_layer_connect(int index)
 
     uart_print("join: sel=");
     uart_print_int(index);
+    uart_print(" bssid=");
+    for (int k = 0; k < 6; k++) { uart_print_hex((uint32_t)ap.bssid[k]); if (k < 5) uart_print(":"); }
+    uart_print(" ch=");
+    uart_print_int((int)ap.channel);
     uart_print(" ssid=");
     for (int k = 0; k < ap.ssid_len; k++) uart_putc(ap.ssid[k]);
     uart_print("\r\n");
@@ -309,9 +313,18 @@ int wifi_layer_connect(int index)
        (rc=-6, W.382). */
     h3_wifi_set_target(ap.ssid, ap.ssid_len);
     h3_wifi_scan_capture_target(ap.bssid, ap.channel);
-    /* WPA2: передать RSN IE выбранной сети в цель — иначе AssocReq к
+    /* WPA2: передать RSN IE выбранной сети в цель — без него AssocReq к
        WPA2-AP уходит без Privacy+RSN (cap=1) и AP не ассоциирует (rc=-6). */
     h3_wifi_set_target_rsn(&ap);
+    /* W.412: для WPA2-сети (rsn_len>0) зафиксировать PSK passphrase целевой
+       сети MTS_GPON_9290e0. PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32)
+       вычисляется при приёме EAPOL msg1 в 4-way handshake. */
+    if (ap.rsn_len > 0) {
+        h3_wifi_set_passphrase("B236f8g4", 8);
+        uart_print("  wpa2 passphrase set (rsn_len=");
+        uart_print_int((int)ap.rsn_len);
+        uart_print(")\r\n");
+    }
 
     rc = h3_wifi_join_ap();
     uart_print("join: rc=");

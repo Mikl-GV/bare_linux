@@ -343,6 +343,17 @@ void h3_wifi_scan_ap_add(struct h3_wifi_ap *ap);
    где RSN не заполняется полным beacon-парсером). */
 void h3_wifi_set_target_rsn(const struct h3_wifi_ap *ap);
 
+/* W.412: задать PSK passphrase (для WPA2 4-way). PMK будет вычислен из него
+   при построении handshake. pass_len>0 — сеть WPA2. */
+void h3_wifi_set_passphrase(const char *pass, uint8_t pass_len);
+
+/* Передать 802.11 data-фрейм (ToDS) с payload (LLC/SNAP+ethertype+data)
+   в LOW-очередь. Используется для DHCP/ARP/ICMP/EAPOL. 0 при успехе. */
+int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len);
+
+/* Прочитать наш MAC (REG_MACID 0x610-0x615). Публичный для сетевого слоя. */
+void h3_wifi_get_mac(uint8_t m[6]);
+
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080
 #define FW_8188F_START       0x1000
