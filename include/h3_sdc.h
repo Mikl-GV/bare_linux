@@ -13,6 +13,21 @@
  * SDIO CMD52/CMD53 (байтовый/блочный доступ к функциям чипа).
  */
 
+/* Расширенный диагностический лог WiFi (verbose). Включает power-seq trace,
+   SDC1-диагностику, rf_dump, macchk, txpre-дамп и т.п. — детальные трассы,
+   не нужные для обычной работы. По умолчанию ВЫКЛ; для восстановления
+   полного лога раскомментируй WIFI_VERBOSE_LOG ниже. */
+/* #define WIFI_VERBOSE_LOG 1 */
+#ifdef WIFI_VERBOSE_LOG
+#define WLOG(...)   uart_print(__VA_ARGS__)
+#define WLOG_HEX(n) uart_print_hex((uint32_t)(n))
+#define WLOG_INT(n) uart_print_int((int)(n))
+#else
+#define WLOG(...)   do {} while (0)
+#define WLOG_HEX(n) do {} while (0)
+#define WLOG_INT(n) do {} while (0)
+#endif
+
 /* Регистры SD/MMC хоста (offset от базы контроллера) — даташит 5.3.7. */
 #define SDC_GCTL   0x00   /* global control (soft+rst, fifo_rst, dma, int_en) */
 #define SDC_CKCR   0x04   /* clock control (card clock en/div) */

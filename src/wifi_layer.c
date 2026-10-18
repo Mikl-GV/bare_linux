@@ -36,23 +36,23 @@ int wifi_layer_start(void)
     uart_print("wifi init...\r\n");
 
     /* Включить чип (WIFI_EN=PL7), инициализировать SDC1 и SDIO-карту. */
-    uart_print("  pl_before=0x"); uart_print_hex(*(volatile uint32_t *)0x01F02C10);
-    uart_print("\r\n");
+    WLOG("  pl_before=0x"); WLOG_HEX(*(volatile uint32_t *)0x01F02C10);
+    WLOG("\r\n");
     h3_sdc1_init();
-    uart_print("  pl_after=0x"); uart_print_hex(*(volatile uint32_t *)0x01F02C10);
-    uart_print("\r\n");
+    WLOG("  pl_after=0x"); WLOG_HEX(*(volatile uint32_t *)0x01F02C10);
+    WLOG("\r\n");
 
-    /* Диагностика после инициализации контроллера. */
-    uart_print("  gctl=0x"); uart_print_hex(*(volatile uint32_t *)0x01C10000);
-    uart_print(" ckcr=0x");  uart_print_hex(*(volatile uint32_t *)0x01C10004);
-    uart_print(" sclk=0x");  uart_print_hex(*(volatile uint32_t *)0x01C2008C);
-    uart_print(" star=0x");  uart_print_hex(*(volatile uint32_t *)0x01C1003C);
-    uart_print(" rst0=0x");  uart_print_hex(*(volatile uint32_t *)0x01C202C0);
-    uart_print(" pg_cfg0=0x");uart_print_hex(*(volatile uint32_t *)0x01C208D8);
-    uart_print(" pg_cfg1=0x");uart_print_hex(*(volatile uint32_t *)0x01C208DC);
-    uart_print(" pl_cfg=0x");uart_print_hex(*(volatile uint32_t *)0x01F02C00);
-    uart_print(" pl_dat=0x");uart_print_hex(*(volatile uint32_t *)0x01F02C10);
-    uart_print("\r\n");
+    /* Диагностика после инициализации контроллера (расширенный лог). */
+    WLOG("  gctl=0x"); WLOG_HEX(*(volatile uint32_t *)0x01C10000);
+    WLOG(" ckcr=0x");  WLOG_HEX(*(volatile uint32_t *)0x01C10004);
+    WLOG(" sclk=0x");  WLOG_HEX(*(volatile uint32_t *)0x01C2008C);
+    WLOG(" star=0x");  WLOG_HEX(*(volatile uint32_t *)0x01C1003C);
+    WLOG(" rst0=0x");  WLOG_HEX(*(volatile uint32_t *)0x01C202C0);
+    WLOG(" pg_cfg0=0x");WLOG_HEX(*(volatile uint32_t *)0x01C208D8);
+    WLOG(" pg_cfg1=0x");WLOG_HEX(*(volatile uint32_t *)0x01C208DC);
+    WLOG(" pl_cfg=0x");WLOG_HEX(*(volatile uint32_t *)0x01F02C00);
+    WLOG(" pl_dat=0x");WLOG_HEX(*(volatile uint32_t *)0x01F02C10);
+    WLOG("\r\n");
 
     /* Ручной probe CMD5 (диагностика контроллера). */
     {
@@ -62,9 +62,9 @@ int wifi_layer_start(void)
         SDC[0x18/4] = (1u<<31) | 5u | (1u<<6);  /* START|CMD5|RESP_RCV */
         for (int w = 0; w < 1000000; w++)
             if (SDC[0x38/4] & (1u<<2)) break;   /* CMD_DONE */
-        uart_print("  cmdr=0x"); uart_print_hex(SDC[0x18/4]);
-        uart_print(" risr=0x");  uart_print_hex(SDC[0x38/4]);
-        uart_print(" resp0=0x"); uart_print_hex(SDC[0x20/4]);
+        WLOG("  cmdr=0x"); WLOG_HEX(SDC[0x18/4]);
+        WLOG(" risr=0x");  WLOG_HEX(SDC[0x38/4]);
+        WLOG(" resp0=0x"); WLOG_HEX(SDC[0x20/4]);
         uart_print("\r\n");
     }
 
