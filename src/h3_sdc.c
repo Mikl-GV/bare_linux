@@ -1700,6 +1700,22 @@ void h3_wifi_rf_rx_test(void)
         uart_print("\r\n");
     }
 
+    /* W.361: A0 address check — определить, где реально SYS_CFG.
+       h3_wifi_power_state() читает WLAN 0x100A0 (pseq_read8(0,0xA0) ->
+       cmd52_read(1,(8<<13)|0xA0)). Прямая запись A0->1 в W.353 шла в
+       SDIO-local 0x00A0 (cmd52_read(1,0x00A0)) — другой регистр, поэтому
+       A0 не менялся. Читаем оба для подтверждения. */
+    {
+        uint8_t a0_w = 0, a0_l = 0;
+        pseq_read8(0, 0xA0, &a0_w);            /* WLAN 0x100A0 (SYS_CFG) */
+        h3_sdc_cmd52_read(1, 0x00A0, &a0_l);   /* SDIO local 0x00A0 */
+        uart_print("  a0_wlan=0x");
+        uart_print_hex((uint32_t)a0_w);
+        uart_print(" a0_sdio=0x");
+        uart_print_hex((uint32_t)a0_l);
+        uart_print("\r\n");
+    }
+
     /* 0) Разбудить firmware — ПО ДРАЙВЕРУ rtw_set_rpwm (rtw_pwrctrl.c:
            528-637): нельзя писать 0x00 «active» — активный запрос это
            S4 (PS_ST_ACTIVE|PS_ALL_ON = 0x0C) | накапливаемый toggle(bit7),
@@ -1858,6 +1874,19 @@ void h3_wifi_rf_rx_test(void)
         uart_print_hex(c2h & 0x0F);
         uart_print(" len=0x");
         uart_print_hex((c2h >> 8) & 0xFF);
+        uart_print(")\r\n");
+    }
+
+    /* W.362-1: A0 сразу после H2C SET_PWR_MODE. Если state 3->1 — H2C
+       работает и IQK после сбрасывает; если остался 3 — H2C не переводит
+       чип из S3 (Card Enable, RF off), TX невозможен. */
+    {
+        uint8_t a0h = 0;
+        pseq_read8(0, 0xA0, &a0h);
+        uart_print("  a0_post_h2c=0x");
+        uart_print_hex((uint32_t)a0h);
+        uart_print(" (state=");
+        uart_print_hex((uint32_t)(a0h & 0x03));
         uart_print(")\r\n");
     }
 
@@ -2165,34 +2194,15 @@ h3_sdc_write_wlan_reg32(0x0440, 0x000FFFF1u);
     uart_print_int((int)((d >> 6) & 1));
     uart_print(")\r\n");
 
-    /* W.352: TX-enable — недостающие шаги из эталонного LPS_TO_ACT
-       (Hal8188FPwrSeq.h): 0x101[1]=1 (WMAC power), 0x02[1:0]=11 (BB macro
-       enable), REG_CR |= MACTXEN|MACRXEN. Без этого BB chain power/MAC TX
-       не активны — TX-кадры не уходят в эфир (TXPKT_EMPTY=FF).
-       W.353: НЕ писать 0x100[7:0]=0xFF — включает неопределённые биты 0-5;
-       используем 16-бит RMW |=0xC0 (только MACTXEN|MACRXEN), как драйвер. */
-    {
-        uint8_t b2 = 0;
-        uint16_t cr16 = 0;
-        h3_sdc_read_wlan_reg8(0x0101, &b2);
-        h3_sdc_write_wlan_reg8(0x0101, (uint8_t)(b2 | (1u << 1)));   /* 0x101[1]=1 */
-        h3_sdc_read_wlan_reg8(0x0002, &b2);
-        h3_sdc_write_wlan_reg8(0x0002, (uint8_t)(b2 | 0x03));        /* BB macro 11 */
-        h3_sdc_read_wlan_reg16(0x0100, &cr16);
-        h3_sdc_write_wlan_reg16(0x0100, (uint16_t)(cr16 | 0x00C0));  /* |= MACTXEN|MACRXEN */
-        /* W.353: прямая запись A0[1:0]=1 (S0/ACTIVE) — попытка вывести чип из
-           S3 (Card Enable, RF off), в котором TX невозможен. readback ниже
-           (в txpre a0=) покажет, откатилась ли FW запись. */
-        {
-            uint8_t a0v = 0;
-            if (h3_sdc_cmd52_read(1, 0x00A0, &a0v) == 0) {
-                a0v = (uint8_t)((a0v & ~0x03) | 0x01);   /* state = S0 (ACTIVE) */
-                h3_sdc_cmd52_write(1, 0x00A0, a0v);
-                udelay(10000);
-            }
-        }
-        uart_print("  rx: tx_enable 0x101|=1, 0x02|=3, 0x100|=C0, A0->1\r\n");
-    }
+    /* W.361: откат к W.307-виду. Блок tx_enable (W.352/W.353) с
+       0x101|=1 / 0x02|=3 / 0x100|=C0 / прямая запись A0=1 убран:
+       - запись 0x100|=C0 дублировала CR из блока выше (2153) и не
+         учитывала ENSWBCN=0;
+       - A0->1 писал в SDIO-local 0x00A0, а не WLAN 0x100A0 (SYS_CFG) —
+         уходило в пустоту;
+       - 0x101|=1/0x02|=3 не влияли на TXPKT_EMPTY.
+       CR уже выставлен выше: MACTXEN|MACRXEN|ENSEC, ENSWBCN=0 (как живой). */
+    uart_print("  rx: tx_enable done (CR MACTXEN|MACRXEN, ENSWBCN=0)\r\n");
 
     /* W.261-D4: IQK ПОСЛЕ включения MAC — как драйвер:
        sdio_halinit.c:1238 (MACTXEN|MACRXEN) → :1273 (LCK) → :1277-1288
@@ -2252,10 +2262,8 @@ h3_sdc_write_wlan_reg32(0x0440, 0x000FFFF1u);
     }
     h3_sdc_cmd52_write(1, 0x0018, 0xFF);   /* HISR: clear (write-1-clear), fn1 */
     h3_sdc_cmd53_read_bytes(1, 0x0014, 4, (uint8_t *)&num);
-    WLOG("  rx: himr_lo=0x");
-    WLOG_HEX(num & 0xFF);
-    WLOG(" hi=0x");
-    WLOG_HEX((num >> 8) & 0xFF);
+    uart_print("  rx: himr_rb=0x");
+    uart_print_hex((uint32_t)num);
     WLOG("\r\n");
 
     /* 4e) Диагностика (W.165): drvinfo, RXDMA_CTRL, C2H_EVT (firmware
@@ -2606,6 +2614,17 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                         int got = 0;
                         /* BSSID = addr3 кадра (fr+16), для захвата целевой сети. */
                         uint8_t *p_bssid = &rxbuf[fr + 16];
+                        /* Реальный канал AP берём из DS Parameter Set IE (id=3),
+                           если он есть — свип ловит off-channel (один BSSID на ch1/5/9/10/11),
+                           auth на неверной частоте тонет (rc=-4, W.368). */
+                        uint8_t ap_ch = (uint8_t)(ch & 0xFF);
+                        while (ie + 2 <= fr + 24u + plen && ie + 2 <= acc) {
+                            uint8_t id = rxbuf[ie];
+                            uint8_t len = rxbuf[ie+1];
+                            if (id == 0x03 && len >= 1) { ap_ch = rxbuf[ie+2]; }
+                            ie += 2u + len;
+                        }
+                        ie = fr + 36u;   /* перезапуск обхода IE */
                         while (ie + 2 <= fr + 24u + plen && ie + 2 <= acc) {
                             uint8_t id = rxbuf[ie];
                             uint8_t len = rxbuf[ie+1];
@@ -2613,7 +2632,11 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                                 int ok = 1;
                                 for (uint32_t j = 0; j < len; j++) {
                                     uint8_t cc = rxbuf[ie+2+j];
-                                    if (cc < 0x20 || cc > 0x7E) { ok = 0; break; }
+                                    /* W.365: разрешаем UTF-8 (байты >=0x80) —
+                                       SSID может содержать русские буквы
+                                       (A05s пользователя М). Блокируем только
+                                       управляющие < 0x20. */
+                                    if (cc < 0x20) { ok = 0; break; }
                                 }
                                 if (ok) {
                                     for (uint32_t j = 0; j < len; j++) uart_putc((char)rxbuf[ie+2+j]);
@@ -2627,20 +2650,28 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                                         for (uint32_t j = 0; j < len; j++)
                                             ap.ssid[j] = (char)rxbuf[ie+2+j];
                                         ap.ssid[len] = 0;
-                                        ap.channel = (uint8_t)(ch & 0xFF);
+                                        ap.channel = ap_ch;
                                         for (int k = 0; k < 6; k++) ap.bssid[k] = p_bssid[k];
                                         ap.rssi_lvl = 0;
                                         h3_wifi_scan_ap_add(&ap);
                                     }
                                     /* Захват BSSID/channel целевой сети (для
-                                       JOINBSS): если SSID совпал и сеть ещё не
-                                       захвачена. */
-                                    if (join_target.ssid_len == len) {
+                                       JOINBSS): по ASCII-префиксу join_target.ssid
+                                       ("A05s"); при совпадении копируем ПОЛНЫЙ
+                                       SSID (в т.ч. UTF-8-хвост) из beacon'а —
+                                       чтобы AssocReq нёс точный SSID эфира. */
+                                    if (join_target.ssid_len > 0 &&
+                                        len >= join_target.ssid_len) {
                                         int same = 1;
-                                        for (uint32_t j = 0; j < len; j++)
+                                        for (uint32_t j = 0; j < join_target.ssid_len; j++)
                                             if (rxbuf[ie+2+j] != (uint8_t)join_target.ssid[j]) { same = 0; break; }
-                                        if (same && !join_target.bssid_captured)
-                                            h3_wifi_scan_capture_target(p_bssid, (uint8_t)(ch & 0xFF));
+                                        if (same && !join_target.bssid_captured) {
+                                            for (uint32_t j = 0; j < len; j++)
+                                                join_target.ssid[j] = (uint8_t)rxbuf[ie+2+j];
+                                            join_target.ssid_len = (uint8_t)len;
+                                            join_target.ssid[len] = 0;
+                                            h3_wifi_scan_capture_target(p_bssid, ap_ch);
+                                        }
                                     }
                                 }
                                 break;
@@ -3705,14 +3736,37 @@ int h3_wifi_join_ap(void)
                 if (plen == 0 || plen > 0x2000) break;
                 uint32_t drvsz = (uint32_t)(rxbuf[off+2] & 0x0Fu) << 3;
                 uint32_t fr = off + 24u + drvsz;
+                /* Диагностика (WLOG): любой management кадр в буфере при ожидании
+                   AuthResp — тип + отправитель + status. Спам beacon'ов (fc=0x80)
+                   маскировал auth/assoc, поэтому скрыто за WIFI_VERBOSE_LOG (W.367);
+                   раскомментируй #define WIFI_VERBOSE_LOG 1 в h3_sdc.h — вернётся
+                   полный вывод. */
+#ifdef WIFI_VERBOSE_LOG
+                if (fr + 30 <= acc) {
+                    uint16_t fcfc = (uint16_t)(rxbuf[fr] | (rxbuf[fr+1] << 8));
+                    if ((fcfc & 0x000C) == 0x0000 && (rxbuf[fr+10] & 0x01) == 0) {
+                        uart_print("  join: rx mgmt fc=0x");
+                        uart_print_hex((uint32_t)fcfc);
+                        uart_print(" sub=");
+                        uart_print_hex((uint32_t)((fcfc >> 4) & 0xF));
+                        uart_print(" dst=");
+                        for (int k = 0; k < 6; k++) { uart_print_hex((uint32_t)rxbuf[fr+4+k]); if (k<5) uart_print(":"); }
+                        uart_print(" src=");
+                        for (int k = 0; k < 6; k++) { uart_print_hex((uint32_t)rxbuf[fr+10+k]); if (k<5) uart_print(":"); }
+                        uart_print("\r\n");
+                    }
+                }
+#endif
                 /* AuthResp: subtype=0xB0, status на +26 (после 3addr 24 + alg2+seq2). */
                 if (fr + 30 <= acc && rxbuf[fr] == 0xB0 && rxbuf[fr+1] == 0x00) {
-                    /* addr2 (отправитель) → fr+10 == целевой BSSID? */
                     int same = 1;
                     for (int k = 0; k < 6; k++)
                         if (rxbuf[fr+10+k] != join_target.bssid[k]) { same = 0; break; }
                     if (same) {
                         uint16_t status = (uint16_t)(rxbuf[fr+28] | (rxbuf[fr+29] << 8));
+                        uart_print("  join: authresp status=0x");
+                        uart_print_hex((uint32_t)status);
+                        uart_print("\r\n");
                         if (status == 0) { got_auth = 1; break; }
                     }
                 }
@@ -3728,6 +3782,11 @@ int h3_wifi_join_ap(void)
 
     /* Шаг 3: на тот же целевой BSSID — AssocReq. */
     rc = h3_wifi_tx_assoc_req();
+    uart_print("  join: assocreq tx rc=");
+    uart_print_int(rc);
+    uart_print(" cap=");
+    uart_print_hex((uint32_t)(join_target.ssid_len > 0 ? 0x0001 : 0));
+    uart_print("\r\n");
     if (rc != 0) return rc;
 
     /* Шаг 4: ждать AssocResp (fc 0x10, status на +26 после 3addr + cap2) от BSSID. */
@@ -3752,6 +3811,9 @@ int h3_wifi_join_ap(void)
                         if (rxbuf[fr+10+k] != join_target.bssid[k]) { same = 0; break; }
                     if (same) {
                         uint16_t status = (uint16_t)(rxbuf[fr+26] | (rxbuf[fr+27] << 8));
+                        uart_print("  join: assocresp status=0x");
+                        uart_print_hex((uint32_t)status);
+                        uart_print("\r\n");
                         if (status == 0) { got_assoc = 1; break; }
                     }
                 }
@@ -3868,6 +3930,27 @@ int h3_wifi_tx_probe_req(uint8_t channel)
     buf[0] = (uint8_t)(plen & 0xFF);
     buf[1] = (uint8_t)((plen >> 8) & 0xFF);
 
+    /* W.361: TRXFF_BNDY (0x114) — 3 замера (pre/post/16-bit), чтобы понять,
+       почему txpre читает trxffb=0, хотя init пишет 0xF8. Если post=0xF8 —
+       write работает и txpre читает не тот адрес; если post=0 — запись
+       блокирована или регистр требует 16-бит. */
+    {
+        uint8_t t0 = 0, t1 = 0;
+        uint16_t t16 = 0;
+        h3_sdc_read_wlan_reg8(0x0114, &t0);
+        uart_print("  tx: trxffb_pre=0x");
+        uart_print_hex((uint32_t)t0);
+        h3_sdc_write_wlan_reg8(0x0114, 0xF8);
+        udelay(1000);
+        h3_sdc_read_wlan_reg8(0x0114, &t1);
+        uart_print(" post=0x");
+        uart_print_hex((uint32_t)t1);
+        h3_sdc_read_wlan_reg16(0x0114, &t16);
+        uart_print(" 16=0x");
+        uart_print_hex((uint32_t)t16);
+        uart_print("\r\n");
+    }
+
     /* 4) Дождаться свободной страницы в очереди HIQ: без этого кадр уходит в
        переполненный FIFO и теряется (эталон: rtl8189fs_xmit.c:95-121 —
        query_free_page + HalQueryTxBufferStatus). Пакет <= 128 байт = 1 страница. */
@@ -3904,11 +3987,11 @@ int h3_wifi_tx_probe_req(uint8_t channel)
        TXPAUSE(0x0522), CR-MACTXEN(0x0100 bit6), PBP(0x0104),
        RXDMA_MODE(0x0290), TRXDMA_CTRL(0x010C), RQPN(0x0200), TXDMA(0x0400),
        + free pages HIQ (SDIO-local 0x20). Сверяем, уходит ли FALSE в FX. */
-    uint8_t mempty = 0, mpause = 0, mtrffb = 0, mpbplo = 0, mpbphi = 0, ma0 = 0;
+    uint8_t mempty = 0, mpause = 0, mtrffb = 0, mpbplo = 0, mpbphi = 0;
     uint32_t mff, mcr, mrx, mtrx, mrqpn, mtx;
     {
         h3_sdc_read_wlan_reg8(0x041A, &mempty);   /* TXPKT_EMPTY */
-        h3_sdc_read_wlan_reg32(0x0118, &mff);     /* REG_TRXFF_STATUS: 31:16 TXFF_PTR, 15:0 RXFF_PTR */
+        h3_sdc_read_wlan_reg32(0x011C, &mff);     /* REG_RXFF_PTR: FIFO-указатели RX/TX (двигаются ли) */
         h3_sdc_read_wlan_reg8(0x0522, &mpause);   /* TXPAUSE */
         h3_sdc_read_wlan_reg32(0x0100, &mcr);     /* CR (MACTXEN bit6) */
         h3_sdc_read_wlan_reg8(0x0114, &mtrffb);   /* TRXFF_BNDY (8-bit) */
@@ -3918,7 +4001,6 @@ int h3_wifi_tx_probe_req(uint8_t channel)
         h3_sdc_read_wlan_reg32(0x010C, &mtrx);    /* TRXDMA_CTRL */
         h3_sdc_read_wlan_reg32(0x0200, &mrqpn);   /* RQPN */
         h3_sdc_read_wlan_reg32(0x0400, &mtx);     /* TXDMA_CTRL */
-        h3_sdc_cmd52_read(1, 0x00A0, &ma0);       /* A0[1:0] power state */
         WLOG("  txpre empty=0x");
         WLOG_HEX((uint32_t)mempty);
         WLOG(" ffptr=0x");
@@ -3941,18 +4023,15 @@ int h3_wifi_tx_probe_req(uint8_t channel)
         WLOG_HEX(mrqpn);
         WLOG(" dbg=0x");
         WLOG_HEX(mtx);
-        WLOG(" a0=0x");
-        WLOG_HEX((uint32_t)ma0);
         WLOG("\r\n");
     }
-    udelay(50000);   /* W.353: дать FW 50 мс на обработку кадра */
+    udelay(50000);   /* W.361: дать FW 50 мс на обработку кадра */
     {
-        uint8_t a = 0, a0p = 0;
+        uint8_t a = 0;
         uint32_t d = 0, d2 = 0, d3 = 0;
         int fp2 = h3_wifi_tx_free_pages_hiq();
         h3_sdc_read_wlan_reg8(0x041A, &a);   /* REG_TXPKT_EMPTY (0x041A!) */
-        h3_sdc_read_wlan_reg32(0x0118, &d3); /* REG_TRXFF_STATUS: TXFF_PTR после записи */
-        h3_sdc_cmd52_read(1, 0x00A0, &a0p);  /* A0 после 50мс */
+        h3_sdc_read_wlan_reg32(0x011C, &d3); /* REG_RXFF_PTR: после записи (двинулся ли) */
         uart_print("  tx: wrc=");
         uart_print_int(wrc);
         uart_print(" post hiq_free=");
@@ -3961,8 +4040,6 @@ int h3_wifi_tx_probe_req(uint8_t channel)
         uart_print_hex((uint32_t)a);
         uart_print(" trxff=0x");
         uart_print_hex(d3);
-        uart_print(" a0=0x");
-        uart_print_hex((uint32_t)a0p);
         h3_sdc_read_wlan_reg32(0x0405, &d);  /* REG_TXDMA_OFFSET */
         WLOG(" txdma_off=0x");
         WLOG_HEX(d);

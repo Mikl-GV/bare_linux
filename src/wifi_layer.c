@@ -229,10 +229,11 @@ int wifi_layer_start(void)
                    host-Auth/Assoc; ввод пароля — отдельно). Парсер RX-скана
                    захватит BSSID/channel при совпадении SSID. */
                 {
-                    /* midea_b8_6515 стабильно виден в W.334 на 5 каналах
-                       (ch2,3,5,6,7,11) — в отличие от MTS_GPON_b4d378
-                       на границе видимости (был только в W.333 на ch9). */
-                    static const char tgt_ssid[] = "midea_b8_6515";
+                    /* Открытая точка пользователя (без WPA2) для доводки assoc.
+                       A05s пользователя М — русские буквы (UTF-8). Цель задаём
+                       по ASCII-префиксу "A05s"; полный UTF-8 SSID берём из
+                       beacon'а (Parsing теперь пропускает байты >=0x80). */
+                    static const char tgt_ssid[] = "A05s";
                     h3_wifi_set_target(tgt_ssid, (uint8_t)(sizeof(tgt_ssid) - 1));
                     uart_print("join: target=");
                     uart_print(tgt_ssid);
