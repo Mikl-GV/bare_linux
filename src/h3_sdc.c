@@ -4053,6 +4053,9 @@ body[0]  = 0x02;                             /* RSN */
        из-за этого точка успевала уйти в retry (replay 2→3→4). Оставлен короткий
        полевой дамп (ver/kinfo/keylen/replay/mic/kdlen). */
 
+    /* W.475: пауза 5 мс перед msg2 — как с msg4, чтобы AP успела переключиться
+       из состояния приёма на обработку (некоторые AP флейкуют на мгновенном отклике). */
+    udelay(5000);
     /* Отправить как data-кадр ethertype 0x888E (payload = EAPOL). */
     return h3_wifi_tx_data(0x888E, pkt, eapol_len);
 }
@@ -4061,10 +4064,12 @@ body[0]  = 0x02;                             /* RSN */
 #ifndef REG_CAMCMD
 #define REG_CAMCMD     0x0670
 #define REG_CAMWRITE   0x0674
+#define REG_CAMREAD    0x0678
 #define CAM_VALID      (1u << 15)
 #define CAM_CONTENT_COUNT 8
 #define CAM_AES        0x04
 #define CAM_WRITE      (1u << 16)
+#define CAM_READ       (1u << 17)
 #define CAM_POLLINIG   (1u << 31)
 #endif
 
@@ -4651,6 +4656,14 @@ int h3_wifi_join_ap(void)
                                             uint8_t m4[20];
                                             wpa_hmac_sha1(join_target.ptk, 16, p4, 4+95, m4);
                                             for (int k = 0; k < 16; k++) p4[4+77+k] = m4[k];
+                                            /* W.474/475: пауза 15 мс ПЕРЕД msg4. После убирания
+                                               plaintext DHCP (W.472/473) msg4 стал уходить
+                                               мгновенно после msg3 — MTS_GPON регрессировал
+                                               (1x msg3 -> 3x msg3): AP не успевает «встать» в
+                                               состояние ожидания msg4 и отбрасывает его.
+                                               hostapd/wpa_supplicant держат EAPOL-таймер;
+                                               bare-metal ответ был слишком быстрым. */
+                                            udelay(15000);
                                             /* W.464: ДЛИНА кадра msg4 = 4(EAPOL hdr) + 95(тело) = 99,
                                                а не 8+95=103 (был мусор-хвост 4 байта — строгий AP
                                                игнорирует/отбрасывает). У msg2 длина уже точная. */
@@ -4684,21 +4697,27 @@ int h3_wifi_join_ap(void)
                                                     gk = gtk + 8;
                                                 }
                                                 wpa_cam_write_key(0, macz, gk, 1);
-                                                /* W.472 [диагностика: CAM readback] — подтвердить,
-                                                   что реально легло в слоты CAM 0 (GTK) и 4 (pairwise).
-                                                   RTL8188F: REG_CAMCMD(0x670) с CAM_WRITE=0 = read,
-                                                   REG_CAMREAD(0x678) = данные. Сбрасываем POLLING
-                                                   битом31 после чтения. */
+                                                /* W.472/474 [диагностика: CAM readback] — по эталону драйвера rtw_sec_read_cam:
+                                                   командa чтения = CAM_POLLINIG|addr (0x670),
+                                                   ждать POLLINIG=0, затем данные из REG_CAMREAD(0x678).
+                                                   Читаем слово0 (ctrl+mac0/1) слотов 0 и 4.
+                                                   (Прошлый дамп читал reg8 без команды/поллинга — дал 0.) */
                                                 for (int cam_slot = 0; cam_slot < 8; cam_slot += 4) {
-                                                    uint8_t w0 = 0, w1 = 0;
-                                                    h3_sdc_write_wlan_reg32(0x0670, ((uint32_t)cam_slot * 8 + 0));
-                                                    h3_sdc_read_wlan_reg8(0x0678, &w0);
-                                                    h3_sdc_read_wlan_reg8(0x0679, &w1);
+                                                    uint32_t addr_w = (uint32_t)(cam_slot * 8 + 0);
+                                                    h3_sdc_write_wlan_reg32(0x0670,
+                                                        CAM_POLLINIG | CAM_READ | addr_w);
+                                                    for (int p = 0; p < 1000; p++) {
+                                                        uint32_t rd = 0;
+                                                        h3_sdc_read_wlan_reg32(0x0670, &rd);
+                                                        if (!(rd & CAM_POLLINIG)) break;
+                                                        udelay(10);
+                                                    }
+                                                    uint32_t cam_w0 = 0;
+                                                    h3_sdc_read_wlan_reg32(0x0678, &cam_w0);
                                                     uart_print(" cam[");
                                                     uart_print_int(cam_slot);
                                                     uart_print("]=0x");
-                                                    uart_print_hex((uint32_t)w0);
-                                                    uart_print_hex((uint32_t)w1);
+                                                    uart_print_hex(cam_w0);
                                                     uart_print(" ");
                                                 }
                                             }
