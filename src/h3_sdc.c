@@ -4174,6 +4174,7 @@ int h3_wifi_tx_assoc_req(void)
    (Ожидание ответов и обработка AssocResp — следующий этап.) */
 int h3_wifi_join_ap(void)
 {
+    int skip_auth = 0;   /* W.478: 1 = already-assoc (re-DHCP), не пере-authenticate */
     if (!join_target.bssid_captured) return -3;
 
     /* W.402 [P1]: повторный join. Если AP уже ассоциирован с тем же BSSID и
@@ -4190,12 +4191,14 @@ int h3_wifi_join_ap(void)
             if (cur[k] != join_target.bssid[k]) same_bssid = 0;
         }
         h3_sdc_read_wlan_reg8(0x0102, &msr);
-        /* W.402: уже ассоциирован к целевому BSSID и MSR=STA — не пере-authenticate
-           (это рвёт связку). Возврат rc=0. (Повторный DHCP при флаке 4-way
-           решается на уровне CAM-ключей/деаута, не здесь.) */
+        /* W.402/478: уже ассоциирован к целевому BSSID и MSR=STA — не пере-authenticate
+           (это рвёт связку). Вместо return 0 флажим skip_auth: пройдём БЕЗ Auth/
+           Assoc сразу в DHCP-цикл ниже (повторный DISCOVER/ожидание OFFER).
+           Если 4-way уже был (secure=1) — DISCOVER уйдёт зашифрованным и OFFER
+           расшифруется; если ещё нет — EAPOL-Start внизу запустит msg1. */
         if (same_bssid && (msr & 0x01)) {
-            uart_print("  join: already assoc to same BSSID, skip auth\r\n");
-            return 0;
+            uart_print("  join: already assoc to same BSSID, skip auth->reDHCP\r\n");
+            skip_auth = 1;
         }
         /* W.472 [фикс]: deauth ПЕРЕД любым auth (даже тот же BSSID). Если
            предыдущий AssocResp был потерян (rc=-6), AP считает нас associated
@@ -4362,8 +4365,11 @@ int h3_wifi_join_ap(void)
                 waited_auth += 2;
             }
         }
-        if (!got_auth) return -4;   /* AuthResp не получена/отказ */
-        uart_print("  join: auth resp rcvd (rx pkt fc=0xB0, BSSID match)\r\n");
+        if (!skip_auth && !got_auth) return -4;   /* AuthResp не получена/отказ */
+        if (skip_auth)
+            uart_print("  join: skip auth (re-DHCP)\r\n");
+        else
+            uart_print("  join: auth resp rcvd (rx pkt fc=0xB0, BSSID match)\r\n");
     }
 
     /* Шаг 3: на тот же целевой BSSID — AssocReq. */
@@ -4436,7 +4442,7 @@ int h3_wifi_join_ap(void)
             udelay(2000);
             waited += 2;
         }
-        if (!got_assoc) return -6;   /* AssocResp не получена/отказ */
+        if (!skip_auth && !got_assoc) return -6;   /* AssocResp не получена/отказ */
         uart_print("  join: assoc resp OK (associated)\r\n");
     }
 
@@ -4496,7 +4502,13 @@ int h3_wifi_join_ap(void)
             uart_print("  join: dhcp discover send\r\n");
             net_dhcp_discover(&nst);
         } else {
-            uart_print("  join: wpa2 net — dhcp deferred to after 4-way\r\n");
+            /* W.477: для WPA2-сети deferred DHCP — но часть AP (MTS_GPON_d23898)
+               НЕ инициирует 4-way сама, если клиент молчит после AssocResp.
+               Шлём EAPOL-Start (ver=1,type=1, len=0) как plaintext trigger,
+               чтобы AP отправила EAPOL-Key msg1. */
+            uint8_t eapol_start[4] = {0x01, 0x01, 0x00, 0x00};
+            h3_wifi_tx_data(0x888E, eapol_start, 4);
+            uart_print("  join: wpa2 net — dhcp deferred, eapol-start sent\r\n");
         }
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
@@ -4718,6 +4730,29 @@ int h3_wifi_join_ap(void)
                                                     uart_print_int(cam_slot);
                                                     uart_print("]=0x");
                                                     uart_print_hex(cam_w0);
+                                                    uart_print(" ");
+                                                }
+                                                /* W.477 [диагностика]: напечатать САМИ БАЙТЫ ключей (слова 2..5)
+                                                   слота 0 (GTK) — проверить, нет ли KDE-заголовка в ключе.
+                                                   Правильный чистый GTK: слово2 (первые 4 байта ключа) НЕ будет
+                                                   0xDD_xx_0F_00 (KDE-заголовок). */
+                                                {
+                                                    int cam_slot = 0;
+                                                    uart_print(" gtk_key=");
+                                                    for (int w = 2; w <= 5; w++) {
+                                                        uint32_t addr_w = (uint32_t)(cam_slot * 8 + w);
+                                                        h3_sdc_write_wlan_reg32(0x0670,
+                                                            CAM_POLLINIG | CAM_READ | addr_w);
+                                                        for (int p = 0; p < 1000; p++) {
+                                                            uint32_t rd = 0;
+                                                            h3_sdc_read_wlan_reg32(0x0670, &rd);
+                                                            if (!(rd & CAM_POLLINIG)) break;
+                                                            udelay(10);
+                                                        }
+                                                        uint32_t kw = 0;
+                                                        h3_sdc_read_wlan_reg32(0x0678, &kw);
+                                                        uart_print_hex(kw);
+                                                    }
                                                     uart_print(" ");
                                                 }
                                             }
