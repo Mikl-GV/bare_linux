@@ -4581,6 +4581,14 @@ int h3_wifi_join_ap(void)
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
+        /* W.511: включить TX-report (REG_TX_RPT_CTRL 0x04EC, биты 1|5 —
+           как hal_com.c:1561). FW будет присылать C2H_CCX_TX_RPT (id 0x03)
+           в REG_C2HEVT (0x01A0) с флагом retry_over/lifetime_over. */
+        {
+            uint8_t tr = 0;
+            h3_sdc_read_wlan_reg8(0x04EC, &tr);
+            h3_sdc_write_wlan_reg8(0x04EC, (uint8_t)(tr | 0x02u | 0x20u));
+        }
 
         while (waited < 6000) {   /* W.469: увеличено 1500→6000 — DHCP OFFER на WPA2 после
                                 4-way идёт broadcast и может прийти с задержкой; окно 3с
@@ -4605,6 +4613,28 @@ int h3_wifi_join_ap(void)
                     uart_print(" hiq=");
                     uart_print_int(h3_wifi_tx_free_pages_hiq());
                     uart_print("\r\n");
+                    /* W.511: дождаться C2H_CCX_TX_RPT (id 0x03) и показать
+                       retry_over/lifetime_over. Оба 0 = AP ACK'нула кадр
+                       (дошёл); любой 1 = не дошёл (ретраи/таймаут). */
+                    {
+                        uint32_t c2h = 0;
+                        int got = 0;
+                        for (int q = 0; q < 100; q++) {
+                            h3_sdc_read_wlan_reg32(0x01A0, &c2h);
+                            if ((c2h & 0x0F) == 0x03) { got = 1; break; }
+                            udelay(1000);
+                        }
+                        uart_print("  join: txrpt got=");
+                        uart_print_int(got);
+                        uart_print(" c2h=0x");
+                        uart_print_hex(c2h);
+                        uart_print(" retry=");
+                        uart_print_int((int)((c2h >> 8) & 0x80));
+                        uart_print(" life=");
+                        uart_print_int((int)((c2h >> 8) & 0x40));
+                        uart_print("\r\n");
+                        h3_sdc_write_wlan_reg8(0x01AF, 0x00);   /* C2H_EVT_HOST_CLOSE */
+                    }
                 }
                 dhcp_resent++;
                 /* W.507: tx-dbg (TXPKT_EMPTY/loq) убран из hot-path (подтверждён в W.495). */
