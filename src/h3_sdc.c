@@ -2061,11 +2061,18 @@ void h3_wifi_rf_rx_test(void)
          0x200=0x00E7020C (rtl8189fs-lakka-live-dump.md). Раньше было
          0xE0 (считали с BCNQ1/WOWLAN 0x08/0x07). W.247. */
     h3_sdc_write_wlan_reg8(0x0214, 0x02);        /* RQPN_NPQ */
-    h3_sdc_write_wlan_reg32(0x0200, 0x80E7020Cu);/* RQPN: HPQ|LPQ|PUBQ|LD */
+    /* W.499: LPQ=2 (0x80E7020C) не вмещает data-кадр >2 страниц (DISCOVER =
+       352Б = 3 страницы по 128Б), поэтому он вечно висел/уходил в HIQ.
+       Ставим LPQ=8 и разрешаем LOW-очереди брать public-страницы
+       (LPQ_PUBLIC_DIS=0): 0x80E1 08 0C. Формат hal_com_reg.h:1375-1384. */
+    h3_sdc_write_wlan_reg32(0x0200, 0x80E1080Cu);/* RQPN: HPQ|LPQ=8|PUBQ|LD */
     h3_sdc_read_wlan_reg32(0x0200, &d);
     WLOG("  rx: rqpn=0x");
     WLOG_HEX(d);
     WLOG("\r\n");
+    uart_print("  rx: rqpn=0x");
+    uart_print_hex(d);
+    uart_print("\r\n");
 
     /* 2a) TX-границы (_InitTxBufferBoundary, sdio_halinit.c:321-324):
          txpktbuf_bndy = TX_PAGE_BOUNDARY_8188F = 0xF8
