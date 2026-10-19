@@ -4225,8 +4225,8 @@ int h3_wifi_join_ap(void)
            Assoc сразу в DHCP-цикл ниже (повторный DISCOVER/ожидание OFFER).
            Если 4-way уже был (secure=1) — DISCOVER уйдёт зашифрованным и OFFER
            расшифруется; если ещё нет — EAPOL-Start внизу запустит msg1. */
-        if (same_bssid && (msr & 0x01)) {
-            uart_print("  join: already assoc to same BSSID, skip auth->reDHCP\r\n");
+        if (same_bssid && (msr & 0x01) && join_target.secure) {
+            uart_print("  join: already assoc+secure to same BSSID, skip auth->reDHCP\r\n");
             skip_auth = 1;
         }
         /* W.472 [фикс]: deauth ПЕРЕД любым auth (даже тот же BSSID). Если
@@ -4806,7 +4806,15 @@ int h3_wifi_join_ap(void)
                                                opensystem): TxUseDK|RxUseDK|TxEncEnable(bit2)|RxDecEnable(bit3)
                                                |TXBCUSEDK|RXBCUSEDK. unicast шифруется pairwise-ключом из
                                                CAM; broadcast/multicast — default key (GTK). */
-                                            h3_sdc_write_wlan_reg8(0x0680, 0xCF);
+                                             /* W.487 [фикс]: seccfg=0xCC, НЕ 0xCF.
+                                                hal_com.c:5809/5833 (эталон 8189FS) для 802.1X
+                                                (WPA2) ставит только TxEncEnable|RxDecEnable
+                                                (+TXBC/RXBCUSEDK), а SCR_TxUseDK(b0)/SCR_RxUseDK(b1)
+                                                добавляет ЛИШЬ для не-802.1X. С b0=1 чип форсил
+                                                Default Key (GTK) на ВСЕ data-кадры, включая
+                                                unicast DISCOVER → AP ждал pairwise и не мог
+                                                расшифровать. 0xCC = TxEnc|RxDec|TXBCUSEDK|RXBCUSEDK. */
+                                             h3_sdc_write_wlan_reg8(0x0680, 0xCC);
                                             /* W.459 [диагностика]: дамп CAM после загрузки ключей.
                                                seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
                                                реально активны; camcmd 0x0670 покажет занятость. */

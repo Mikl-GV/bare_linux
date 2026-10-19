@@ -53,7 +53,11 @@ int net_dhcp_discover(struct net_state *st)
     pkt[p++] = (uint8_t)(dhcp_xid >> 24); pkt[p++] = (uint8_t)(dhcp_xid >> 16);
     pkt[p++] = (uint8_t)(dhcp_xid >> 8);  pkt[p++] = (uint8_t)dhcp_xid;
     pkt[p++] = 0x00; pkt[p++] = 0x00;   /* secs=0 */
-    pkt[p++] = 0x80; pkt[p++] = 0x00;   /* flags: broadcast */
+    /* W.487: broadcast-флаг СНЯТ (0x0000). С флагом 0x8000 AP отвечала OFFER
+       broadcast-ом, а расшифровка group-кадра зависела от RXBCUSEDK/GTK.
+       Без флага AP шлёт OFFER unicast на наш MAC → расшифровка проверенной
+       pairwise-парой (cam4). */
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* flags: unicast reply */
     /* ciaddr, yiaddr, siaddr, giaddr = 0 (16 байт) — до chaddr */
     for (i = 0; i < 16; i++) pkt[p++] = 0;
     /* chaddr (16 байт): наш MAC + 10 нулей */
