@@ -127,12 +127,45 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, struct net_state *st)
         uint8_t yiaddr[4] = { pkt[dh+16], pkt[dh+17], pkt[dh+18], pkt[dh+19] };
         if (yiaddr[0] == 0) return;
         st->have = 1;
-        for (int k = 0; k < 4; k++) { st->ip[k] = yiaddr[k]; st->net[k] = yiaddr[k]; }
+        for (int k = 0; k < 4; k++) st->ip[k] = yiaddr[k];
+
+        /* W.521 [фикс]: маска сети = НЕ IP. Раньше писали st->net[k]=yiaddr[k],
+           из-за чего «маска» совпадала с адресом (мусор для расчётов). Теперь
+           берём реальные DHCP-опции: 1 = subnet mask, 3 = router (gw).
+           Правило-подстановка .199 удалено ещё в W.407 — IP только из yiaddr. */
+        for (int k = 0; k < 4; k++) { st->net[k] = 0; st->mask[k] = 0; st->gw[k] = 0; }
+        uint16_t opt = (uint16_t)(dh + 240);          /* cookie+fixed 236 */
+        uint16_t end = (uint16_t)(dh + (udp_len - 8));
+        if (end > len) end = len;
+        while (opt + 2 <= end) {
+            uint8_t code = pkt[opt];
+            if (code == 0) { opt++; continue; }        /* pad */
+            if (code == 255) break;                    /* end */
+            uint8_t olen = pkt[opt + 1];
+            if (opt + 2 + olen > end) break;
+            if (code == 1 && olen == 4) {
+                for (int k = 0; k < 4; k++) st->mask[k] = pkt[opt + 2 + k];
+            } else if (code == 3 && olen >= 4) {
+                for (int k = 0; k < 4; k++) st->gw[k] = pkt[opt + 2 + k];
+            }
+            opt = (uint16_t)(opt + 2 + olen);
+        }
+
         uart_print("  net: DHCP OK ip=");
         uart_print_int((int)st->ip[0]); uart_print(".");
         uart_print_int((int)st->ip[1]); uart_print(".");
         uart_print_int((int)st->ip[2]); uart_print(".");
         uart_print_int((int)st->ip[3]);
+        uart_print(" mask=");
+        uart_print_int((int)st->mask[0]); uart_print(".");
+        uart_print_int((int)st->mask[1]); uart_print(".");
+        uart_print_int((int)st->mask[2]); uart_print(".");
+        uart_print_int((int)st->mask[3]);
+        uart_print(" gw=");
+        uart_print_int((int)st->gw[0]); uart_print(".");
+        uart_print_int((int)st->gw[1]); uart_print(".");
+        uart_print_int((int)st->gw[2]); uart_print(".");
+        uart_print_int((int)st->gw[3]);
         uart_print("\r\n");
     }
 }
