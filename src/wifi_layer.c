@@ -311,6 +311,16 @@ int wifi_layer_connect(int index)
         }
         uart_print("  wpa2 passphrase set (rsn_len=");
         uart_print_int((int)ap.rsn_len);
+        /* W.515: RSN capabilities — последние 2 байта RSN IE.
+           bit7=MFPC (PMF capable), bit6=MFPR (PMF required). Если MFPR=1,
+           AP требует 802.11w и unprotected data (DHCP) будет дропаться. */
+        if (ap.rsn_len >= 4) {
+            uint8_t caps0 = ap.rsn_ie[ap.rsn_len - 2];
+            uart_print(" pmf_cap=");
+            uart_print_int((int)((caps0 >> 7) & 1));
+            uart_print(" pmf_req=");
+            uart_print_int((int)((caps0 >> 6) & 1));
+        }
         uart_print(")\r\n");
     }
 
