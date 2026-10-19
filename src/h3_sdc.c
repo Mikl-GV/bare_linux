@@ -3767,7 +3767,11 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
 
     /* tx_desc: как у драйвера для data (rtl8188f_fill_default_txdesc). */
     buf[2] = 40u;                                       /* OFFSET = 40 */
-    buf[3] = (uint8_t)((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7)); /* BMC|LAST|FIRST|OWN */
+    /* W.488 [фикс]: BMC (txdesc byte3 bit0) = 1 только для broadcast.
+       Раньше BMC=1 стоял всегда → чип шифровал unicast-данные (DISCOVER)
+       групповым ключом GTK, а AP ждала pairwise и отбрасывала кадр.
+       Данные шлём unicast на BSSID, поэтому BMC=0. */
+    buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
     /* W.485: EAPOL (msg2/msg4) отправляем на 6M OFDM (DESC_RATE6M=0x0C), а не
        CCK 1M по умолчанию. Часть AP (Samsung A05s hotspot) не декодирует наши
@@ -4036,56 +4040,19 @@ body[0]  = 0x02;                             /* RSN */
         for (int i = 0; i < 16; i++) pkt[4+77+i] = mic[i];
     }
 
-    /* W.443 [диагностика]: дамп msg2 — что именно уходит в эфир.
-       replay должен = msg1; snonce[0..7] ≠ 0; MIC[0..15] ≠ 0. */
-    uart_print("    msg2 dump: ver=");
-    uart_print_int((int)pkt[0]);
-    uart_print(" len=");
-    uart_print_int((int)eapol_len);
-    uart_print(" kinfo=");
-    uart_print_hex((uint32_t)((body[1] | (body[2] << 8))));
-    uart_print(" keylen=");
-    uart_print_int((int)((body[3] << 8) | body[4]));
-    uart_print(" replay=");
-    for (int i = 0; i < 8; i++) { uart_print_hex((uint32_t)body[5+i]); if (i < 7) uart_print(":"); }
-    uart_print(" mic=");
-    for (int i = 0; i < 8; i++) { uart_print_hex((uint32_t)pkt[4+77+i]); if (i < 7) uart_print(":"); }
-    uart_print(" kdlen=");
-    uart_print_int((int)kd_len);
-    uart_print("\r\n");
+    /* W.488: убран полный msg2 dump (ver/len/kinfo/keylen/replay/mic/kdlen) —
+       в горячем пути msg1→msg2 он забивал UART-буфер и давал блокирующий flush. */
     /* W.452: убраны тяжёлые дампы (kck[16]/snonce[32]/ssid/pmk) — выполняли
        диагностическую миссию в hot-path msg1→msg2 и забивали UART-буфер (4096Б),
        вызывая блокирующий flush (≈22мс на 256Б@115200) ПЕРЕД записью msg2 в HIQ;
        из-за этого точка успевала уйти в retry (replay 2→3→4). Оставлен короткий
        полевой дамп (ver/kinfo/keylen/replay/mic/kdlen). */
 
-    /* W.475: пауза 5 мс перед msg2 — как с msg4, чтобы AP успела переключиться
-       из состояния приёма на обработку (некоторые AP флейкуют на мгновенном отклике). */
+    /* W.475: пауза 5 мс перед msg2, чтобы AP успела переключиться из приёма
+       на обработку. W.488: убраны 100-мс пауза и диагностика loq/rpt после
+       отправки (тормозили 4-way и срывали тайминги msg1-retry). */
     udelay(5000);
-    /* W.485 [диагностика TX]: LOQ free pages до/после + TX-статус. Если post < pre —
-       кадр застрял в очереди (TX не вытянул); если post == pre — чип протолкнул
-       в эфир (ACK/ретраи завершились). TX-RPT (0x0434) даёт retry-count/ack. */
-    {
-        int loq_pre = h3_wifi_tx_free_pages_loq();
-        int m2rc = h3_wifi_tx_data(0x888E, pkt, eapol_len);
-        udelay(100000);                       /* 100 мс — дать чипу отработать TX */
-        int loq_post = h3_wifi_tx_free_pages_loq();
-        uint32_t rpt0 = 0, rpt1 = 0;
-        h3_sdc_read_wlan_reg32(0x0434, &rpt0);
-        h3_sdc_read_wlan_reg32(0x0438, &rpt1);
-        uart_print("    m2: rc=");
-        uart_print_int(m2rc);
-        uart_print(" loq ");
-        uart_print_int(loq_pre);
-        uart_print("->");
-        uart_print_int(loq_post);
-        uart_print(" rpt=");
-        uart_print_hex(rpt0);
-        uart_print(",");
-        uart_print_hex(rpt1);
-        uart_print("\r\n");
-        return m2rc;
-    }
+    return h3_wifi_tx_data(0x888E, pkt, eapol_len);
 }
 
 /* Регистры/биты CAM шифрования 8188F (hal_com_reg.h). */
@@ -4609,7 +4576,6 @@ int h3_wifi_join_ap(void)
                                dp+8 = EAPOL header: version, type, length(be).
                                dp+12 = EAPOL-Key body. Печатаем msg1-поля. */
                             uint8_t ea = rxbuf[dp+8+1];       /* EAPOL type */
-                            uint16_t eaplen = (uint16_t)((rxbuf[dp+8+2]<<8)|rxbuf[dp+8+3]);
                             if (ea == 0x03) {                 /* EAPOL-Key */
                                 /* W.413 [P2]: правильные смещения тела EAPOL-Key (RFC 4137):
                                    +0 = Descriptor Type (0x02 RSN)
@@ -4617,36 +4583,13 @@ int h3_wifi_join_ap(void)
                                    +3..4 = Key Length
                                    +5..12 = Key Replay Counter
                                    +13..44 = Key Nonce (ANonce) */
-                                uint8_t  ktype = rxbuf[dp+12+0];
                                 uint16_t kinfo = (uint16_t)((rxbuf[dp+12+1]<<8)|rxbuf[dp+12+2]);
-                                uint16_t klen  = (uint16_t)((rxbuf[dp+12+3]<<8)|rxbuf[dp+12+4]);
                                 /* ANonce (32 байта на +13) */
                                 uint8_t  anonce[32];
                                 for (int aa = 0; aa < 32; aa++) anonce[aa] = rxbuf[dp+12+13+aa];
-                                uart_print("    eapol_key len=");
-                                uart_print_int((int)eaplen);
-                                uart_print(" kinfo=0x");
-                                uart_print_hex((uint32_t)kinfo);
-                                uart_print(" rsn_type=0x");
-                                uart_print_hex((uint32_t)ktype);
-                                uart_print(" keylen=");
-                                uart_print_int((int)klen);
-                                /* msg1: bit3=Pairwise? bit0/1=descr. Старший опции */
-                                uint8_t descr = kinfo & 0x0007;
-                                uint8_t pair  = (kinfo >> 3) & 1;
-                                uint8_t ack   = (kinfo & 0x0080) ? 1 : 0;  /* Key ACK = bit7 */
-                                uint8_t micbit= (kinfo & 0x0100) ? 1 : 0;  /* MIC = bit8 */
-                                uart_print(" descr=");
-                                uart_print_int((int)descr);
-                                uart_print(" pair=");
-                                uart_print_int((int)pair);
-                                uart_print(" ack=");
-                                uart_print_int((int)ack);
-                                uart_print(" mic=");
-                                uart_print_int((int)micbit);
-                                uart_print(" anonce=");
-                                for (int aa = 0; aa < 6; aa++) { uart_print_hex((uint32_t)anonce[aa]); if (aa < 5) uart_print(":"); }
-                                uart_print("\r\n");
+                                /* W.488: убран подробный дамп полей msg1
+                                   (kinfo/rsn_type/keylen/descr/pair/ack/mic/anonce) —
+                                   печатается одна строка на msg1 ниже. */
                                 /* W.447: сохранить msg1 для 4-way — ANonce + replay counter.
                                    Детект msg1: Key ACK (bit7=0x0080) установлен И
                                    Encrypted Key Data (bit12=0x1000) сброшен. msg3 (GTK)
@@ -4656,10 +4599,10 @@ int h3_wifi_join_ap(void)
                                     /* W.447 [диагностика]: показать полный msg1 replay (8Б) и весь ANonce (32Б)
                                        рядом с msg2 — сверить, эхо ли это (если msg1 replay растёт 2,3,4,
                                        значит AP сам шлёт новые msg1, не ретраит; тогда мой эхо корректен). */
+                                    /* W.488: одна короткая строка на msg1. */
                                     uart_print("    msg1 replay=");
-                                    for (int bb = 0; bb < 8; bb++) { uart_print_hex((uint32_t)rxbuf[dp+12+5+bb]); if (bb < 7) uart_print(":"); }
-                                    uart_print(" anonce0=");
-                                    for (int bb = 0; bb < 6; bb++) { uart_print_hex((uint32_t)anonce[bb]); if (bb < 5) uart_print(":"); }
+                                    uart_print_hex((uint32_t)rxbuf[dp+12+5+6]);
+                                    uart_print_hex((uint32_t)rxbuf[dp+12+5+7]);
                                     uart_print("\r\n");
                                     for (int aa = 0; aa < 32; aa++) join_target.anonce[aa] = anonce[aa];
                                     for (int aa = 0; aa < 8; aa++) join_target.replay[aa] = rxbuf[dp+12+5+aa];
