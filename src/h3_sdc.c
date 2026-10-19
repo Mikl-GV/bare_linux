@@ -3769,6 +3769,12 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     buf[2] = 40u;                                       /* OFFSET = 40 */
     buf[3] = (uint8_t)((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7)); /* BMC|LAST|FIRST|OWN */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
+    /* W.485: EAPOL (msg2/msg4) отправляем на 6M OFDM (DESC_RATE6M=0x0C), а не
+       CCK 1M по умолчанию. Часть AP (Samsung A05s hotspot) не декодирует наши
+       CCK data-кадры, хотя mgmt (auth/assoc) проходят. Это проверяет гипотезу
+       «rate» до правки RTS/ERP. Для IP-данных rate не трогаем. */
+    if (ethertype == 0x888E)
+        buf[16] = 0x0Cu;                                /* DESC_RATE6M */
 
     /* кадр с базы buf+40 */
     uint8_t *f = buf + 40;
@@ -4056,8 +4062,30 @@ body[0]  = 0x02;                             /* RSN */
     /* W.475: пауза 5 мс перед msg2 — как с msg4, чтобы AP успела переключиться
        из состояния приёма на обработку (некоторые AP флейкуют на мгновенном отклике). */
     udelay(5000);
-    /* Отправить как data-кадр ethertype 0x888E (payload = EAPOL). */
-    return h3_wifi_tx_data(0x888E, pkt, eapol_len);
+    /* W.485 [диагностика TX]: LOQ free pages до/после + TX-статус. Если post < pre —
+       кадр застрял в очереди (TX не вытянул); если post == pre — чип протолкнул
+       в эфир (ACK/ретраи завершились). TX-RPT (0x0434) даёт retry-count/ack. */
+    {
+        int loq_pre = h3_wifi_tx_free_pages_loq();
+        int m2rc = h3_wifi_tx_data(0x888E, pkt, eapol_len);
+        udelay(100000);                       /* 100 мс — дать чипу отработать TX */
+        int loq_post = h3_wifi_tx_free_pages_loq();
+        uint32_t rpt0 = 0, rpt1 = 0;
+        h3_sdc_read_wlan_reg32(0x0434, &rpt0);
+        h3_sdc_read_wlan_reg32(0x0438, &rpt1);
+        uart_print("    m2: rc=");
+        uart_print_int(m2rc);
+        uart_print(" loq ");
+        uart_print_int(loq_pre);
+        uart_print("->");
+        uart_print_int(loq_post);
+        uart_print(" rpt=");
+        uart_print_hex(rpt0);
+        uart_print(",");
+        uart_print_hex(rpt1);
+        uart_print("\r\n");
+        return m2rc;
+    }
 }
 
 /* Регистры/биты CAM шифрования 8188F (hal_com_reg.h). */
@@ -4206,18 +4234,25 @@ int h3_wifi_join_ap(void)
            (msr=1 на AP), а наш msr=0 -> рассинхрон, auth молчит (rc=-4).
            Deauth не-associated стана AP игнорирует (no-op) — вреда нет,
            зато сбрасывает подвисшее состояние на AP. reason 3 = Leaving ESS. */
-        if (msr & 0x01) {
+        /* W.485: при skip_auth (уже assoc к этому BSSID) НЕ рвать связку.
+           Прежний код слал deauth + сбрасывал MSR/BSSID даже в этом случае,
+           затем всё равно проходил auth/assoc (флаг влиял только на возврат
+           -4/-6) → каждый повторный клик разрушал рабочий линк и начинал
+           4-way с нуля, в итоге падая в WPA2 pending. */
+        if (!skip_auth && (msr & 0x01)) {
             h3_wifi_tx_deauth(join_target.bssid, 3);   /* к ЦЕЛЕВОМУ BSSID */
             udelay(20000);
             uart_print("  join: deauth (pre-auth)\r\n");
         }
-        /* Всегда сбрасываем link в NOLINK перед новым join (deauth даже для
-           same / после потерянного AssocResp). */
-        h3_sdc_write_wlan_reg8(0x0102, 0x00);        /* MSR NOLINK */
-        for (int k = 0; k < 6; k++) h3_sdc_write_wlan_reg8(0x0618 + k, 0x00);
-        for (int k = 0; k < 32; k++) h3_sdc_write_wlan_reg8(0x06E0 + k, 0x00);
-        udelay(5000);
-        uart_print("  join: reset link (NOLINK, bssid=0)\r\n");
+        /* Всегда сбрасываем link в NOLINK перед новым join, но только если
+           действительно делаем auth (иначе теряем готовую связку). */
+        if (!skip_auth) {
+            h3_sdc_write_wlan_reg8(0x0102, 0x00);        /* MSR NOLINK */
+            for (int k = 0; k < 6; k++) h3_sdc_write_wlan_reg8(0x0618 + k, 0x00);
+            for (int k = 0; k < 32; k++) h3_sdc_write_wlan_reg8(0x06E0 + k, 0x00);
+            udelay(5000);
+            uart_print("  join: reset link (NOLINK, bssid=0)\r\n");
+        }
     }
 
     /* W.391 (join_prepare): сбросить накопленное состояние между join.
@@ -4286,12 +4321,16 @@ int h3_wifi_join_ap(void)
     uart_print_hex(0xC00u | (uint32_t)(join_target.channel & 0xFF));
     uart_print(")\r\n");
 
-    /* Шаг 1: Auth (opensystem, seq=1). */
-    int rc = h3_wifi_tx_auth();
-    uart_print("  join: auth tx rc=");
-    uart_print_int(rc);
-    uart_print("\r\n");
-    if (rc != 0) return rc;
+    /* Шаг 1: Auth (opensystem, seq=1). W.485: при skip_auth (уже assoc)
+       кадр НЕ шлём — линк не трогаем, сразу ждём DHCP/EAPOL ниже. */
+    int rc = 0;
+    if (!skip_auth) {
+        rc = h3_wifi_tx_auth();
+        uart_print("  join: auth tx rc=");
+        uart_print_int(rc);
+        uart_print("\r\n");
+        if (rc != 0) return rc;
+    }
 
     /* Шаг 2: ждать AuthResp (fc 0xB0, seq=2, status=0) от целевого BSSID. */
     {
@@ -4308,7 +4347,7 @@ int h3_wifi_join_ap(void)
         rxp_seq = 0;
         {
             int waited_auth = 0;
-            for (tries = 0; tries < 500 && waited_auth < 1000; tries++) {
+            for (tries = 0; !skip_auth && tries < 500 && waited_auth < 1000; tries++) {
                 if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited_auth += 2; continue; }
                 if (acc == 0) { udelay(2000); waited_auth += 2; continue; }
             uint32_t off = 0;
@@ -4373,17 +4412,19 @@ int h3_wifi_join_ap(void)
             uart_print("  join: auth resp rcvd (rx pkt fc=0xB0, BSSID match)\r\n");
     }
 
-    /* Шаг 3: на тот же целевой BSSID — AssocReq. */
-    rc = h3_wifi_tx_assoc_req();
-    uart_print("  join: assocreq tx rc=");
-    uart_print_int(rc);
-    uart_print(" rsn_len=");
-    uart_print_int((int)join_target.rsn_len);
-    uart_print(" cap=");
-    /* Фактический cap, согласованный с h3_wifi_tx_assoc_req (W.376): не хардкод! */
-    uart_print_hex((uint32_t)((join_target.rsn_len > 0) ? 0x0011 : 0x0001));
-    uart_print("\r\n");
-    if (rc != 0) return rc;
+    /* Шаг 3: на тот же целевой BSSID — AssocReq. W.485: при skip_auth не шлём. */
+    if (!skip_auth) {
+        rc = h3_wifi_tx_assoc_req();
+        uart_print("  join: assocreq tx rc=");
+        uart_print_int(rc);
+        uart_print(" rsn_len=");
+        uart_print_int((int)join_target.rsn_len);
+        uart_print(" cap=");
+        /* Фактический cap, согласованный с h3_wifi_tx_assoc_req (W.376): не хардкод! */
+        uart_print_hex((uint32_t)((join_target.rsn_len > 0) ? 0x0011 : 0x0001));
+        uart_print("\r\n");
+        if (rc != 0) return rc;
+    }
 
     /* Шаг 4: ждать AssocResp (fc 0x10, status на +26 после 3addr + cap2) от BSSID. */
     {
@@ -4393,7 +4434,7 @@ int h3_wifi_join_ap(void)
         int got_assoc = 0;
         int waited = 0;
         /* W.377: ассос к WPA2-AP отвечает до сотен мс. Ждём до ~1200 мс. */
-        for (tries = 0; tries < 600 && waited < 1200; tries++) {
+        for (tries = 0; !skip_auth && tries < 600 && waited < 1200; tries++) {
             if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
             if (acc == 0) { udelay(2000); waited += 2; continue; }
             uint32_t off = 0;
@@ -4444,7 +4485,7 @@ int h3_wifi_join_ap(void)
             waited += 2;
         }
         if (!skip_auth && !got_assoc) return -6;   /* AssocResp не получена/отказ */
-        uart_print("  join: assoc resp OK (associated)\r\n");
+        if (!skip_auth) uart_print("  join: assoc resp OK (associated)\r\n");
     }
 
     /* Шаг 5: перевести в STA-режим и записать BSSID AP (ассоциация состоялась). */
