@@ -4597,9 +4597,8 @@ int h3_wifi_join_ap(void)
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
-        /* W.518: TX-report, запись через CMD52 (как эталон sdio_writeb ->
-           rtw_write8). Наш h3_sdc_write_wlan_reg8 идёт CMD53 и 0x04EC не
-           применялся (ctrl читался 0x00). */
+        /* W.519: TX Report по эталону rtl8188ee/hw.c — ТРИ записи, через CMD52:
+           0x04EC |= BIT(1)|BIT(0);  0x04ED = 2 (max report MACID);  0x04F0 = 0xCDF0. */
         {
             uint8_t tr = 0;
             uint32_t ft = (8u << 13) | 0x04ECu;
@@ -4607,13 +4606,16 @@ int h3_wifi_join_ap(void)
             h3_sdc_cmd52_read(1, ft, &tr);
             uart_print("  join: txrpt before=0x");
             uart_print_hex((uint32_t)tr);
-            h3_sdc_cmd52_write(1, ft, (uint8_t)(tr | 0x01u | 0x02u | 0x20u));
+            h3_sdc_cmd52_write(1, ft, (uint8_t)(tr | 0x01u | 0x02u));      /* 0x04EC */
+            h3_sdc_cmd52_write(1, (8u << 13) | 0x04EDu, 0x02u);            /* max MACID */
+            h3_sdc_cmd52_write(1, (8u << 13) | 0x04F0u, (uint8_t)(0xCDF0u & 0xFF));
+            h3_sdc_cmd52_write(1, (8u << 13) | 0x04F1u, (uint8_t)((0xCDF0u >> 8) & 0xFF));
             h3_sdc_cmd52_read(1, ft, &tr);
             uart_print(" after=0x");
             uart_print_hex((uint32_t)tr);
-            /* таймер 0x04F0 — 16 бит: два байта через CMD52 */
-            h3_sdc_cmd52_write(1, (8u << 13) | 0x04F0u, (uint8_t)(0xCDF0u & 0xFF));
-            h3_sdc_cmd52_write(1, (8u << 13) | 0x04F1u, (uint8_t)((0xCDF0u >> 8) & 0xFF));
+            h3_sdc_cmd52_read(1, (8u << 13) | 0x04EDu, &tr);
+            uart_print(" ed=0x");
+            uart_print_hex((uint32_t)tr);
             uart_print("\r\n");
         }
 
@@ -4646,7 +4648,11 @@ int h3_wifi_join_ap(void)
                     {
                         uint32_t c2h = 0;
                         int got = 0;
-                        for (int q = 0; q < 500; q++) {
+                        /* W.519: SDIO-отчёты приходят с задержкой — для первой
+                           отправки ждём до 2500 мс (как в ядре), для повторов 200 мс,
+                           чтобы не выйти за окно DHCP 6 с. */
+                        int wait_ms = (dhcp_resent == 1) ? 2500 : 200;
+                        for (int q = 0; q < wait_ms; q++) {
                             h3_sdc_read_wlan_reg32(0x01A0, &c2h);
                             if ((c2h & 0x0F) == 0x03) { got = 1; break; }
                             udelay(1000);
@@ -4908,7 +4914,10 @@ int h3_wifi_join_ap(void)
                                                 а отдаёт их как есть (garbage ethertype). Если после
                                                 этого появятся rx DATA — значит RX блокировала
                                                 дешифровка (ключ не найден). Вернуть 0xCC. */
-                                             h3_sdc_write_wlan_reg8(0x0680, 0xC4);
+                                             /* W.519: возвращён 0xCC (RxDecEnable) —
+                                                тест 0xC4 окончен: rxcnt=0 и без дешифровки,
+                                                значит RX не блокируется, AP не шлёт. */
+                                             h3_sdc_write_wlan_reg8(0x0680, 0xCC);
                                             /* W.459 [диагностика]: дамп CAM после загрузки ключей.
                                                seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
                                                реально активны; camcmd 0x0670 покажет занятость. */
