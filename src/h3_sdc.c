@@ -4549,8 +4549,20 @@ int h3_wifi_join_ap(void)
            при BSSID-filter на пакеты данных от нашего AP. */
         uint32_t rcr = 0;
         h3_sdc_read_wlan_reg32(0x0608, &rcr);
-        h3_sdc_write_wlan_reg32(0x0608, rcr | (1u << 6));   /* RCR_CBSSID_DATA */
-        uart_print("  join: data-rx ON (rxfltmap2=ffff, rcr cbssid_data)\r\n");
+        /* W.520 [корневой фикс приёма data]: по эталону connected-STA
+           (rtl8188f_hal_init.c:5088) RCR = 0x7000208E, плюс RCR_ADF=BIT11
+           (Accept data type frame) — иначе чип НЕ принимает data-кадры,
+           и OFFER/ARP от AP просто не попадают в RX. Прежние 0x7000604E
+           не имели ADF. */
+        (void)rcr;
+        h3_sdc_write_wlan_reg32(0x0608, 0x7000288Eu);
+        {
+            uint32_t rcr_rb = 0;
+            h3_sdc_read_wlan_reg32(0x0608, &rcr_rb);
+            uart_print("  join: data-rx ON rcr=0x");
+            uart_print_hex(rcr_rb);
+            uart_print("\r\n");
+        }
     }
 
     /* W.395: data-приём после ассоциации — отправляем DHCP DISCOVER и ждём
