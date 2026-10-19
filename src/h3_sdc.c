@@ -3767,13 +3767,12 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
 
     /* tx_desc: как у драйвера для data (rtl8188f_fill_default_txdesc). */
     buf[2] = 40u;                                       /* OFFSET = 40 */
-    /* W.491 [фикс]: DHCP DISCOVER (0x0800) — честный L2 broadcast: addr1 и
-       addr3 = ff:ff:ff:ff:ff:ff (клиент не знает MAC сервера; BSSID-адресация
-       в addr3 давала рассогласование L2-unicast/L3-broadcast, строгий AP
-       дропал). BMC=1 → чип берёт групповой ключ GTK. */
-    int dhcp_bcast = (ethertype == 0x0800);
+    /* W.492 [фикс по эталону rtw_xmit.c:1041-1051,1506-1512]: для STA (ToDS=1)
+       addr1 (ra) = BSSID ВСЕГДА (unicast к AP, даже для broadcast-пакета),
+       addr3 = L2 dst (для DHCP DISCOVER = ff:ff:ff:ff:ff:ff). Пакет к AP
+       шифруется pairwise-ключом (cam4, MAC=BSSID), поэтому BMC=0. */
+    int l2bcast = (ethertype == 0x0800);   /* DHCP DISCOVER: addr3 = broadcast */
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
-    if (dhcp_bcast) buf[3] |= (1u << 0);                     /* BMC (byte3 bit0) */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
     /* W.485: EAPOL (msg2/msg4) отправляем на 6M OFDM (DESC_RATE6M=0x0C), а не
        CCK 1M по умолчанию. Часть AP (Samsung A05s hotspot) не декодирует наши
@@ -3804,8 +3803,8 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
            txdesc[6]; биты[23:22] = биты 7,6 байта txdesc[6]. 0x3 = 11. */
         buf[6] = (uint8_t)((buf[6] & 0x3Fu) | 0xC0u);   /* SEC_TYPE bits = 0b11 */
     }
-    if (dhcp_bcast) {
-        for (i = 0; i < 6; i++) { f[4+i] = 0xFF; f[10+i] = m[i]; f[16+i] = 0xFF; }
+    if (l2bcast) {
+        for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = 0xFF; }
     } else {
         for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
     }
