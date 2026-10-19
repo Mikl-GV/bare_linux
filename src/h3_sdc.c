@@ -4544,11 +4544,20 @@ int h3_wifi_join_ap(void)
                            Раньше читали LE (rxbuf[dp+6] | rxbuf[dp+7]<<8 → 0x0008),
                            из-за чего сравнение с 0x0800/0x888E никогда не срабатывало
                            и DHCP OFFER прилетал, но net_handle_ipv4 не вызывался. */
-                        uart_print("  join: rx DATA etype=0x");
-                        uart_print_hex((uint32_t)etype);
-                        uart_print(" plen=");
-                        uart_print_int((int)plen);
-                        uart_print("\r\n");
+                        /* W.482: print rx DATA etype не более чем для первых кадров (флуд
+                           зашифрованных 0x3208/0xABC3 тормозил лог на десятках
+                           строк/цикле). Сумма — см. eapol_count/NET-данные ниже. */
+                        {
+                            static int dbg_cnt = 0;
+                            if (dbg_cnt < 8 || etype == 0x0800 || etype == 0x888E) {
+                                uart_print("  join: rx DATA etype=0x");
+                                uart_print_hex((uint32_t)etype);
+                                uart_print(" plen=");
+                                uart_print_int((int)plen);
+                                uart_print("\r\n");
+                            }
+                            dbg_cnt++;
+                        }
                         if (etype == 0x0800)      /* IPv4: парсим DHCP OFFER */
                             net_handle_ipv4(&rxbuf[dp+8], (uint16_t)plen, &nst);
                         if (etype == 0x888E) {    /* WPA2 EAPOL-Key (4-way) */
@@ -4704,42 +4713,36 @@ int h3_wifi_join_ap(void)
                                                    — чип получал мусор и не расшифровывал broadcast.
                                                    Проверяем OUI и берём GTK со смещения 8. */
                                                 const uint8_t *gk = gtk;
-                                                if (glen >= 24 && gtk[0] == 0xDD &&
-                                                    gtk[2]==0x00 && gtk[3]==0x0F && gtk[4]==0xAC) {
-                                                    gk = gtk + 8;
+                                                /* W.480: plaintext key_data в msg3 может НЕ начинаться
+                                                   с GTK-KDE (напр. сначала RSN IE: 30 14 01 00 00 0F AC 04..).
+                                                   Сканируем весь plaintext на GTK-KDE
+                                                   [0xDD][len][00 0F AC][0x01][keyid][reserved][16 GTK],
+                                                   GTK на +8. Fallback — gtk. */
+                                                {
+                                                    uint32_t gk_off = 0;
+                                                    for (uint32_t off = 0; off + 8 <= glen; off++) {
+                                                        if (gtk[off] == 0xDD &&
+                                                            off + 2 + gtk[off+1] <= glen &&
+                                                            gtk[off+2]==0x00 && gtk[off+3]==0x0F &&
+                                                            gtk[off+4]==0xAC && gtk[off+5]==0x01) {
+                                                            gk = gtk + off + 8;
+                                                            gk_off = off;
+                                                            break;
+                                                        }
+                                                    }
+                                                    uart_print(" gtk_from=");
+                                                    uart_print_int((int)gk_off);
                                                 }
                                                 wpa_cam_write_key(0, macz, gk, 1);
-                                                /* W.472/474 [диагностика: CAM readback] — по эталону драйвера rtw_sec_read_cam:
-                                                   командa чтения = CAM_POLLINIG|addr (0x670),
-                                                   ждать POLLINIG=0, затем данные из REG_CAMREAD(0x678).
-                                                   Читаем слово0 (ctrl+mac0/1) слотов 0 и 4.
-                                                   (Прошлый дамп читал reg8 без команды/поллинга — дал 0.) */
+                                                /* W.472/481 [диагностика: CAM readback] — по эталону драйвера rtw_sec_read_cam:
+                                                   командa чтения = CAM_POLLINIG|CAM_READ|addr (0x670),
+                                                   ждать POLLINIG=0, данные из REG_CAMREAD(0x678).
+                                                   Полный дамп всех 8 слов для entry 0 (GTK) и 4 (pairwise). */
                                                 for (int cam_slot = 0; cam_slot < 8; cam_slot += 4) {
-                                                    uint32_t addr_w = (uint32_t)(cam_slot * 8 + 0);
-                                                    h3_sdc_write_wlan_reg32(0x0670,
-                                                        CAM_POLLINIG | CAM_READ | addr_w);
-                                                    for (int p = 0; p < 1000; p++) {
-                                                        uint32_t rd = 0;
-                                                        h3_sdc_read_wlan_reg32(0x0670, &rd);
-                                                        if (!(rd & CAM_POLLINIG)) break;
-                                                        udelay(10);
-                                                    }
-                                                    uint32_t cam_w0 = 0;
-                                                    h3_sdc_read_wlan_reg32(0x0678, &cam_w0);
-                                                    uart_print(" cam[");
+                                                    uart_print(" cam");
                                                     uart_print_int(cam_slot);
-                                                    uart_print("]=0x");
-                                                    uart_print_hex(cam_w0);
-                                                    uart_print(" ");
-                                                }
-                                                /* W.477 [диагностика]: напечатать САМИ БАЙТЫ ключей (слова 2..5)
-                                                   слота 0 (GTK) — проверить, нет ли KDE-заголовка в ключе.
-                                                   Правильный чистый GTK: слово2 (первые 4 байта ключа) НЕ будет
-                                                   0xDD_xx_0F_00 (KDE-заголовок). */
-                                                {
-                                                    int cam_slot = 0;
-                                                    uart_print(" gtk_key=");
-                                                    for (int w = 2; w <= 5; w++) {
+                                                    uart_print("=");
+                                                    for (int w = 0; w < 8; w++) {
                                                         uint32_t addr_w = (uint32_t)(cam_slot * 8 + w);
                                                         h3_sdc_write_wlan_reg32(0x0670,
                                                             CAM_POLLINIG | CAM_READ | addr_w);
@@ -4749,9 +4752,10 @@ int h3_wifi_join_ap(void)
                                                             if (!(rd & CAM_POLLINIG)) break;
                                                             udelay(10);
                                                         }
-                                                        uint32_t kw = 0;
-                                                        h3_sdc_read_wlan_reg32(0x0678, &kw);
-                                                        uart_print_hex(kw);
+                                                        uint32_t cv = 0;
+                                                        h3_sdc_read_wlan_reg32(0x0678, &cv);
+                                                        if (w) uart_print(":");
+                                                        uart_print_hex(cv);
                                                     }
                                                     uart_print(" ");
                                                 }
