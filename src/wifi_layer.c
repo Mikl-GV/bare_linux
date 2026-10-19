@@ -323,10 +323,21 @@ int wifi_layer_connect(int index)
        MTS_GPON_9290e0 (B236f8g4). */
     if (ap.rsn_len > 0) {
         if (ap.ssid_len >= 4 &&
-            ap.ssid[0]=='A' && ap.ssid[1]=='0' && ap.ssid[2]=='5' && ap.ssid[3]=='s')
+            ap.ssid[0]=='A' && ap.ssid[1]=='0' && ap.ssid[2]=='5' && ap.ssid[3]=='s') {
             h3_wifi_set_passphrase("8645449Qq", 9);
-        else
+            uart_print("  passphrase: A05s\r\n");
+        } else if (ap.ssid_len >= 8 &&
+                   ap.ssid[0]=='M' && ap.ssid[1]=='T' && ap.ssid[2]=='S' &&
+                   ap.ssid[3]=='_') {
+            /* W.485: B236f8g4 известен ТОЛЬКО для MTS_GPON_9290e0.
+               Для d23898/b4d378 пароль другой — 4-way даст MIC-fail (AP
+               начнёт новый handshake с новым ANonce), это НЕ баг TX. */
             h3_wifi_set_passphrase("B236f8g4", 8);
+            uart_print("  passphrase: MTS guess B236f8g4 (верен только для 9290e0)\r\n");
+        } else {
+            h3_wifi_set_passphrase("B236f8g4", 8);
+            uart_print("  passphrase: GUESS B236f8g4 (SSID неизвестен)\r\n");
+        }
         uart_print("  wpa2 passphrase set (rsn_len=");
         uart_print_int((int)ap.rsn_len);
         uart_print(")\r\n");
