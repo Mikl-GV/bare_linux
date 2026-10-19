@@ -68,6 +68,7 @@ static struct {
     uint8_t pmk[32];             /* PSK->PMK, PBKDF2 */
     uint8_t pmk_valid;           /* W.453: PMK предвычислен (в h3_wifi_set_passphrase) */
     uint8_t snonce[32];          /* наш nonce */
+    uint8_t secure;              /* 1 = 4-way завершён и PTK/GTK в CAM — TX data шифровать (Protected) */
 } join_target;
 
 /* Список найденных сетей для UI «Transfer» (заполняется парсером RX-скана). */
@@ -3642,6 +3643,8 @@ void h3_wifi_set_target(const char *ssid, uint8_t ssid_len)
     for (uint8_t i = 0; i < ssid_len; i++) join_target.ssid[i] = ssid[i];
     join_target.ssid[ssid_len] = 0;
     join_target.bssid_captured = 0;   /* сброс до следующего скана */
+    join_target.have_msg1 = 0;        /* чистое 4-way состояние для нового подключения */
+    join_target.secure = 0;           /* до прохождения handshake данные не шифровать */
 }
 
 int h3_wifi_target_is_set(void)
@@ -3773,6 +3776,14 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     h3_wifi_get_mac(m);
 
     f[0] = 0x08; f[1] = 0x01;      /* data, ToDS(bit1)=1 */
+    /* W.462: после 4-way (secure=1) data-кадры обязаны идти С Protected-битом
+       (fc bit11=0x40) — иначе чип не зашифрует их TK/CCMP и AP дропнет.
+       EAPOL msg4 сам не защищается (уходит до установки ключей в AP), поэтому
+       Secure ставится ТОЛЬКО для обычного data (DHCP/ARP/ICMP), но не для
+       самого msg4. Ниже flag=NORMAL(0) оставляет msg4 как есть; флаг варится
+       по ethertype: 0x888E (EAPOL) — без Protected. */
+    if (join_target.secure && ethertype != 0x888E)
+        f[1] |= 0x40;              /* Protected */
     for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
     f[22] = 0; f[23] = 0;          /* seq */
 
@@ -4633,6 +4644,13 @@ int h3_wifi_join_ap(void)
                                             wpa_cam_write_key(4, join_target.bssid,
                                                               join_target.ptk + 32);
                                             wpa_cam_write_key(0, join_target.bssid, gtk);
+                                            /* W.462: включить CCMP TxEnc/RxDec в чипе — БЕЗ этого
+                                               даже с ключами в CAM чип физически НЕ шифрует/дешифрует.
+                                               REG_SECCFG (0x680) = 0xCF (как драйвер 8188F в STA при
+                                               opensystem): TxUseDK|RxUseDK|TxEncEnable(bit2)|RxDecEnable(bit3)
+                                               |TXBCUSEDK|RXBCUSEDK. unicast шифруется pairwise-ключом из
+                                               CAM; broadcast/multicast — default key (GTK). */
+                                            h3_sdc_write_wlan_reg8(0x0680, 0xCF);
                                             /* W.459 [диагностика]: дамп CAM после загрузки ключей.
                                                seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
                                                реально активны; camcmd 0x0670 покажет занятость. */
@@ -4645,6 +4663,7 @@ int h3_wifi_join_ap(void)
                                                 uart_print(" camcmd=0x");
                                                 uart_print_hex((uint32_t)cam_cmd);
                                                 wpa2_done = 1;
+                                                join_target.secure = 1;
                                             }
                                             uart_print(" cam keys loaded\r\n");
                                         } else {
