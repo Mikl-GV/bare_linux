@@ -4597,18 +4597,23 @@ int h3_wifi_join_ap(void)
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
-        /* W.515: включить TX-report по эталону rtl8xxxu:
-           REG_TX_RPT_CTRL(0x04EC) |= BIT0 (enable report) | BIT1 (timer) | BIT5;
-           REG_TX_RPT_TIME(0x04F0) = 0xCDF0 (~168 мкс единиц).
-           FW будет присылать C2H_CCX_TX_RPT (id 0x03) в REG_C2HEVT (0x01A0). */
+        /* W.518: TX-report, запись через CMD52 (как эталон sdio_writeb ->
+           rtw_write8). Наш h3_sdc_write_wlan_reg8 идёт CMD53 и 0x04EC не
+           применялся (ctrl читался 0x00). */
         {
             uint8_t tr = 0;
-            h3_sdc_read_wlan_reg8(0x04EC, &tr);
-            h3_sdc_write_wlan_reg8(0x04EC, (uint8_t)(tr | 0x01u | 0x02u | 0x20u));
-            h3_sdc_write_wlan_reg16(0x04F0, 0xCDF0);
-            uart_print("  join: txrpt ctrl=0x");
-            h3_sdc_read_wlan_reg8(0x04EC, &tr);
+            uint32_t ft = (8u << 13) | 0x04ECu;
+
+            h3_sdc_cmd52_read(1, ft, &tr);
+            uart_print("  join: txrpt before=0x");
             uart_print_hex((uint32_t)tr);
+            h3_sdc_cmd52_write(1, ft, (uint8_t)(tr | 0x01u | 0x02u | 0x20u));
+            h3_sdc_cmd52_read(1, ft, &tr);
+            uart_print(" after=0x");
+            uart_print_hex((uint32_t)tr);
+            /* таймер 0x04F0 — 16 бит: два байта через CMD52 */
+            h3_sdc_cmd52_write(1, (8u << 13) | 0x04F0u, (uint8_t)(0xCDF0u & 0xFF));
+            h3_sdc_cmd52_write(1, (8u << 13) | 0x04F1u, (uint8_t)((0xCDF0u >> 8) & 0xFF));
             uart_print("\r\n");
         }
 
@@ -4656,6 +4661,14 @@ int h3_wifi_join_ap(void)
                         uart_print_int((int)((c2h >> 8) & 0x40));
                         uart_print("\r\n");
                         h3_sdc_write_wlan_reg8(0x01AF, 0x00);   /* C2H_EVT_HOST_CLOSE */
+                    }
+                    /* W.517: RXPKT_NUM — приняла ли FW хоть что-то от AP. */
+                    {
+                        uint32_t rxn = 0;
+                        h3_sdc_read_wlan_reg32(0x0284, &rxn);
+                        uart_print("  join: rxcnt=");
+                        uart_print_int((int)(rxn & 0xFFFF));
+                        uart_print("\r\n");
                     }
                 }
                 dhcp_resent++;
@@ -4890,7 +4903,12 @@ int h3_wifi_join_ap(void)
                                                 Default Key (GTK) на ВСЕ data-кадры, включая
                                                 unicast DISCOVER → AP ждал pairwise и не мог
                                                 расшифровать. 0xCC = TxEnc|RxDec|TXBCUSEDK|RXBCUSEDK. */
-                                             h3_sdc_write_wlan_reg8(0x0680, 0xCC);
+                                             /* W.517 [тест]: 0xC4 = 0xCC без RxDecEnable(bit3).
+                                                Так чип НЕ дропает нерасшифрованные unicast-кадры,
+                                                а отдаёт их как есть (garbage ethertype). Если после
+                                                этого появятся rx DATA — значит RX блокировала
+                                                дешифровка (ключ не найден). Вернуть 0xCC. */
+                                             h3_sdc_write_wlan_reg8(0x0680, 0xC4);
                                             /* W.459 [диагностика]: дамп CAM после загрузки ключей.
                                                seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
                                                реально активны; camcmd 0x0670 покажет занятость. */
