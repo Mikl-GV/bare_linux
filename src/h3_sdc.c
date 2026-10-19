@@ -4074,18 +4074,22 @@ body[0]  = 0x02;                             /* RSN */
      CAM_POLLINIG = BIT31, CAM_WRITE = BIT16, CAM_VALID = BIT15
      CAM_AES = 0x04, CAM_CONTENT_COUNT = 8
    addr — номер записи CAM (pairwise: номер по MAC, group: 0/1..3).
-   mac[6] — адрес (для pairwise — BSSID AP; для GTK — 0/broadcast).
-   key[16] — 128-бит ключ (CCMP). */
+   mac[6] — адрес (pairwise — BSSID AP; для GTK-default — ВСЕ НУЛИ, см.
+     драйвер rtw_mlme_ext.c:14186-14189: cam_id<=3 -> addr=null_addr).
+   key[16] — 128-бит ключ (CCMP).
+   is_group — 1 для GTK (default/group key): добавить BIT6 (флаг group key)
+     в слово управления, как у драйвера ctrl = BIT15|BIT6|alg<<2|keyid
+     (rtw_mlme_ext.c:14214). Без BIT6 и null-addr чип не находит групповой
+     ключ для расшифровки broadcast-кадров (DHCP OFFER на ff:ff:ff:ff:ff:ff). */
 static void wpa_cam_write_key(uint8_t addr, const uint8_t *mac,
-                              const uint8_t *key)
+                              const uint8_t *key, int is_group)
 {
     uint32_t ulContent;
-    /* Заполнение 8 контент-слов; слово 0 содержит CAM ID + algorithm + valid
-       + первые 4 байта MAC, затем ключ по 4 байта/слово. */
     for (int i = 0; i < (int)CAM_CONTENT_COUNT; i++) {
         ulContent = 0;
         if (i == 0) {
             ulContent = (addr & 0x03) | ((uint32_t)CAM_AES << 2) | CAM_VALID;
+            if (is_group) ulContent |= (1u << 6);   /* BIT6 = group/default key */
             ulContent |= (uint32_t)mac[0] << 16;
             ulContent |= (uint32_t)mac[1] << 24;
         } else if (i == 1) {
@@ -4640,9 +4644,18 @@ int h3_wifi_join_ap(void)
                                             /* Установить ключи в CAM чипа:
                                                pairwise TK = ptk[32..48) (AES-CCMP),
                                                group GTK = gtk[0..glen). */
-                                            wpa_cam_write_key(4, join_target.bssid,
-                                                              join_target.ptk + 32);
-                                            wpa_cam_write_key(0, join_target.bssid, gtk);
+                                            /* W.442/468: pairwise TK = ptk[32..48) (AES-CCMP) — unicast, ищется
+                                               по BSSID AP. */
+                                            {
+                                                uint8_t macz[6] = {0,0,0,0,0,0};
+                                                wpa_cam_write_key(4, join_target.bssid,
+                                                                  join_target.ptk + 32, 0);
+                                                /* W.468: GTK = group/default key (cam 0): пишем
+                                                   с null-addr + BIT6 (group), как драйвер
+                                                   rtw_mlme_ext.c:14214 — иначе чип не найдёт ключ
+                                                   для broadcast (DHCP OFFER на ff:ff:ff:ff:ff:ff). */
+                                                wpa_cam_write_key(0, macz, gtk, 1);
+                                            }
                                             /* W.462: включить CCMP TxEnc/RxDec в чипе — БЕЗ этого
                                                даже с ключами в CAM чип физически НЕ шифрует/дешифрует.
                                                REG_SECCFG (0x680) = 0xCF (как драйвер 8188F в STA при
