@@ -3840,7 +3840,23 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     buf[0] = (uint8_t)(p & 0xFF);
     buf[1] = (uint8_t)((p >> 8) & 0xFF);
 
-    /* W.507: диагностика tx fc/rate/qos убрана из hot-path (подтверждена в W.504). */
+    /* W.513: вернули строку фактических полей кадра (fc/rate/use/qos/sec/len)
+       — одна строка на DHCP, нужна для сверки с эталоном. */
+    if (ethertype == 0x0800) {
+        uart_print("  tx fc=0x");
+        uart_print_hex((uint32_t)(f[0] | ((uint32_t)f[1] << 8)));
+        uart_print(" rate=0x");
+        uart_print_hex((uint32_t)buf[16]);
+        uart_print(" use=");
+        uart_print_int((int)(buf[13] & 1));
+        uart_print(" qos=0x");
+        uart_print_hex((uint32_t)(qos_data ? (f[24] | ((uint32_t)f[25] << 8)) : 0xFFFFu));
+        uart_print(" sec=");
+        uart_print_int((int)((buf[6] >> 6) & 0x3));
+        uart_print(" len=");
+        uart_print_int((int)p);
+        uart_print("\r\n");
+    }
 
     /* W.498 [корневой фикс]: TX-страница чипа = 128 байт
        (rtl8189fs_xmit.c:612: pg_num = (len+127)/128). Раньше ждали всего
