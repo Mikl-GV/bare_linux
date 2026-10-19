@@ -3767,11 +3767,13 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
 
     /* tx_desc: как у драйвера для data (rtl8188f_fill_default_txdesc). */
     buf[2] = 40u;                                       /* OFFSET = 40 */
-    /* W.488 [фикс]: BMC (txdesc byte3 bit0) = 1 только для broadcast.
-       Раньше BMC=1 стоял всегда → чип шифровал unicast-данные (DISCOVER)
-       групповым ключом GTK, а AP ждала pairwise и отбрасывала кадр.
-       Данные шлём unicast на BSSID, поэтому BMC=0. */
+    /* W.490 [тест]: DHCP (0x0800) шлём broadcast на ff:ff → чип берёт групповой
+       ключ GTK (TXBCUSEDK). Так проверяем, работает ли GTK-TX: если OFFER придёт,
+       значит pairwise-шифрование unicast TX сломано, а group — работает.
+       EAPOL (0x888E) остаётся unicast на BSSID без шифрования. */
+    int dhcp_bcast = (ethertype == 0x0800);
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
+    if (dhcp_bcast) buf[3] |= (1u << 0);                     /* BMC (byte3 bit0) */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
     /* W.485: EAPOL (msg2/msg4) отправляем на 6M OFDM (DESC_RATE6M=0x0C), а не
        CCK 1M по умолчанию. Часть AP (Samsung A05s hotspot) не декодирует наши
@@ -3802,7 +3804,11 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
            txdesc[6]; биты[23:22] = биты 7,6 байта txdesc[6]. 0x3 = 11. */
         buf[6] = (uint8_t)((buf[6] & 0x3Fu) | 0xC0u);   /* SEC_TYPE bits = 0b11 */
     }
-    for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
+    if (dhcp_bcast) {
+        for (i = 0; i < 6; i++) { f[4+i] = 0xFF; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
+    } else {
+        for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
+    }
     f[22] = 0; f[23] = 0;          /* seq */
 
     uint32_t p = 24;
