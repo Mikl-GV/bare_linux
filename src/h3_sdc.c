@@ -3790,7 +3790,12 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
        в CAM и seccfg=0xCF. EAPOL msg4 НЕ защищается (уходит до установки
        ключей на AP), поэтому для ethertype 0x888E Protected и SEC_TYPE не
        ставятся. */
-    if (join_target.secure && ethertype != 0x888E) {
+    /* W.497 [развилочный тест]: DHCP (0x0800) временно отправляем БЕЗ
+       шифрования (без Protected/SEC_TYPE). Если очередь начнёт освобождаться
+       (txempty bit0=1, loq>0) — значит чип не мог зашифровать кадр и держал
+       его в LOQ (проблема с ключом/CAM для TX). Если и так висит — проблема в
+       очереди/дескрипторе, а не в ключе. */
+    if (join_target.secure && ethertype != 0x888E && ethertype != 0x0800) {
         f[1] |= 0x40;              /* Protected (fc bit11) */
         /* SEC_TYPE = AES (0x3): SET_BITS_TO_LE_4BYTE(pDesc+4,22,2,val) —
            LE 32-бит слово на байтах txdesc[4..7]; бит22 = бит6 байта
