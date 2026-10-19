@@ -4484,7 +4484,9 @@ int h3_wifi_join_ap(void)
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
 
-        while (waited < 1500) {   /* W.450: сокращён с 5000 — точка сбрасывает «зависшего» клиента */
+        while (waited < 6000) {   /* W.469: увеличено 1500→6000 — DHCP OFFER на WPA2 после
+                                4-way идёт broadcast и может прийти с задержкой; окно 3с
+                                было мало (MTS eapol=2, но OFFER не успевал) */
             /* W.459: первый DISCOVER ушёл plaintext ДО установки PTK — AP его дропнул
                (после WPA2 ждёт только CCMP-encrypted data). Пересылаем DISCOVER сразу
                после полного 4-way (wpa2_done=1) — теперь чип зашифрует его TK. */
@@ -4590,10 +4592,14 @@ int h3_wifi_join_ap(void)
                                         uart_print("\r\n");
                                     }
                                 }
-                                /* W.450: msg3 (GTK) — AP приняла наш msg2. Key ACK + Encrypted Key Data
+/* W.450/W.469: msg3 (GTK) — AP приняла наш msg2. Key ACK + Encrypted Key Data
                                    установлены; GTK в key_data (wrapped, AES-Key-Wrap
-                                   по KEK=ptk[16..32)). Распаковываем GTK. */
-                                if ((kinfo & 0x0080) && (kinfo & 0x1000) && join_target.have_msg1 == 1) {
+                                   по KEK=ptk[16..32)). Распаковываем GTK.
+                                   W.469: при have_msg1==2 (msg3 уже обработан) НЕ игнорируем
+                                   повторный msg3 — AP ретраит его, пока не примет msg4.
+                                   Дублирующий GTK unwrap безопасен (idempotent); главное —
+                                   ответить msg4 на КАЖДЫЙ msg3, иначе AP висит (A05s eapol=5). */
+                                if ((kinfo & 0x0080) && (kinfo & 0x1000) && join_target.have_msg1 >= 1) {
                                     uint16_t kd_len = (uint16_t)((rxbuf[dp+12+93]<<8)|rxbuf[dp+12+94]);
                                     uart_print("    EAPOL msg3 (GTK) kd_len=");
                                     uart_print_int((int)kd_len);
