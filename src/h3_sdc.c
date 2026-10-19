@@ -4593,8 +4593,14 @@ int h3_wifi_join_ap(void)
                НЕ инициирует 4-way сама, если клиент молчит после AssocResp.
                Шлём EAPOL-Start (ver=1,type=1, len=0) как plaintext trigger,
                чтобы AP отправила EAPOL-Key msg1. */
-            uint8_t eapol_start[4] = {0x01, 0x01, 0x00, 0x00};
-            h3_wifi_tx_data(0x888E, eapol_start, 4);
+            /* W.506 [тест длины]: EAPOL-Start шлём 300 байт (первые 4 значимые,
+               остальное нули). Если AP всё равно ответит msg1 — длинные кадры
+               доходят, и проблема DISCOVER в содержимом; если msg1 не придёт —
+               не доставляются длинные (>~200Б) кадры. */
+            uint8_t eapol_start[300];
+            for (int z = 0; z < 300; z++) eapol_start[z] = 0;
+            eapol_start[0] = 0x01; eapol_start[1] = 0x01;
+            h3_wifi_tx_data(0x888E, eapol_start, 300);
             uart_print("  join: wpa2 net — dhcp deferred, eapol-start sent\r\n");
         }
         int eapol_count = 0;
