@@ -4115,12 +4115,13 @@ static void wpa_cam_write_key(uint8_t addr, const uint8_t *mac,
         h3_sdc_write_wlan_reg32(0x0674, ulContent);        /* WCAMI */
         h3_sdc_write_wlan_reg32(0x0670, CAM_POLLINIG | CAM_WRITE |
                                 ((uint32_t)CAM_CONTENT_COUNT * addr + (uint32_t)i));
-        /* wait polling bit clears */
-        for (int p = 0; p < 1000; p++) {
+        /* wait polling bit clears. W.484: 1000x10мс = до 10 с на слово при
+           залипании POLLINIG, что рвало тайминги 4-way. 100x1мс достаточно. */
+        for (int p = 0; p < 100; p++) {
             uint32_t rd = 0;
             h3_sdc_read_wlan_reg32(0x0670, &rd);
             if (!(rd & CAM_POLLINIG)) break;
-            udelay(10);
+            udelay(1);
         }
     }
 }
@@ -4733,32 +4734,30 @@ int h3_wifi_join_ap(void)
                                                     uart_print(" gtk_from=");
                                                     uart_print_int((int)gk_off);
                                                 }
-                                                wpa_cam_write_key(0, macz, gk, 1);
-                                                /* W.472/481 [диагностика: CAM readback] — по эталону драйвера rtw_sec_read_cam:
-                                                   командa чтения = CAM_POLLINIG|CAM_READ|addr (0x670),
-                                                   ждать POLLINIG=0, данные из REG_CAMREAD(0x678).
-                                                   Полный дамп всех 8 слов для entry 0 (GTK) и 4 (pairwise). */
-                                                for (int cam_slot = 0; cam_slot < 8; cam_slot += 4) {
-                                                    uart_print(" cam");
-                                                    uart_print_int(cam_slot);
-                                                    uart_print("=");
-                                                    for (int w = 0; w < 8; w++) {
-                                                        uint32_t addr_w = (uint32_t)(cam_slot * 8 + w);
-                                                        h3_sdc_write_wlan_reg32(0x0670,
-                                                            CAM_POLLINIG | CAM_READ | addr_w);
-                                                        for (int p = 0; p < 1000; p++) {
-                                                            uint32_t rd = 0;
-                                                            h3_sdc_read_wlan_reg32(0x0670, &rd);
-                                                            if (!(rd & CAM_POLLINIG)) break;
-                                                            udelay(10);
-                                                        }
-                                                        uint32_t cv = 0;
-                                                        h3_sdc_read_wlan_reg32(0x0678, &cv);
-                                                        if (w) uart_print(":");
-                                                        uart_print_hex(cv);
-                                                    }
-                                                    uart_print(" ");
-                                                }
+                                                 wpa_cam_write_key(0, macz, gk, 1);
+                                                 /* W.484: readback сокращён до word0 двух слотов.
+                                                    Прежний полный дамп 16 слов с поллингом до 10 с/слово
+                                                    давал десятки секунд паузы в логе и срывал тайминги.
+                                                    word0 достаточно, чтобы подтвердить раскладку:
+                                                    slot0 (GTK) = VALID|AES|GROUP, MAC=00:00;
+                                                    slot4 (pairwise) = VALID|AES, MAC=BSSID. */
+                                                 for (int cam_slot = 0; cam_slot < 8; cam_slot += 4) {
+                                                     uint32_t addr_w = (uint32_t)(cam_slot * 8);
+                                                     h3_sdc_write_wlan_reg32(0x0670,
+                                                         CAM_POLLINIG | CAM_READ | addr_w);
+                                                     for (int p = 0; p < 100; p++) {
+                                                         uint32_t rd = 0;
+                                                         h3_sdc_read_wlan_reg32(0x0670, &rd);
+                                                         if (!(rd & CAM_POLLINIG)) break;
+                                                         udelay(1);
+                                                     }
+                                                     uint32_t cv = 0;
+                                                     h3_sdc_read_wlan_reg32(0x0678, &cv);
+                                                     uart_print(" cam");
+                                                     uart_print_int(cam_slot);
+                                                     uart_print("=");
+                                                     uart_print_hex(cv);
+                                                 }
                                             }
                                             /* W.462: включить CCMP TxEnc/RxDec в чипе — БЕЗ этого
                                                даже с ключами в CAM чип физически НЕ шифрует/дешифрует.
