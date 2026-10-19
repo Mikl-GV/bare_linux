@@ -1,8 +1,8 @@
-# Промпт для следующего чата (продолжение WiFi-этапа: ассоциация)
+# Промпт для следующего чата (продолжение WiFi-этапа: DHCP после WPA2)
 
 > Вставьте этот текст в начало нового чата с MultiTool, чтобы восстановить контекст.
-> Дата: 2026-10-18. Проект: `E:\Giga_1\Bare_linux` (Allwinner H3, Orange Pi Lite, RTL8189FTV по SDIO).
-> Точка стенда: **W.338**. Рабочая точка git: коммит `a528029` (пушнут).
+> Дата: 2026-10-19. Проект: `E:\Giga_1\Bare_linux` (Allwinner H3, Orange Pi Lite, RTL8189FTV по SDIO).
+> Точка стенда: **W.459**. Рабочая точка git: коммит `369c018` (пушнут); правки W.459 в рабочем дереве.
 
 ---
 
@@ -13,45 +13,32 @@
 (полный, с поддержкой 8188F; версия v4.3.24_15589.20151023 — та же, что в
 эталонном образе Lakka 2.3.1, ядро 4.14.18). Сравнивай ТОЛЬКО с ним.
 
-## Текущее состояние (подтверждено на стенде, W.338)
+## Текущее состояние (подтверждено на стенде, W.458/W.459)
 
-**RX-приём РАБОТАЕТ. Парсер извлекает beacon и SSID из реального эфира на всех
-13 каналах:**
+**Ассоциация к открытым и WPA2-сетям + полный 4-way handshake WPA2 РАБОТАЮТ.**
 
-```
-rx: t=1 ch=2 rxlen=0x3D4 ... BCN plen=0x10F ch=2 ssid=midea_b8_6515
-```
-
-Полная цепочка инициализации работает 1:1 с драйвером:
-1. SDIO (1-bit/50 МГц — рабочая шина стенда; 4-bit ломает CMD53): CMD5→CMD3→
-   CMD7, chip_id (manf=0x024C, card=0xF179), PowerSeq CARDEMU→ACTIVE, Fn1,
-   загрузка FW (fwdl rc=0, MCUFWDL=0xC6 штатное), eFuse/программный MAC.
-2. Конфигурация: MAC_REG + BB-конфиг + AGC + RF RadioA (пропуск записи 0x18)
-   + LSSI + LCK + RFMOD(0x800)=0x83045700 + IQK (Tx OK/Rx OK).
-3. RX-конфиг: RQPN/NPQ → TX-границы → LLT → rx_bndy → BWOPMODE → SIFS/RL/EDCA →
-   PBP/DRVINFO → NETTYPE_AP → RCR → RRSR → RXFLTMAP → MAR → RXDMA agg → REG_CR →
-   HSIMR/C2H clear → HIMR → HISR clear → H2C SET_PWR_MODE → CCCR/FBR INT →
-   antenna_sel (LEDCFG2 |= BIT7).
-4. **RPWM/CPWM/HIMR/HISR — через fn1** (SDIO-local, не fn0): cpwm=0x80 (tog_sw=1),
-   HIMR=0x01. Эксперимент W.338: запись 0xCC в HRPWM1 → readback 0xCC, но CPWM
-   state[3:0] всё равно 0 — ACK на связке только через toggle.
-5. **JOINBSS-движок** (W.332-W.338): host передаёт Auth/AssocReq кадры (не
-   H2C 0x23 — это P2P_LPS_PARAM); захват BSSID+channel из скана
-   (`join: bssid=A4:2A:26:0F:B9:61 ch=2`), вызов из пункта меню Transfer с
-   Retry (3 скана). `join: rc=0` = Auth+AssocReq отправлены (не подтверждённый
-   коннект).
+- Полный 802.11 join (rc=0, MSR=STA) к A05s и к WPA2-сетям (A05s закрытая,
+  pass `8645449Qq`, и MTS_GPON_9290e0).
+- **WPA2 4-way доведён до конца** (лог W.458, 3 повтора стабильно):
+  `msg2 tx rc=0` (AP принял) → `EAPOL msg3 (GTK) gtk_ok len=48` (RFC3394 unwrap) →
+  `msg4 tx rc=0` → `cam keys loaded` (PTK/GTK в CAM чипа).
+- Правки W.459 в рабочем дереве:
+  1. **msg4 key_info = 0x030A** (вер2|pairwise|MIC|**secure**) — было 0x0042 (без
+     Secure-бита), из-за чего AP не принимал msg4 и повторял msg3.
+  2. msg4: Nonce=0, EAPOL ver=1, replay из msg3, key_len=0.
+  3. DHCP DISCOVER пересылается **после** handshake (wpa2_done) — первый ушёл
+     plaintext до PTK и был дропнут AP.
+  4. Диагностика после загрузки ключей: дамп `cam: seccfg=0x0680 camcmd=0x0670`.
 
 ## Симптом (что осталось неработающим)
 
-```
-rx: c2h_ping 0x1A0=0 payload=0 hisr=0x21 rxpk=... C2H-ABSENT  <- C2H не идёт
-```
+После `cam keys loaded` AP продолжал повторять msg3 (не принимал msg4), поэтому
+DHCP OFFER не приходил (`WPA2 pending (eapol=3), no DHCP/IP`). W.459 лечит это
+правкой key_info msg4; после неё ждём завершения handshake и DHCP OFFER.
 
-Приём это НЕ блокирует (SSID получен). Эксперимент W.338 снял версию «FW не в
-ACTIVE из-за маски RPWM»: даже запись 0xCC не даёт state в CPWM. Следующий шаг —
-**host-ассоциация**: обработать Auth/AssocResp из RX-пути (fc=0xB1/0x11 от
-целевого BSSID), перевести MSR в STA-режим — для цели «эмулятор + сетевой
-доступ к ROM на SD» (фикс IP 192.168.x.199).
+Следующий шаг — **добиться DHCP OFFER на WPA2-сети** (после `cam keys loaded`
+DISCOVER переслан зашифрованным CCMP) → IP 10.72.75.x → пинг с ПК. Цель —
+«эмулятор + сетевой доступ к ROM на SD».
 
 ## Критические предостережения (не наступить дважды)
 
@@ -74,13 +61,14 @@ ACTIVE из-за маски RPWM»: даже запись 0xCC не даёт sta
   в этом build = 0). SSID = IE id=0.
 - CrystalCap (0x24): маска `~0x007FF800`, `cc=(cs<<6)|cs`, `(cc<<11)`.
 - Шина стенда: 1-bit/50 МГц (4-bit ломает CMD53 data-фазу).
-- Сборка: **`make` без `-j`** (иначе bump_version гоняется параллельно с
-  компиляцией main.o и версия в bin не совпадает с version.h). После сборки
-  проверять `strings h3_bare.bin | grep 'W\.[0-9]'`.
+- Сборка: **`make -j` многопоточно** (AGENTS.md); bump_version идёт в Makefile
+  отдельным таргетом. После сборки проверять `strings h3_bare.bin | grep 'W\.[0-9]'`
+  и что `FW_VERSION_STR`= последней W.minor (версия бампается автоматически при
+  каждой сборке).
 - **Бэкапы (`*.bak`) хранить в `backups/` в корне**, не в src/.
 - Методика: один шаг → лог → анализ; после успеха — комментарии+доки+git+тег.
 
 ## Git
 
-Рабочая точка: `a528029` (W.338, пушнут в origin/main). Текущая разработка —
-обработка Auth/AssocResp для ассоциации — в рабочем дереве.
+Рабочая точка: `369c018` (W.441-W.458, пушнут в origin/main). Правки W.459
+(msg4 secure bit, DHCP resend, CAM-дамп) — в рабочем дереве, будут в след. коммите.

@@ -8,15 +8,15 @@
 к WiFi-чипу RTL8189FTV (приём эфира, сканирование beacon/SSID)**. В планах —
 превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние (W.413): **полная host-ассоциация работает end-to-end**.
-> Ассоциация к любой сети из скана (AuthResp=0 → AssocReq → AssocResp=0 →
-> MSR=STA, rc=0), в т.ч. к открытой A05s и к WPA2 (MTS_GPON_9290e0, RSN IE 22
-> байта) — к WPA2 происходит assoc и AP инициирует 4-way (EAPOL-Key msg1 в RX,
-> etype=0x888E). Приём data-кадров после assoc (ARP/IPv6) подтверждён; ethertype
-> парсится big-endian. Отправка DHCP DISCOVER корректна (IP proto=UDP, len=278,
-> flags=0x8000). Криптоядро WPA2 host-supplicant (SHA-1/HMAC-SHA1/PBKDF2/PRF/MIC —
-> проверено на хосте). Реализованы: скан 13 каналов (канал AP из DS Parameter Set
-> IE), фикса недетерминизма повторных join (deauth при смене BSSID, drain RX FIFO).
+> Рабочее состояние (W.459): **полная host-ассоциация + завершённый 4-way
+> handshake WPA2 работают end-to-end**.
+> К любой сети из скана проходит ассоциация (AuthResp=0 → AssocReq → AssocResp=0 →
+> MSR=STA, rc=0). К открытым и WPA2-сетям (A05s, MTS_GPON_9290e0). Криптоядро
+> host-supplicant (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap —
+> проверено на хосте). Против WPA2-AP 4-way handshake доведён до конца:
+> EAPOL msg1 → msg2 (принят AP) → msg3 (GTK unwrap OK) → msg4 (tx rc=0) →
+> PTK/GTK в CAM чипа (`cam keys loaded`). DHCP DISCOVER после handshake
+> пересылается зашифрованным (CCMP). Стадия «получить DHCP OFFER → IP» — в работе.
 > Шина SDIO — 1-bit/50 МГц (4-bit ломает data-фазу CMD53). host не тянет
 > многоблочный SDIO read (только 1 блок/CMD53).
 
@@ -28,7 +28,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join (rc=0, MSR=STA) к открытой и WPA2-сети; assoc к WPA2 принят (EAPOL msg1 приходит); data-приём после assoc (ARP/IPv6); DHCP DISCOVER уходит корректно; дальше WPA2 4-way handshake (для IP на WPA2-сети). |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join (rc=0, MSR=STA) к открытой и WPA2-сети; **WPA2 4-way handshake завершён** (msg1→msg2→msg3 GTK unwrap→msg4, PTK/GTK в CAM); DHCP DISCOVER переслан после handshake; ждём DHCP OFFER → IP. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -55,12 +55,13 @@
    (rc=0, MSR=STA) к открытым и WPA2-сетям; при смене BSSID шлётся deauth
    и выполняется drain RX FIFO перед новым auth (фикс flaky rc=-4).
 8. **DHCP (W.395-W.410)**: после assoc отправляется DHCP DISCOVER
-   (IP proto=UDP, broadcast, len=278); приём data-кадров после assoc
-   (ARP/IPv6) подтверждён; OFFER ожидается до 5 с. IP-цель — x.x.x.199.
-9. **WPA2 (W.412-W.413)**: криптоядро host-supplicant готово; к WPA2-сети
-   assoc принимается и AP инициирует 4-way (EAPOL-Key msg1 в RX, парсится
-   по RFC 4137: kinfo/keylen/ANonce). Сам 4-way handshake (msg2/msg3/msg4 +
-   ключи в CAM) — в работе.
+   (IP proto=UDP, broadcast); приём data-кадров после assoc (ARP/IPv6)
+   подтверждён. При WPA2 — пересылается после handshake (зашифрованный CCMP).
+   Цель — IP от AP (из yiaddr OFFER).
+9. **WPA2 (W.412-W.459)**: криптоядро host-supplicant готово; против WPA2-AP
+   проходит полный 4-way handshake: EAPOL msg1 → msg2 (принят AP, nonce min/max
+   фикс) → msg3 (GTK unwrap через RFC3394) → msg4 (key_info 0x030A, secure bit)
+   → PTK/GTK в CAM чипа. Handshake завершён; DHCP OFFER после него — в работе.
 
 ### Известные ограничения (W.338+)
 
@@ -77,11 +78,11 @@
   RX FIFO; парсер проходит по цепочке кадров (24+drvsz+plen, round 8).
 - **C2H-ABSENT**: FW не отдаёт C2H-пакеты в scan/связанном состоянии по
   причине, зависящей от power-state. Ассоциация идёт host-кадрами
-  Auth/Assoc через RX-путь; C2H понадобится для WPA (подтверждение 4-way).
+  Auth/Assoc через RX-путь.
 
-Ближайшие шаги: **WPA2 4-way handshake** к MTS_GPON_9290e0 (msg2/msg3/msg4 +
-установка PTK/GTK в CAM чипа; криптоядро готово), затем DHCP/IP на WPA2-сети
-(x.x.x.199) и пинг с ПК. Цель — «эмулятор + сетевой доступ к ROM на SD».
+Ближайший шаг: добиться **DHCP OFFER после WPA2 handshake** (после `cam keys
+loaded` DISCOVER пересылается зашифрованным CCMP; ждём OFFER → IP 10.72.75.x),
+затем пинг с ПК. Цель — «эмулятор + сетевой доступ к ROM на SD».
 Подробности: `NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
 
 ---
@@ -111,7 +112,7 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ на 0
 - Сборка многопоточная при желании: `make -j8 bin`.
 - Версия прошивки (`FW vW.xxx`) авто-инкрементируется при сборке
   (`tools/scripts/bump_version.sh`), выводится по UART и на экран.
-- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~67 КБ).
+- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~88 КБ).
 
 ## Заливка
 
@@ -165,15 +166,23 @@ Makefile       сборка (MSYS2 make, arm-none-eabi-gcc)
 | `HARDWARE-REF.md` | Аппаратная справка: регистры H3, звук, DMA, JTAG, WiFi/SDIO/RF. |
 | `KNOWLEDGE.md` | База знаний: проверенные факты, источники, уроки отладки. |
 | `REGISTER-MAP.md` | Снимки значений регистров со стенда (эталон). |
-| `NEXT-CHAT-PROMPT.md` | Контекст для продолжения разработки (WiFi: шина SDIO, RF-калибровки, RX). |
+| `NEXT-CHAT-PROMPT.md` | Контекст для продолжения разработки (WiFi: ассоциация, WPA2 4-way, DHCP). |
 | `HARDWARE-WIFI.md` | Справка по чипу RTL8189FTV и драйверу. |
 
 ## Git / точки восстановления
 
-Каждая рабочая точка фиксируется тегом:
+Каждая рабочая точка фиксируется коммитом (в `origin/main`) и, для ключевых
+вех, тегом. Последняя точка восстановления — **W.459** (4-way handshake WPA2
+завершён; коммиты `369c018` и последующий). Лог ветки:
 
 ```
-restore-W099-fw-ok     звук + базовый каркас (после чистки репо)
+git log --oneline -15
+```
+
+Примеры ранних тегов:
+
+```
+restore-W099-fw-ok     звук + базовый каркас
 w119-wifi-init         полная инициализация чипа (FW, MAC)
 w139-rf-lck            RF-часть: BB-конфиг, LSSI, калибровка LCK
 ```

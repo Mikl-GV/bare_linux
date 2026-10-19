@@ -32,8 +32,8 @@ int net_dhcp_discover(struct net_state *st)
     pkt[p++] = 0x00; pkt[p++] = 0x00;/* flags/frag */
     pkt[p++] = 0x40;                 /* TTL 64 (один байт, offset 8) */
     pkt[p++] = 0x11;                 /* protocol = UDP (offset 9) */
-    pkt[p++] = 0x00;                 /* ip csum hi (заполним ниже, offset 10) */
-    pkt[p++] = 0x00;                 /* ip csum lo (заполним ниже, offset 11) */
+    pkt[p++] = 0x00;                 /* ip csum hi (рассчитаем ниже) */
+    pkt[p++] = 0x00;                 /* ip csum lo (рассчитаем ниже) */
     /* src IP 0.0.0.0 */
     pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0;
     /* dst 255.255.255.255 */
@@ -71,9 +71,6 @@ int net_dhcp_discover(struct net_state *st)
     pkt[p++] = 55; pkt[p++] = 4; pkt[p++] = 1; pkt[p++] = 3; pkt[p++] = 6; pkt[p++] = 15;
     pkt[p++] = 255;                  /* END */
 
-    /* full IPv4 len = p */
-    uint16_t ip_off = 0;
-    (void)ip_off;
     /* total length поля: по реальному размеру пакета p (не фикс 328). */
     pkt[2] = (uint8_t)(p >> 8); pkt[3] = (uint8_t)p;
     /* W.407 [P3]: UDP length тоже по реальному размеру (p - IP header 20),

@@ -59,11 +59,10 @@ static struct {
        Задаётся через h3_wifi_set_passphrase. pass_len=0 = сеть открытая. */
     char passphrase[64];
     uint8_t pass_len;
-    /* W.??: состояние 4-way handshake (WPA2-PSK). Заполняется при приёме
+    /* 4-way handshake (WPA2-PSK): заполняется при приёме
        EAPOL-Key msg1; на основе PTK строится msg2. */
     uint8_t anonce[32];          /* AP nonce из msg1 */
     uint8_t replay[8];           /* replay counter из msg1 */
-    uint8_t eapol_version;       /* EAPOL/802.11 version из msg1 (обычно 1) — echo в msg2 */
     uint8_t have_msg1;           /* 1 = msg1 получен (обновить msg2 при следующем poll) */
     uint8_t ptk[48];             /* PTK: KCK[0..16) KEK[16..32) TK[32..48) */
     uint8_t pmk[32];             /* PSK->PMK, PBKDF2 */
@@ -3901,7 +3900,7 @@ static int h3_wifi_tx_deauth(const uint8_t *bssid, uint16_t reason)
     return tx_mgnt_cmd(f, 26);
 }
 
-/* W.??: построить и отправить EAPOL-Key msg2 (4-way, ответ на msg1).
+/* W.453: построить и отправить EAPOL-Key msg2 (4-way, ответ на msg1).
    Вычисляет PMK (PBKDF2 pass+ssid), PTK (PRF-512), SNonce, MIC (HMAC-SHA1
    по KCK). Кадр уходит через h3_wifi_tx_data(0x888E) — data-путь ToDS.
    Возвращает 0 при успешной отправке. */
@@ -4059,7 +4058,7 @@ body[0]  = 0x02;                             /* RSN */
 #define CAM_POLLINIG   (1u << 31)
 #endif
 
-/* W.??: записать ключ (PTK/TK или GTK) в CAM чипа (AES-CCMP, драйвер
+/* W.442: записать ключ (PTK/TK или GTK) в CAM чипа (AES-CCMP, драйвер
    rtw_sec_write_cam). Протокол 8188F:
      REG_CAMCMD  = 0x0670, REG_CAMWRITE = 0x0674
      CAM_POLLINIG = BIT31, CAM_WRITE = BIT16, CAM_VALID = BIT15
@@ -4474,8 +4473,18 @@ int h3_wifi_join_ap(void)
         uart_print("  join: dhcp discover send\r\n");
         net_dhcp_discover(&nst);
         int eapol_count = 0;
+        int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
+        int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
 
         while (waited < 1500) {   /* W.450: сокращён с 5000 — точка сбрасывает «зависшего» клиента */
+            /* W.459: первый DISCOVER ушёл plaintext ДО установки PTK — AP его дропнул
+               (после WPA2 ждёт только CCMP-encrypted data). Пересылаем DISCOVER сразу
+               после полного 4-way (wpa2_done=1) — теперь чип зашифрует его TK. */
+            if (wpa2_done && !dhcp_resent) {
+                uart_print("  join: dhcp discover (enc) resend\r\n");
+                net_dhcp_discover(&nst);
+                dhcp_resent = 1;
+            }
             if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
             if (acc == 0) { udelay(2000); waited += 2; continue; }
             uint32_t off = 0;
@@ -4547,7 +4556,7 @@ int h3_wifi_join_ap(void)
                                 uart_print(" anonce=");
                                 for (int aa = 0; aa < 6; aa++) { uart_print_hex((uint32_t)anonce[aa]); if (aa < 5) uart_print(":"); }
                                 uart_print("\r\n");
-                                /* W.??: сохранить msg1 для 4-way — ANonce + replay counter.
+                                /* W.447: сохранить msg1 для 4-way — ANonce + replay counter.
                                    Детект msg1: Key ACK (bit7=0x0080) установлен И
                                    Encrypted Key Data (bit12=0x1000) сброшен. msg3 (GTK)
                                    имеет Encrypted Key Data=1 и обрабатывается отдельно.
@@ -4563,9 +4572,8 @@ int h3_wifi_join_ap(void)
                                     uart_print("\r\n");
                                     for (int aa = 0; aa < 32; aa++) join_target.anonce[aa] = anonce[aa];
                                     for (int aa = 0; aa < 8; aa++) join_target.replay[aa] = rxbuf[dp+12+5+aa];
-                                    join_target.eapol_version = rxbuf[dp+8+0];   /* EAPOL/802.11 version из msg1 */
                                     join_target.have_msg1 = 1;
-                                    /* W.??: ответить msg2 (PMK/PTK/SNonce/MIC),
+                                    /* W.449: ответить msg2 (PMK/PTK/SNonce/MIC),
                                        затем ждать msg3 (GTK). */
                                     if (join_target.pass_len > 0) {
                                         int m2 = wpa_tx_msg2();
@@ -4574,7 +4582,7 @@ int h3_wifi_join_ap(void)
                                         uart_print("\r\n");
                                     }
                                 }
-                                /* W.??: msg3 (GTK) — AP приняла наш msg2. Key ACK + Encrypted Key Data
+                                /* W.450: msg3 (GTK) — AP приняла наш msg2. Key ACK + Encrypted Key Data
                                    установлены; GTK в key_data (wrapped, AES-Key-Wrap
                                    по KEK=ptk[16..32)). Распаковываем GTK. */
                                 if ((kinfo & 0x0080) && (kinfo & 0x1000) && join_target.have_msg1 == 1) {
@@ -4591,18 +4599,27 @@ int h3_wifi_join_ap(void)
                                             uart_print(" gtk_ok len=");
                                             uart_print_int((int)glen);
                                             join_target.have_msg1 = 2;   /* msg3 OK */
+                                            /* W.459: msg4 обязан нести replay-счётчик из msg3
+                                               (не из msg1). Захватываем здесь. */
+                                            for (int rr = 0; rr < 8; rr++)
+                                                join_target.replay[rr] = rxbuf[dp+12+5+rr];
                                             /* msg4: подтверждение (KeyMIC, без GTK).
-                                               key_info msg4 = 0x0042 (version2|keymic,
+                                               key_info msg4 = 0x030A (version2|keymic|secure,
                                                no install, no ack); replay из msg3. */
                                             uint8_t b4[95];
                                             for (int k = 0; k < 95; k++) b4[k] = 0;
                                             b4[0] = 0x02;
-                                            b4[1] = 0x00; b4[2] = 0x42;
-                                            b4[3] = 0x00; b4[4] = 0x10;   /* key len 16 */
-                                            for (int k = 0; k < 8; k++) b4[5+k] = join_target.replay[k];
-                                            for (int k = 0; k < 32; k++) b4[13+k] = join_target.snonce[k];
+                                            /* W.459 [фикс]: key_info msg4 = 0x030A — это ГЛАВНЫЙ
+                                               баг W.458. Было 0x0042 (Install|ver2, БЕЗ Secure), из-за
+                                               чего AP не принимал msg4 и повторял msg3. По 802.11i
+                                               msg4 обязан нести SECURE-бит: ver2(0x0002) | pairwise(0x0008)
+                                               | MIC(0x0100) | SECURE(0x0200) = 0x030A. */
+                                            b4[1] = 0x03; b4[2] = 0x0A;
+                                            b4[3] = 0x00; b4[4] = 0x00;   /* key_len 0 (msg4 без ключей) */
+                                            for (int k = 0; k < 8; k++) b4[5+k] = join_target.replay[k]; /* replay из msg3 */
+                                            for (int k = 0; k < 32; k++) b4[13+k] = 0;   /* Key Nonce = 0 (в msg4) */
                                             uint8_t p4[8+95];
-                                            p4[0] = 2; p4[1] = 3; p4[2] = 0; p4[3] = 95;
+                                            p4[0] = 1; p4[1] = 3; p4[2] = 0; p4[3] = 95;   /* W.459: EAPOL ver=1, как msg2 */
                                             for (int k = 0; k < 95; k++) p4[4+k] = b4[k];
                                             uint8_t m4[20];
                                             wpa_hmac_sha1(join_target.ptk, 16, p4, 4+95, m4);
@@ -4616,6 +4633,19 @@ int h3_wifi_join_ap(void)
                                             wpa_cam_write_key(4, join_target.bssid,
                                                               join_target.ptk + 32);
                                             wpa_cam_write_key(0, join_target.bssid, gtk);
+                                            /* W.459 [диагностика]: дамп CAM после загрузки ключей.
+                                               seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
+                                               реально активны; camcmd 0x0670 покажет занятость. */
+                                            {
+                                                uint8_t sec_cfg = 0, cam_cmd = 0;
+                                                h3_sdc_read_wlan_reg8(0x0680, &sec_cfg);
+                                                h3_sdc_read_wlan_reg8(0x0670, &cam_cmd);
+                                                uart_print(" cam: seccfg=0x");
+                                                uart_print_hex((uint32_t)sec_cfg);
+                                                uart_print(" camcmd=0x");
+                                                uart_print_hex((uint32_t)cam_cmd);
+                                                wpa2_done = 1;
+                                            }
                                             uart_print(" cam keys loaded\r\n");
                                         } else {
                                             uart_print(" gtk_unwrap_FAIL rc=");

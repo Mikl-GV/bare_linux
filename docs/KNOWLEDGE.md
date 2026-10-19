@@ -88,9 +88,12 @@
       host, не FW — issue_auth (opensystem) → issue_assocreq, ответ AP идёт
       в RX-путь. Реализован захват BSSID+channel цели из скана
       (`join: bssid=... ch=...`), вызов из пункта Transfer с Retry.
-    - **Осталось (W.338+)**: обработать Auth/AssocResp (fc=0xB1/0x11) из RX-пути
-      для подтверждения ассоциации, перевести MSR в STA-режим, затем TCP/IP
-      (фикс IP 192.168.x.199) — цель «эмулятор + сетевой доступ к ROM на SD».
+    - **Ассоциация + WPA2 4-way (W.369-W.459)**: полный join (AuthResp=0 →
+      AssocResp=0 → MSR=STA, rc=0) к открытым и WPA2-сетям; 4-way доведён до
+      конца (msg1→msg2 принят→msg3 GTK unwrap→msg4→PTK/GTK в CAM). Осталось:
+      добиться DHCP OFFER на WPA2-сети (после handshake DISCOVER переслан
+      зашифрованным CCMP) → IP 10.72.75.x → пинг с ПК — цель «эмулятор +
+      сетевой доступ к ROM на SD».
 
     Эталон D7: rtl8189fs-lakka-live-rx-dump-w7.md.
 

@@ -317,9 +317,10 @@ int wifi_layer_connect(int index)
        WPA2-AP уходит без Privacy+RSN (cap=1) и AP не ассоциирует (rc=-6). */
     h3_wifi_set_target_rsn(&ap);
     /* W.412: для WPA2-сети (rsn_len>0) зафиксировать PSK passphrase по SSID.
-       PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32) вычисляется при приёме
-       EAPOL msg1 в 4-way handshake. Сети известны заранее: A05s (тестовая,
-       пароль 8645449Qq), MTS_GPON_9290e0 (B236f8g4). */
+       PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32) предвычисляется сразу в
+       h3_wifi_set_passphrase (кэш, вне hot-path — чтобы не платить 5.5с на
+       первый msg1). Сети известны заранее: A05s (тестовая, пароль 8645449Qq),
+       MTS_GPON_9290e0 (B236f8g4). */
     if (ap.rsn_len > 0) {
         if (ap.ssid_len >= 4 &&
             ap.ssid[0]=='A' && ap.ssid[1]=='0' && ap.ssid[2]=='5' && ap.ssid[3]=='s')

@@ -2,12 +2,14 @@
 
 > Оранж Пи Лайт (Orange Pi Lite), SoC Allwinner H3 (SUN8I 1680, Cortex-A7).
 
-> **Версия:** 1.5
-> **Дата:** 2026-10-13
-> **Изменения (1.5):** WiFi-этап: RF-часть ожила — включение BB/RF по драйверу,
-> загрузка полного BB-конфига (209 рег.), LSSI-доступ к RF-регистрам (канал
-> читается/пишется) и калибровка LCK. Ранее (1.4): полная инициализация
-> RTL8189FTV — PowerSeq, fwdl rc=0, eFuse пуст, программный MAC в REG_MACID.
+> **Версия:** 1.7
+> **Дата:** 2026-10-19
+> **Изменения (1.7):** WiFi-этап: **ассоциация + полный 4-way handshake WPA2**
+> (W.369-W.459) — полный join (AuthResp=0→AssocResp=0→MSR=STA, rc=0) к открытым
+> и WPA2-сетям; криптоядро host-supplicant (SHA-1/HMAC/PBKDF2/PRF, AES-128,
+> RFC3394) и доведённый до конца 4-way (msg2 принят AP→msg3 GTK unwrap→msg4
+> secure→PTK/GTK в CAM). Ранее (1.5): полная инициализация RTL8189FTV — PowerSeq,
+> fwdl rc=0, eFuse пуст, программный MAC в REG_MACID.
 
 ---
 
@@ -22,6 +24,7 @@
 | 1.4 | 2026-10-13 | WiFi-этап: рабочая последовательность init чипа — PowerSeq до Fn1, fwdl rc=0, eFuse пуст, программный MAC в REG_MACID (mac_set=OK, readback совпал). CMD53: фикс хвостов (write/read) и noinc-доступ к 0x610/0x614. |
 | 1.5 | 2026-10-13 | WiFi-этап: RF-часть ожила — включение BB/RF по `PHY_BBConfig8188F`, загрузка полного BB-конфига (209 рег.), LSSI-доступ к RF (канал читается/пишется), калибровка **LCK**. |
 | 1.6 | 2026-10-18 | WiFi-этап: **RX-приём заработал** (W.316). Чип принимает beacon'ы эфира, парсер извлекает SSID. Причина прошлых «мёртвых» сессий: host SDIO H3 не тянет многоблочный read (30 блоков → rc=-1) и сдвиг смещения кадра в парсере (off+28 вместо off+24). |
+| 1.7 | 2026-10-19 | WiFi-этап (W.369-W.459): **ассоциация + полный 4-way handshake WPA2**. Полный join (AuthResp=0 → AssocResp=0 → MSR=STA, rc=0) к открытым и WPA2-сетям; криптоядро host-supplicant (SHA-1/HMAC/PBKDF2/PRF, AES-128, RFC3394 unwrap); 4-way доведён до конца (msg1→msg2 принят AP→msg3 GTK unwrap→msg4 secure→PTK/GTK в CAM). DHCP OFFER на WPA2-сети — в работе. |
 | 1.7 | 2026-10-18 | **Дисплей выведен с нуля** (W.328): полный порт DE2/TCON1/HDMI по u-boot, картинка на стенде без FB U-Boot. display_init в начале kmain. Меню: Sound test / Transfer (WiFi) / Settings; WiFi вынесен в отдельный слой `wifi_layer.c`, вызывается из пункта Transfer. |
 | 1.8 | 2026-10-18 | WiFi-этап (W.329-W.338): **RPWM/CPWM/HIMR/HISR через fn1** (SDIO-local, не fn0) — скан на всех 13 каналах, декодирование beacon/SSID стабильно. Эксперимент W.338: запись 0xCC в HRPWM1 даёт rb=0xCC, но CPWM state[3:0]=0 — ACK идёт только через toggle, маска 0xC1 у драйвера не баг. Реализован JOINBSS-движок (host Auth/AssocReq кадры, захват BSSID+channel из скана, Retry). Дальше — обработка Auth/AssocResp из RX-пути для подтверждения ассоциации (цель «эмулятор + сетевой доступ к ROM на SD», фикс IP 192.168.x.199). |
 
@@ -49,7 +52,8 @@
   (`BCN plen= ch= ssid=`). RPWM/CPWM/HIMR/HISR через fn1; реализован
   JOINBSS-движок (host Auth/AssocReq кадры, захват BSSID+channel из скана).
   Хост-чтение RX-FIFO — по 1 блоку (512 б)/CMD53 (host H3 не тянет многоблок).
-  Полный сетевой стек (ассоциация/WPA2/TCP/IP) — в разработке.
+  **Ассоциация (rc=0, MSR=STA)** и **полный 4-way handshake WPA2** (msg1→msg4,
+  PTK/GTK в CAM) работают; стадия DHCP OFFER → IP — в работе.
 
 ---
 
@@ -85,7 +89,7 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ гру
 ```
 
 - Артефакты: `h3_bare.elf`, `h3_bare.bin` (в корне проекта).
-- Размер бинаря ~10 КБ.
+- Размер бинаря ~88 КБ.
 
 ---
 
