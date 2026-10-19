@@ -3774,12 +3774,6 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     int l2bcast = (ethertype == 0x0800);   /* DHCP DISCOVER: addr3 = broadcast */
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
-    /* W.485: EAPOL (msg2/msg4) отправляем на 6M OFDM (DESC_RATE6M=0x0C), а не
-       CCK 1M по умолчанию. Часть AP (Samsung A05s hotspot) не декодирует наши
-       CCK data-кадры, хотя mgmt (auth/assoc) проходят. Это проверяет гипотезу
-       «rate» до правки RTS/ERP. Для IP-данных rate не трогаем. */
-    if (ethertype == 0x888E)
-        buf[16] = 0x0Cu;                                /* DESC_RATE6M */
 
     /* кадр с базы buf+40 */
     uint8_t *f = buf + 40;
@@ -4535,6 +4529,12 @@ int h3_wifi_join_ap(void)
                (после WPA2 ждёт только CCMP-encrypted data). Пересылаем DISCOVER сразу
                после полного 4-way (wpa2_done=1) — теперь чип зашифрует его TK. */
             if (wpa2_done && !dhcp_resent) {
+                /* W.493 [фикс по эталону]: после msg4 подождать, пока чип
+                   реально применит ключи из CAM, прежде чем слать DISCOVER в LOQ.
+                   Без паузы кадр мог уйти до активации PTK/GTK (запись в CAM и
+                   TX в LOQ асинхронны) и AP его не расшифровывал. Эталон в
+                   rtw_xmit.c также даёт задержку после 4-way до DHCP. */
+                udelay(100000);
                 uart_print("  join: dhcp discover (enc) resend\r\n");
                 net_dhcp_discover(&nst);
                 dhcp_resent = 1;
