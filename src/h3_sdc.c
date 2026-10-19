@@ -4529,16 +4529,29 @@ int h3_wifi_join_ap(void)
             /* W.459: первый DISCOVER ушёл plaintext ДО установки PTK — AP его дропнул
                (после WPA2 ждёт только CCMP-encrypted data). Пересылаем DISCOVER сразу
                после полного 4-way (wpa2_done=1) — теперь чип зашифрует его TK. */
-            if (wpa2_done && !dhcp_resent) {
-                /* W.493 [фикс по эталону]: после msg4 подождать, пока чип
-                   реально применит ключи из CAM, прежде чем слать DISCOVER в LOQ.
-                   Без паузы кадр мог уйти до активации PTK/GTK (запись в CAM и
-                   TX в LOQ асинхронны) и AP его не расшифровывал. Эталон в
-                   rtw_xmit.c также даёт задержку после 4-way до DHCP. */
-                udelay(100000);
-                uart_print("  join: dhcp discover (enc) resend\r\n");
+            /* W.495: DISCOVER шлём 3 раза с интервалом ~1 с (как стандартный
+               DHCP-клиент ретраит). Один потерянный кадр не должен убивать всю
+               попытку. Перед первой отправкой — 100 мс на применение ключей. */
+            if (wpa2_done && dhcp_resent < 3 && waited >= dhcp_resent * 1000) {
+                if (dhcp_resent == 0) udelay(100000);
+                uart_print("  join: dhcp discover (enc) #");
+                uart_print_int(dhcp_resent + 1);
+                uart_print("\r\n");
                 net_dhcp_discover(&nst);
-                dhcp_resent = 1;
+                dhcp_resent++;
+                /* W.495 [TX-диагностика]: TXPKT_EMPTY (0x041A) бит0=1 — очередь
+                   TX пуста (кадр ушёл в эфир). 0 — застрял в очереди.
+                   LOQ free pages — сколько страниц осталось. */
+                {
+                    uint8_t txe = 0xFF;
+                    int loq = h3_wifi_tx_free_pages_loq();
+                    h3_sdc_read_wlan_reg8(0x041A, &txe);
+                    uart_print("  join: tx-dbg txempty=0x");
+                    uart_print_hex((uint32_t)txe);
+                    uart_print(" loq=");
+                    uart_print_int(loq);
+                    uart_print("\r\n");
+                }
             }
             /* W.494 [диагностика RX]: через ~500 мс после DISCOVER прочитать
                счётчики приёма FW. RXPKT_NUM (0x0284): cnt[15:0]=пакетов в
