@@ -4597,13 +4597,19 @@ int h3_wifi_join_ap(void)
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
-        /* W.511: включить TX-report (REG_TX_RPT_CTRL 0x04EC, биты 1|5 —
-           как hal_com.c:1561). FW будет присылать C2H_CCX_TX_RPT (id 0x03)
-           в REG_C2HEVT (0x01A0) с флагом retry_over/lifetime_over. */
+        /* W.515: включить TX-report по эталону rtl8xxxu:
+           REG_TX_RPT_CTRL(0x04EC) |= BIT0 (enable report) | BIT1 (timer) | BIT5;
+           REG_TX_RPT_TIME(0x04F0) = 0xCDF0 (~168 мкс единиц).
+           FW будет присылать C2H_CCX_TX_RPT (id 0x03) в REG_C2HEVT (0x01A0). */
         {
             uint8_t tr = 0;
             h3_sdc_read_wlan_reg8(0x04EC, &tr);
-            h3_sdc_write_wlan_reg8(0x04EC, (uint8_t)(tr | 0x02u | 0x20u));
+            h3_sdc_write_wlan_reg8(0x04EC, (uint8_t)(tr | 0x01u | 0x02u | 0x20u));
+            h3_sdc_write_wlan_reg16(0x04F0, 0xCDF0);
+            uart_print("  join: txrpt ctrl=0x");
+            h3_sdc_read_wlan_reg8(0x04EC, &tr);
+            uart_print_hex((uint32_t)tr);
+            uart_print("\r\n");
         }
 
         while (waited < 6000) {   /* W.469: увеличено 1500→6000 — DHCP OFFER на WPA2 после
@@ -4635,7 +4641,7 @@ int h3_wifi_join_ap(void)
                     {
                         uint32_t c2h = 0;
                         int got = 0;
-                        for (int q = 0; q < 100; q++) {
+                        for (int q = 0; q < 500; q++) {
                             h3_sdc_read_wlan_reg32(0x01A0, &c2h);
                             if ((c2h & 0x0F) == 0x03) { got = 1; break; }
                             udelay(1000);
