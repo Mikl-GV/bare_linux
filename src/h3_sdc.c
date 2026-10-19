@@ -4656,11 +4656,21 @@ int h3_wifi_join_ap(void)
                                                 uint8_t macz[6] = {0,0,0,0,0,0};
                                                 wpa_cam_write_key(4, join_target.bssid,
                                                                   join_target.ptk + 32, 0);
-                                                /* W.468: GTK = group/default key (cam 0): пишем
-                                                   с null-addr + BIT6 (group), как драйвер
-                                                   rtw_mlme_ext.c:14214 — иначе чип не найдёт ключ
-                                                   для broadcast (DHCP OFFER на ff:ff:ff:ff:ff:ff). */
-                                                wpa_cam_write_key(0, macz, gtk, 1);
+                                                /* W.468/471: GTK = group/default key (cam 0), null-addr
+                                                   + BIT6 (group) — как драйвер rtw_mlme_ext.c:14214.
+                                                   W.471 [фикс]: распакованный key_data приходит в виде
+                                                   KDE (Key Data Encapsulation), сам GTK НЕ с байта 0:
+                                                     [0]=0xDD [1]=len(48) [2..5]=00 0F AC 01
+                                                     [6]=keyid [7]=reserved [8..23]=GTK(16 байт)
+                                                   Раньше писали gtk[0..16) = "DD 30 00 0F.." (заголовок)
+                                                   — чип получал мусор и не расшифровывал broadcast.
+                                                   Проверяем OUI и берём GTK со смещения 8. */
+                                                const uint8_t *gk = gtk;
+                                                if (glen >= 24 && gtk[0] == 0xDD &&
+                                                    gtk[2]==0x00 && gtk[3]==0x0F && gtk[4]==0xAC) {
+                                                    gk = gtk + 8;
+                                                }
+                                                wpa_cam_write_key(0, macz, gk, 1);
                                             }
                                             /* W.462: включить CCMP TxEnc/RxDec в чипе — БЕЗ этого
                                                даже с ключами в CAM чип физически НЕ шифрует/дешифрует.
