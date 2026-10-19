@@ -6,8 +6,8 @@
  * Формат: W.<minor>
  *   - minor инкрементируется при каждой сборке через make (tools/scripts/bump_version.sh).
  */
-#define FW_VERSION_MINOR 502
+#define FW_VERSION_MINOR 503
 
-#define FW_VERSION_STR  "W.502"
+#define FW_VERSION_STR  "W.503"
 
 #endif /* VERSION_H */

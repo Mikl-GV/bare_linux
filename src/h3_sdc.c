@@ -3781,6 +3781,14 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     int l2bcast = (ethertype == 0x0800);   /* DHCP DISCOVER: addr3 = broadcast */
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
+    /* W.503 [диагностика rate]: IPv4/DHCP отправляем на 6M OFDM (0x0C) вместо
+       CCK 1M по умолчанию. 4-way (EAPOL 1M) AP слышит, но data может требовать
+       OFDM-скорости (HT-AP). Проверяем: если OFFER появится — дело было в rate. */
+    if (ethertype == 0x0800) {
+        buf[16] = 0x0Cu;                                /* TX_RATE = DESC_RATE6M */
+        buf[13] |= 0x01u;                               /* USE_RATE (pDesc+12, bit8) —
+                                                           без него rate игнорируется */
+    }
 
     /* кадр с базы buf+40 */
     uint8_t *f = buf + 40;
