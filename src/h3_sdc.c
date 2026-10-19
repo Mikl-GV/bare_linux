@@ -3790,12 +3790,7 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
        в CAM и seccfg=0xCF. EAPOL msg4 НЕ защищается (уходит до установки
        ключей на AP), поэтому для ethertype 0x888E Protected и SEC_TYPE не
        ставятся. */
-    /* W.497 [развилочный тест]: DHCP (0x0800) временно отправляем БЕЗ
-       шифрования (без Protected/SEC_TYPE). Если очередь начнёт освобождаться
-       (txempty bit0=1, loq>0) — значит чип не мог зашифровать кадр и держал
-       его в LOQ (проблема с ключом/CAM для TX). Если и так висит — проблема в
-       очереди/дескрипторе, а не в ключе. */
-    if (join_target.secure && ethertype != 0x888E && ethertype != 0x0800) {
+    if (join_target.secure && ethertype != 0x888E) {
         f[1] |= 0x40;              /* Protected (fc bit11) */
         /* SEC_TYPE = AES (0x3): SET_BITS_TO_LE_4BYTE(pDesc+4,22,2,val) —
            LE 32-бит слово на байтах txdesc[4..7]; бит22 = бит6 байта
@@ -3820,17 +3815,36 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     buf[0] = (uint8_t)(p & 0xFF);
     buf[1] = (uint8_t)((p >> 8) & 0xFF);
 
-    /* ждать свободной страницы LOW (data)-очереди */
+    /* W.498 [корневой фикс]: TX-страница чипа = 128 байт
+       (rtl8189fs_xmit.c:612: pg_num = (len+127)/128). Раньше ждали всего
+       fp >= 1 и писали кадр, которому нужно больше страниц: msg2 (~196Б=2 стр)
+       проходил, а DISCOVER (~352Б=3 стр) не влезал в LOQ — висел, loq=0,
+       txempty bit0=0. Ждём ровно столько страниц, сколько нужно кадру. */
     uint32_t total = (40u + p + 3u) & ~3u;
+    int pg_needed = (int)((total + 127u) / 128u);
     int fp = -1;
-    for (int t = 0; t < 100; t++) {
+    for (int t = 0; t < 200; t++) {
         fp = h3_wifi_tx_free_pages_loq();
-        if (fp >= 1) break;
+        if (fp >= pg_needed) break;
         udelay(1000);
     }
-    if (fp < 1) return -2;
+    /* W.498 [fallback]: если LOW-страниц не хватает (у нас LPQ мал, ~2),
+       отправляем через HIQ (device 4) — там страниц много. HIQ в 8188F
+       обслуживает и data-кадры, если FW в активном режиме. */
+    int use_hiq = 0;
+    if (fp < pg_needed) {
+        use_hiq = 1;
+        for (int t = 0; t < 200; t++) {
+            fp = h3_wifi_tx_free_pages_hiq();
+            if (fp >= pg_needed) break;
+            udelay(1000);
+        }
+        if (fp < pg_needed) return -2;
+    }
 
-    uint32_t fifo_addr = (WLAN_TX_LOQ_DEVICE_ID_W220 << 13)
+    uint32_t tx_dev = use_hiq ? WLAN_TX_HIQ_DEVICE_ID_W220
+                              : WLAN_TX_LOQ_DEVICE_ID_W220;
+    uint32_t fifo_addr = (tx_dev << 13)
                        | ((total / 4) & 0x1FFFu);
     /* W.449 [W.450: спрятан] — tx dump печатался на каждую отправку (dhcp+msg2)
        и задерживал запись в HIQ. Оставлен в комментарии для справки:
@@ -4556,7 +4570,16 @@ int h3_wifi_join_ap(void)
                 uart_print("  join: dhcp discover (enc) #");
                 uart_print_int(dhcp_resent + 1);
                 uart_print("\r\n");
-                net_dhcp_discover(&nst);
+                {
+                    int drc = net_dhcp_discover(&nst);
+                    uart_print("  join: dhcp_tx rc=");
+                    uart_print_int(drc);
+                    uart_print(" loq=");
+                    uart_print_int(h3_wifi_tx_free_pages_loq());
+                    uart_print(" hiq=");
+                    uart_print_int(h3_wifi_tx_free_pages_hiq());
+                    uart_print("\r\n");
+                }
                 dhcp_resent++;
                 /* W.495 [TX-диагностика]: TXPKT_EMPTY (0x041A) бит0=1 — очередь
                    TX пуста (кадр ушёл в эфир). 0 — застрял в очереди.
