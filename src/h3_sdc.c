@@ -3925,7 +3925,6 @@ static int h3_wifi_tx_deauth(const uint8_t *bssid, uint16_t reason)
    Возвращает 0 при успешной отправке. */
 static int wpa_tx_msg2(void)
 {
-    uint32_t t_msg1 = micros();   /* W.453: замер latency msg1→msg2 */
     if (join_target.pass_len == 0 || !join_target.have_msg1)
         return -1;
 
@@ -4047,15 +4046,7 @@ body[0]  = 0x02;                             /* RSN */
     for (int i = 0; i < 8; i++) { uart_print_hex((uint32_t)pkt[4+77+i]); if (i < 7) uart_print(":"); }
     uart_print(" kdlen=");
     uart_print_int((int)kd_len);
-    uart_print(" anonce[32]=");
-    for (int i = 0; i < 32; i++) uart_print_hex((uint32_t)join_target.anonce[i]);
-    uart_print(" snonce[32]=");
-    for (int i = 0; i < 32; i++) uart_print_hex((uint32_t)join_target.snonce[i]);
-    uart_print(" kck=");
-    for (int i = 0; i < 16; i++) uart_print_hex((uint32_t)join_target.ptk[i]);
-    uart_print(" dt=");
-    uart_print_int((int)(micros() - t_msg1));
-    uart_print("us\r\n");
+    uart_print("\r\n");
     /* W.452: убраны тяжёлые дампы (kck[16]/snonce[32]/ssid/pmk) — выполняли
        диагностическую миссию в hot-path msg1→msg2 и забивали UART-буфер (4096Б),
        вызывая блокирующий flush (≈22мс на 256Б@115200) ПЕРЕД записью msg2 в HIQ;
@@ -4165,14 +4156,8 @@ int h3_wifi_tx_assoc_req(void)
     /* W.379: полный hex-дамп готового AssocReq-фрейма (без tx_desc), чтобы
        увидеть фактические байты, которые уходят в эфир — RSN-дамп не показал
        повреждения, но AP молчит именно с RSN IE (W.378). p = длина кадра. */
-    uart_print("  join: assoc-frm len=");
-    uart_print_int((int)p);
-    uart_print(":");
-    for (uint32_t i = 0; i < p && i < 96; i++) {
-        uart_print(" ");
-        uart_print_hex((uint32_t)f[i]);
-    }
-    uart_print("\r\n");
+    /* W.467: тяжёлый hex-дамп assoc-frm (до 96 слов) УБРАН — печатался в hot-path
+       перед Auth/Assoc и задерживал handshake (AP успевал ретраить), см. W.452. */
     return tx_mgnt_cmd(f, p);
 }
 
@@ -4649,15 +4634,9 @@ int h3_wifi_join_ap(void)
                                             int m4rc = h3_wifi_tx_data(0x888E, p4, 4+95);
                                             uart_print(" msg4 tx rc=");
                                             uart_print_int(m4rc);
-                                            /* W.464 [диагностика]: msg4 — что уходит в эфир. kinfo
-                                               должен = 0x030A (TYPE|KEY_TYPE|MIC|SECURE), replay =
-                                               из msg3, nonce=0, kd_len=0, MIC!=0. */
                                             uart_print(" kinfo=0x");
                                             uart_print_hex((uint32_t)((b4[1]<<8)|b4[2]));
-                                            uart_print(" replay=");
-                                            for (int k = 0; k < 8; k++) { uart_print_hex((uint32_t)b4[5+k]); if (k<7) uart_print(":"); }
-                                            uart_print(" kdlen=");
-                                            uart_print_int((int)((b4[93]<<8)|b4[94]));
+                                            uart_print("\r\n");
                                             /* Установить ключи в CAM чипа:
                                                pairwise TK = ptk[32..48) (AES-CCMP),
                                                group GTK = gtk[0..glen). */
