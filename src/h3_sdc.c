@@ -4185,26 +4185,30 @@ int h3_wifi_join_ap(void)
             if (cur[k] != join_target.bssid[k]) same_bssid = 0;
         }
         h3_sdc_read_wlan_reg8(0x0102, &msr);
+        /* W.402: уже ассоциирован к целевому BSSID и MSR=STA — не пере-authenticate
+           (это рвёт связку). Возврат rc=0. (Повторный DHCP при флаке 4-way
+           решается на уровне CAM-ключей/деаута, не здесь.) */
         if (same_bssid && (msr & 0x01)) {
             uart_print("  join: already assoc to same BSSID, skip auth\r\n");
             return 0;
         }
-        if (!same_bssid) {
-            /* Другая сеть: сначала deauth к старому BSSID (W.413 [P1]) — чтобы
-               FW/AP вышли из associated/pending, иначе следующий auth к новому
-               BSSID молчит (rc=-4). Деаут только если есть куда слать (MSR был STA). */
-            if (msr & 0x01) {
-                h3_wifi_tx_deauth(cur, 3);   /* reason 3 = Leaving ESS */
-                udelay(20000);
-                uart_print("  join: deauth old bssid\r\n");
-            }
-            /* Сбросить текущую связь в NOLINK. */
-            h3_sdc_write_wlan_reg8(0x0102, 0x00);        /* MSR NOLINK */
-            for (int k = 0; k < 6; k++) h3_sdc_write_wlan_reg8(0x0618 + k, 0x00);
-            for (int k = 0; k < 32; k++) h3_sdc_write_wlan_reg8(0x06E0 + k, 0x00);
-            udelay(5000);
-            uart_print("  join: reset link (NOLINK, bssid=0)\r\n");
+        /* W.472 [фикс]: deauth ПЕРЕД любым auth (даже тот же BSSID). Если
+           предыдущий AssocResp был потерян (rc=-6), AP считает нас associated
+           (msr=1 на AP), а наш msr=0 -> рассинхрон, auth молчит (rc=-4).
+           Deauth не-associated стана AP игнорирует (no-op) — вреда нет,
+           зато сбрасывает подвисшее состояние на AP. reason 3 = Leaving ESS. */
+        if (msr & 0x01) {
+            h3_wifi_tx_deauth(join_target.bssid, 3);   /* к ЦЕЛЕВОМУ BSSID */
+            udelay(20000);
+            uart_print("  join: deauth (pre-auth)\r\n");
         }
+        /* Всегда сбрасываем link в NOLINK перед новым join (deauth даже для
+           same / после потерянного AssocResp). */
+        h3_sdc_write_wlan_reg8(0x0102, 0x00);        /* MSR NOLINK */
+        for (int k = 0; k < 6; k++) h3_sdc_write_wlan_reg8(0x0618 + k, 0x00);
+        for (int k = 0; k < 32; k++) h3_sdc_write_wlan_reg8(0x06E0 + k, 0x00);
+        udelay(5000);
+        uart_print("  join: reset link (NOLINK, bssid=0)\r\n");
     }
 
     /* W.391 (join_prepare): сбросить накопленное состояние между join.
@@ -4478,8 +4482,17 @@ int h3_wifi_join_ap(void)
         uint32_t acc = 0;
         int waited = 0;
 
-        uart_print("  join: dhcp discover send\r\n");
-        net_dhcp_discover(&nst);
+        /* W.472: для WPA2-сети первый DISCOVER НЕ шлём в plaintext (AP после
+           assoc ждёт только CCMP-encrypted; plaintext кадр дропается и висит
+           в LOQ, задерживая msg4). Отправляем DISCOVER только ПОСЛЕ 4-way
+           (wpa2_done) — уже зашифрованным. Для открытой сети (pass_len=0)
+           DISCOVER отправляем сразу. */
+        if (join_target.pass_len == 0) {
+            uart_print("  join: dhcp discover send\r\n");
+            net_dhcp_discover(&nst);
+        } else {
+            uart_print("  join: wpa2 net — dhcp deferred to after 4-way\r\n");
+        }
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
@@ -4671,6 +4684,23 @@ int h3_wifi_join_ap(void)
                                                     gk = gtk + 8;
                                                 }
                                                 wpa_cam_write_key(0, macz, gk, 1);
+                                                /* W.472 [диагностика: CAM readback] — подтвердить,
+                                                   что реально легло в слоты CAM 0 (GTK) и 4 (pairwise).
+                                                   RTL8188F: REG_CAMCMD(0x670) с CAM_WRITE=0 = read,
+                                                   REG_CAMREAD(0x678) = данные. Сбрасываем POLLING
+                                                   битом31 после чтения. */
+                                                for (int cam_slot = 0; cam_slot < 8; cam_slot += 4) {
+                                                    uint8_t w0 = 0, w1 = 0;
+                                                    h3_sdc_write_wlan_reg32(0x0670, ((uint32_t)cam_slot * 8 + 0));
+                                                    h3_sdc_read_wlan_reg8(0x0678, &w0);
+                                                    h3_sdc_read_wlan_reg8(0x0679, &w1);
+                                                    uart_print(" cam[");
+                                                    uart_print_int(cam_slot);
+                                                    uart_print("]=0x");
+                                                    uart_print_hex((uint32_t)w0);
+                                                    uart_print_hex((uint32_t)w1);
+                                                    uart_print(" ");
+                                                }
                                             }
                                             /* W.462: включить CCMP TxEnc/RxDec в чипе — БЕЗ этого
                                                даже с ключами в CAM чип физически НЕ шифрует/дешифрует.
