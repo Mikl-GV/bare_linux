@@ -4521,6 +4521,7 @@ int h3_wifi_join_ap(void)
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
+        int rx_dbg_done = 0;    /* W.494: RX-счётчики напечатаны один раз */
 
         while (waited < 6000) {   /* W.469: увеличено 1500→6000 — DHCP OFFER на WPA2 после
                                 4-way идёт broadcast и может прийти с задержкой; окно 3с
@@ -4538,6 +4539,28 @@ int h3_wifi_join_ap(void)
                 uart_print("  join: dhcp discover (enc) resend\r\n");
                 net_dhcp_discover(&nst);
                 dhcp_resent = 1;
+            }
+            /* W.494 [диагностика RX]: через ~500 мс после DISCOVER прочитать
+               счётчики приёма FW. RXPKT_NUM (0x0284): cnt[15:0]=пакетов в
+               буфере FW; b18=RW_RELEASE_EN. RXERR_RPT (0x0664): счётчик по
+               выбранному типу. Если cnt>0 — FW приняла кадры от AP (значит
+               проблема в дешифровке/выдаче), если 0 — AP не ответила. */
+            {
+                if (dhcp_resent && !rx_dbg_done && waited >= 500) {
+                    uint32_t rxn = 0, rxerr = 0;
+                    h3_sdc_read_wlan_reg32(0x0284, &rxn);
+                    h3_sdc_read_wlan_reg32(0x0664, &rxerr);
+                    uart_print("  join: RX-dbg rxpk=0x");
+                    uart_print_hex(rxn);
+                    uart_print(" cnt=");
+                    uart_print_int((int)(rxn & 0xFFFF));
+                    uart_print(" b18=");
+                    uart_print_int((int)((rxn >> 18) & 1));
+                    uart_print(" rxerr=0x");
+                    uart_print_hex(rxerr);
+                    uart_print("\r\n");
+                    rx_dbg_done = 1;
+                }
             }
             if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
             if (acc == 0) { udelay(2000); waited += 2; continue; }
