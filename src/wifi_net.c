@@ -109,8 +109,8 @@ int net_dhcp_discover(struct net_state *st)
 }
 
 /* Входящий IPv4 (уже после 802.11 data + LLC/SNAP + ethertype на входе).
-   Парсим UDP/DHCP: если OFFER (msg type 2) на наш xid — берем yiaddr как сеть,
-   ставим себе 0.0.0.199. */
+   Парсим UDP/DHCP: если OFFER/ACK (msg type 2/5) на наш xid — берём yiaddr
+   как выданный AP адрес напрямую (не подставляем .199). */
 void net_handle_ipv4(const uint8_t *pkt, uint16_t len, struct net_state *st)
 {
     /* pkt указывает на начало IPv4-заголовка. Минимум 20+8+dhcp. */
@@ -123,18 +123,16 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, struct net_state *st)
     if (pkt[udp_off+0] != 0x00 || pkt[udp_off+3] != 0x43) return;   /* src 67 */
 
     uint16_t dh = udp_off + 8;
-    if ((dh+4) <= len && pkt[dh] == 0x02) {   /* BOOTREPLY */
+    if ((dh+4) <= len && (pkt[dh] == 0x02 || pkt[dh] == 0x05)) { /* BOOTREPLY/OFFER/ACK */
         uint8_t yiaddr[4] = { pkt[dh+16], pkt[dh+17], pkt[dh+18], pkt[dh+19] };
         if (yiaddr[0] == 0) return;
         st->have = 1;
-        for (int k = 0; k < 4; k++) st->net[k] = yiaddr[k];
-        st->ip[0] = st->net[0]; st->ip[1] = st->net[1];
-        st->ip[2] = st->net[2]; st->ip[3] = 199;
-        uart_print("  net: DHCP OFFER net=");
-        uart_print_int((int)st->net[0]); uart_print(".");
-        uart_print_int((int)st->net[1]); uart_print(".");
-        uart_print_int((int)st->net[2]); uart_print(".");
-        uart_print_int((int)st->net[3]);
-        uart_print(" -> ip=x.x.x.199\r\n");
+        for (int k = 0; k < 4; k++) { st->ip[k] = yiaddr[k]; st->net[k] = yiaddr[k]; }
+        uart_print("  net: DHCP OK ip=");
+        uart_print_int((int)st->ip[0]); uart_print(".");
+        uart_print_int((int)st->ip[1]); uart_print(".");
+        uart_print_int((int)st->ip[2]); uart_print(".");
+        uart_print_int((int)st->ip[3]);
+        uart_print("\r\n");
     }
 }

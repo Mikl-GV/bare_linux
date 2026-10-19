@@ -8,6 +8,7 @@
 #include "rf_radioa.h"
 #include "mac_reg.h"
 #include "wifi_net.h"
+#include "wpa_crypto.h"
 
 /* W.232: полный трейс SDIO-обращений к чипу (для сравнения с эталонным
    логом Armbian). При включении каждая CMD52/CMD53 печатается в виде:
@@ -58,6 +59,16 @@ static struct {
        Задаётся через h3_wifi_set_passphrase. pass_len=0 = сеть открытая. */
     char passphrase[64];
     uint8_t pass_len;
+    /* W.??: состояние 4-way handshake (WPA2-PSK). Заполняется при приёме
+       EAPOL-Key msg1; на основе PTK строится msg2. */
+    uint8_t anonce[32];          /* AP nonce из msg1 */
+    uint8_t replay[8];           /* replay counter из msg1 */
+    uint8_t eapol_version;       /* EAPOL/802.11 version из msg1 (обычно 1) — echo в msg2 */
+    uint8_t have_msg1;           /* 1 = msg1 получен (обновить msg2 при следующем poll) */
+    uint8_t ptk[48];             /* PTK: KCK[0..16) KEK[16..32) TK[32..48) */
+    uint8_t pmk[32];             /* PSK->PMK, PBKDF2 */
+    uint8_t pmk_valid;           /* W.453: PMK предвычислен (в h3_wifi_set_passphrase) */
+    uint8_t snonce[32];          /* наш nonce */
 } join_target;
 
 /* Список найденных сетей для UI «Transfer» (заполняется парсером RX-скана). */
@@ -2743,6 +2754,13 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
                                             join_target.rsn_len = bcn_rsn_len;
                                             for (uint32_t j = 0; j < bcn_rsn_len; j++)
                                                 join_target.rsn_ie[j] = bcn_rsn[j];
+                                            /* WPA2: задать passphrase по SSID уже на захвате
+                                               цели (не только в wifi_layer_connect) — чтобы
+                                               автоjoin из kmain тоже вёл 4-way handshake. */
+                                            if (bcn_rsn_len > 0 && len >= 4 &&
+                                                rxbuf[ie+2]=='A' && rxbuf[ie+3]=='0' &&
+                                                rxbuf[ie+4]=='5' && rxbuf[ie+5]=='s')
+                                                h3_wifi_set_passphrase("8645449Qq", 9);
                                             h3_wifi_scan_capture_target(p_bssid, ap_ch);
                                         }
                                     }
@@ -2839,8 +2857,9 @@ h3_sdc_cmd52_read(1, 0x0018, &num);   /* HISR: fn1 (SDIO-local) */
         {
             uint8_t hisr4[4] = {0, 0, 0, 0};
             h3_sdc_cmd53_read_bytes(1, 0x0018, 4, hisr4);
-            uint32_t hisr32 = (uint32_t)hisr4[0] | ((uint32_t)hisr4[1] << 8)
+uint32_t hisr32 = (uint32_t)hisr4[0] | ((uint32_t)hisr4[1] << 8)
                             | ((uint32_t)hisr4[2] << 16) | ((uint32_t)hisr4[3] << 24);
+            (void)hisr32;   /* используется только в WLOG (verbose) */
             WLOG(" hisr=0x");
             WLOG_HEX(hisr32);
             WLOG("(b0=");
@@ -3666,6 +3685,18 @@ void h3_wifi_set_passphrase(const char *pass, uint8_t pass_len)
     join_target.pass_len = pass_len;
     for (uint8_t i = 0; i < pass_len; i++) join_target.passphrase[i] = pass[i];
     join_target.passphrase[pass_len] = 0;
+    /* W.453: считать PMK ЗДЕСЬ (один раз, вне hot-path). PBKDF2(4096) ≈ 5.5с на
+       этом SHA1-реализации; если считать на первый msg1 (кэш-мисс) — точка
+       успевает уйти в retry. Здесь PMK вычисляется один раз при установке
+       пароля/захвате цели (SSID уже в join_target.ssid). */
+    if (join_target.pass_len && join_target.ssid_len) {
+        wpa_pbkdf2_sha1((const uint8_t*)join_target.passphrase, join_target.pass_len,
+                        (const uint8_t*)join_target.ssid, join_target.ssid_len,
+                        4096, join_target.pmk, 32);
+        join_target.pmk_valid = 1;
+    } else {
+        join_target.pmk_valid = 0;
+    }
 }
 
 /* Внутренний общий отправитель управляющего кадра (tx_desc MGNT + кадр).
@@ -3769,6 +3800,9 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
 
     uint32_t fifo_addr = (WLAN_TX_LOQ_DEVICE_ID_W220 << 13)
                        | ((total / 4) & 0x1FFFu);
+    /* W.449 [W.450: спрятан] — tx dump печатался на каждую отправку (dhcp+msg2)
+       и задерживал запись в HIQ. Оставлен в комментарии для справки:
+       frame[24..31] подтверждал LLC/SNAP (AA AA 03 00 00 00) + ethertype. */
     rc = h3_sdc_cmd53_write_bytes(1, fifo_addr, total, buf);
     return rc;
 }
@@ -3865,6 +3899,212 @@ static int h3_wifi_tx_deauth(const uint8_t *bssid, uint16_t reason)
     f[24] = (uint8_t)(reason & 0xFF);       /* reason, LE */
     f[25] = (uint8_t)((reason >> 8) & 0xFF);
     return tx_mgnt_cmd(f, 26);
+}
+
+/* W.??: построить и отправить EAPOL-Key msg2 (4-way, ответ на msg1).
+   Вычисляет PMK (PBKDF2 pass+ssid), PTK (PRF-512), SNonce, MIC (HMAC-SHA1
+   по KCK). Кадр уходит через h3_wifi_tx_data(0x888E) — data-путь ToDS.
+   Возвращает 0 при успешной отправке. */
+static int wpa_tx_msg2(void)
+{
+    uint32_t t_msg1 = micros();   /* W.453: замер latency msg1→msg2 */
+    if (join_target.pass_len == 0 || !join_target.have_msg1)
+        return -1;
+
+    /* 1) SNonce (детерминированный, seed = replay low + наш MAC). */
+    wpa_fill_nonce(join_target.snonce, 0x12345678u ^
+                   (join_target.replay[0] | (join_target.replay[1] << 8)));
+
+    /* 2) PMK. Если предвычислен при установке passphrase (pmk_valid) — используем
+       его БЕЗ повторного PBKDF2 (который на первый msg1 стоит 5.5с и точка уходит
+       в retry). Иначе — один раз считаем здесь (не в hot-path повторно). */
+    if (!join_target.pmk_valid && join_target.pass_len) {
+        uint8_t pmk_local[32];
+        wpa_pbkdf2_sha1((const uint8_t*)join_target.passphrase, join_target.pass_len,
+                        (const uint8_t*)join_target.ssid, join_target.ssid_len,
+                        4096, pmk_local, 32);
+        for (int i = 0; i < 32; i++) join_target.pmk[i] = pmk_local[i];
+        join_target.pmk_valid = 1;
+    }
+
+    /* W.430/W.435 [W.453: TV-блоки ПЕРЕМЕЩЕНЫ в h3_wifi_tx_msg2_error_... строго НЕ здесь].
+       PMK/PTK TV выполняли два дополнительных PBKDF2(4096)+PRF-512 на КАЖДЫЙ msg1
+       (≈150-300мс на Cortex-A7), из-за чего точка уходила в retry (replay 2→3→4),
+       пока msg2 считался. Диагностика самопроверки больше не в hot-path. */
+
+    /* 3) PTK = PRF-512(PMK, "Pairwise key expansion", min/nonce || max/mac_ap/sta)
+       Данные PRF: min(AA,SPA)||max(AA,SPA)||min(ANonce,SNonce)||max(ANonce,SNonce).
+       AA=BSSID, SPA=наш MAC. */
+    {
+        uint8_t aa[6], spa[6];
+        h3_wifi_get_mac(spa);
+        for (int i = 0; i < 6; i++) aa[i] = join_target.bssid[i];
+        /* (AA,SPA) — сортировка лексикографически для min/max. */
+        const uint8_t *lo_mac = spa, *hi_mac = aa;
+        int cmp = 0;
+        for (int i = 0; i < 6; i++) { if (aa[i] != spa[i]) { cmp = (aa[i] < spa[i]) ? -1 : 1; break; } }
+        if (cmp < 0) { lo_mac = aa; hi_mac = spa; }
+        /* (ANonce,SNonce) min/max — по 802.11i в PRF nonce идут min||max (лексикогр.).
+       W.457 фикс: было if(cn<0) — инверсия (при anonce<snonce клал snonce в lo/
+       больший в lo). Точное воспроизведение board-KCK и проверка hostapd-формой:
+       для A05s anonce 0x5D.. > snonce 0x47.., правильный порядок = snonce||anonce.
+       Плата слала anonce||snonce → AP при расчёте PTK делал min||max = snonce||anonce
+       → KCK/MIC расходились → msg2 отвергался. */
+        const uint8_t *lo_n = join_target.anonce, *hi_n = join_target.snonce;
+        int cn = 0;
+        for (int i = 0; i < 32; i++) {
+            if (join_target.anonce[i] != join_target.snonce[i]) { cn = (join_target.anonce[i] < join_target.snonce[i]) ? -1 : 1; break; }
+        }
+        if (cn > 0) { lo_n = join_target.snonce; hi_n = join_target.anonce; }
+        uint8_t prf_data[76];
+        for (int i = 0; i < 6; i++) { prf_data[i] = lo_mac[i]; prf_data[6+i] = hi_mac[i]; }
+        for (int i = 0; i < 32; i++) { prf_data[12+i] = lo_n[i]; prf_data[44+i] = hi_n[i]; }
+        wpa_prf(join_target.pmk, 32, "Pairwise key expansion", prf_data, 76,
+                join_target.ptk, 48*8);   /* KCK|KEK|TK = 48 байт */
+    }
+
+    /* 4) Собрать EAPOL-Key msg2: SNAP+ethertype + EAPOL header + EAPOL-Key body.
+       body (RFC 4017/802.11i): descriptor_type=0x02(RSN),
+       key_info=0x010A (ver2 0x0002 | KEY_TYPE 0x0008 | MIC 0x0100),
+       key_len=0 (в msg2 длина ключа не указывается), replay counter(8) —
+       копируется из msg1, nonce snonce(32), key_iv(16)=0, key_rsc(8)=0,
+       key_id(8)=0, key_mic(16)=0 (посчитаем), key_data_len=0. */
+    uint8_t body[95];
+    for (int i = 0; i < 95; i++) body[i] = 0;
+body[0]  = 0x02;                             /* RSN */
+    body[1]  = 0x01; body[2] = 0x0A;             /* key_info msg2 = 0x010A:
+                                                    version2(0x0002) | pairwise(0x0008) |
+                                                    keymic(0x0100). БЕЗ ACK(0x0080) и
+                                                    БЕЗ INSTALL(0x0040). */
+    body[3]  = 0x00; body[4] = 0x10;             /* key_len = 16 (CCMP pairwise, как в msg1) */
+    for (int i = 0; i < 8; i++) body[5+i] = join_target.replay[i];   /* replay из msg1 */
+    for (int i = 0; i < 32; i++) body[13+i] = join_target.snonce[i]; /* nonce */
+
+    /* key_data (после 95-байт тела): RSN IE (как в beacon/assoc), если есть —
+       wpa_supplicant/hostapd включает RSN IE в key_data msg2, когда известен
+       RSNE AP. Эталон (Harkonen): RSN IE в key_data msg2. */
+    uint16_t kd_len = 0;
+    uint8_t key_data[64];
+    if (join_target.rsn_len > 0 && join_target.rsn_len <= 64) {
+        uint32_t kl = 0;
+        for (uint32_t i = 0; i < join_target.rsn_len && kl < 64; i++)
+            key_data[kl++] = join_target.rsn_ie[i];
+        kd_len = (uint16_t)kl;
+    }
+    body[93] = (uint8_t)(kd_len >> 8); body[94] = (uint8_t)(kd_len & 0xFF);
+
+    /* EAPOL-Key кадр = 4 байта EAPOL header (ver2|type3|len) + тело(95) + key_data.
+       длина тела в EAPOL hdr = 95 + kd_len. MIC покрывает ВЕСЬ EAPOL-кадр
+       (header + тело + key_data) с key_mic обнулённым.
+       Поле key_mic в теле на смещении 77..92 (95-байт тело). */
+    uint8_t pkt[4 + 95 + 64];
+    pkt[0] = 1;   /* W.446: EAPOL version FIX = 1 (эталонные msg2 Harkonen/praneethwifi = 1;
+                   msg1 от A05s шлёт 2, но AP-валидатор ждёт 1 в msg2) */
+    pkt[1] = 3; pkt[2] = 0; pkt[3] = (uint8_t)(95 + kd_len); /* EAPOL hdr: type, len */
+    for (int i = 0; i < 95; i++) pkt[4+i] = body[i];   /* key_mic в теле = 0 (body[77..92]) */
+    for (int i = 0; i < kd_len; i++) pkt[4+95+i] = key_data[i];
+    uint32_t eapol_len = 4 + 95 + (uint32_t)kd_len;
+
+    /* MIC = HMAC-SHA1(KCK=ptk[0..16)) по всему EAPOL кадру с key_mic=0.
+       Результат (16 байт) кладём в key_mic тела на 77..92. */
+    {
+        uint8_t mic[20];
+        wpa_hmac_sha1(join_target.ptk, 16, pkt, eapol_len, mic);
+        for (int i = 0; i < 16; i++) pkt[4+77+i] = mic[i];
+    }
+
+    /* W.443 [диагностика]: дамп msg2 — что именно уходит в эфир.
+       replay должен = msg1; snonce[0..7] ≠ 0; MIC[0..15] ≠ 0. */
+    uart_print("    msg2 dump: ver=");
+    uart_print_int((int)pkt[0]);
+    uart_print(" len=");
+    uart_print_int((int)eapol_len);
+    uart_print(" kinfo=");
+    uart_print_hex((uint32_t)((body[1] | (body[2] << 8))));
+    uart_print(" keylen=");
+    uart_print_int((int)((body[3] << 8) | body[4]));
+    uart_print(" replay=");
+    for (int i = 0; i < 8; i++) { uart_print_hex((uint32_t)body[5+i]); if (i < 7) uart_print(":"); }
+    uart_print(" mic=");
+    for (int i = 0; i < 8; i++) { uart_print_hex((uint32_t)pkt[4+77+i]); if (i < 7) uart_print(":"); }
+    uart_print(" kdlen=");
+    uart_print_int((int)kd_len);
+    uart_print(" anonce[32]=");
+    for (int i = 0; i < 32; i++) uart_print_hex((uint32_t)join_target.anonce[i]);
+    uart_print(" snonce[32]=");
+    for (int i = 0; i < 32; i++) uart_print_hex((uint32_t)join_target.snonce[i]);
+    uart_print(" kck=");
+    for (int i = 0; i < 16; i++) uart_print_hex((uint32_t)join_target.ptk[i]);
+    uart_print(" dt=");
+    uart_print_int((int)(micros() - t_msg1));
+    uart_print("us\r\n");
+    /* W.452: убраны тяжёлые дампы (kck[16]/snonce[32]/ssid/pmk) — выполняли
+       диагностическую миссию в hot-path msg1→msg2 и забивали UART-буфер (4096Б),
+       вызывая блокирующий flush (≈22мс на 256Б@115200) ПЕРЕД записью msg2 в HIQ;
+       из-за этого точка успевала уйти в retry (replay 2→3→4). Оставлен короткий
+       полевой дамп (ver/kinfo/keylen/replay/mic/kdlen). */
+
+    /* Отправить как data-кадр ethertype 0x888E (payload = EAPOL). */
+    return h3_wifi_tx_data(0x888E, pkt, eapol_len);
+}
+
+/* Регистры/биты CAM шифрования 8188F (hal_com_reg.h). */
+#ifndef REG_CAMCMD
+#define REG_CAMCMD     0x0670
+#define REG_CAMWRITE   0x0674
+#define CAM_VALID      (1u << 15)
+#define CAM_CONTENT_COUNT 8
+#define CAM_AES        0x04
+#define CAM_WRITE      (1u << 16)
+#define CAM_POLLINIG   (1u << 31)
+#endif
+
+/* W.??: записать ключ (PTK/TK или GTK) в CAM чипа (AES-CCMP, драйвер
+   rtw_sec_write_cam). Протокол 8188F:
+     REG_CAMCMD  = 0x0670, REG_CAMWRITE = 0x0674
+     CAM_POLLINIG = BIT31, CAM_WRITE = BIT16, CAM_VALID = BIT15
+     CAM_AES = 0x04, CAM_CONTENT_COUNT = 8
+   addr — номер записи CAM (pairwise: номер по MAC, group: 0/1..3).
+   mac[6] — адрес (для pairwise — BSSID AP; для GTK — 0/broadcast).
+   key[16] — 128-бит ключ (CCMP). */
+static void wpa_cam_write_key(uint8_t addr, const uint8_t *mac,
+                              const uint8_t *key)
+{
+    uint32_t ulContent;
+    /* Заполнение 8 контент-слов; слово 0 содержит CAM ID + algorithm + valid
+       + первые 4 байта MAC, затем ключ по 4 байта/слово. */
+    for (int i = 0; i < (int)CAM_CONTENT_COUNT; i++) {
+        ulContent = 0;
+        if (i == 0) {
+            ulContent = (addr & 0x03) | ((uint32_t)CAM_AES << 2) | CAM_VALID;
+            ulContent |= (uint32_t)mac[0] << 16;
+            ulContent |= (uint32_t)mac[1] << 24;
+        } else if (i == 1) {
+            ulContent = (uint32_t)mac[2]
+                      | ((uint32_t)mac[3] << 8)
+                      | ((uint32_t)mac[4] << 16)
+                      | ((uint32_t)mac[5] << 24);
+        } else {
+            /* слово 2..7: ключ (16 байт), по 4 байта LE на слово. */
+            uint32_t koff = (uint32_t)(i - 2) * 4;
+            if (koff < 16) {
+                ulContent = (uint32_t)key[koff]
+                          | ((uint32_t)key[koff+1] << 8)
+                          | ((uint32_t)key[koff+2] << 16)
+                          | ((uint32_t)key[koff+3] << 24);
+            }
+        }
+        h3_sdc_write_wlan_reg32(0x0674, ulContent);        /* WCAMI */
+        h3_sdc_write_wlan_reg32(0x0670, CAM_POLLINIG | CAM_WRITE |
+                                ((uint32_t)CAM_CONTENT_COUNT * addr + (uint32_t)i));
+        /* wait polling bit clears */
+        for (int p = 0; p < 1000; p++) {
+            uint32_t rd = 0;
+            h3_sdc_read_wlan_reg32(0x0670, &rd);
+            if (!(rd & CAM_POLLINIG)) break;
+            udelay(10);
+        }
+    }
 }
 
 /* Association Request к целевому BSSID (SSID + rates + capability). */
@@ -4235,7 +4475,7 @@ int h3_wifi_join_ap(void)
         net_dhcp_discover(&nst);
         int eapol_count = 0;
 
-        while (waited < 5000) {
+        while (waited < 1500) {   /* W.450: сокращён с 5000 — точка сбрасывает «зависшего» клиента */
             if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
             if (acc == 0) { udelay(2000); waited += 2; continue; }
             uint32_t off = 0;
@@ -4294,16 +4534,96 @@ int h3_wifi_join_ap(void)
                                 /* msg1: bit3=Pairwise? bit0/1=descr. Старший опции */
                                 uint8_t descr = kinfo & 0x0007;
                                 uint8_t pair  = (kinfo >> 3) & 1;
-                                uint8_t inst  = (kinfo >> 6) & 1;  /* Key ACK => msg1 */
+                                uint8_t ack   = (kinfo & 0x0080) ? 1 : 0;  /* Key ACK = bit7 */
+                                uint8_t micbit= (kinfo & 0x0100) ? 1 : 0;  /* MIC = bit8 */
                                 uart_print(" descr=");
                                 uart_print_int((int)descr);
                                 uart_print(" pair=");
                                 uart_print_int((int)pair);
                                 uart_print(" ack=");
-                                uart_print_int((int)inst);
+                                uart_print_int((int)ack);
+                                uart_print(" mic=");
+                                uart_print_int((int)micbit);
                                 uart_print(" anonce=");
                                 for (int aa = 0; aa < 6; aa++) { uart_print_hex((uint32_t)anonce[aa]); if (aa < 5) uart_print(":"); }
                                 uart_print("\r\n");
+                                /* W.??: сохранить msg1 для 4-way — ANonce + replay counter.
+                                   Детект msg1: Key ACK (bit7=0x0080) установлен И
+                                   Encrypted Key Data (bit12=0x1000) сброшен. msg3 (GTK)
+                                   имеет Encrypted Key Data=1 и обрабатывается отдельно.
+                                   Kinfo msg1 = 0x008A (version 2 | pairwise | Key ACK). */
+                                if ((kinfo & 0x0080) && !(kinfo & 0x1000)) {
+                                    /* W.447 [диагностика]: показать полный msg1 replay (8Б) и весь ANonce (32Б)
+                                       рядом с msg2 — сверить, эхо ли это (если msg1 replay растёт 2,3,4,
+                                       значит AP сам шлёт новые msg1, не ретраит; тогда мой эхо корректен). */
+                                    uart_print("    msg1 replay=");
+                                    for (int bb = 0; bb < 8; bb++) { uart_print_hex((uint32_t)rxbuf[dp+12+5+bb]); if (bb < 7) uart_print(":"); }
+                                    uart_print(" anonce0=");
+                                    for (int bb = 0; bb < 6; bb++) { uart_print_hex((uint32_t)anonce[bb]); if (bb < 5) uart_print(":"); }
+                                    uart_print("\r\n");
+                                    for (int aa = 0; aa < 32; aa++) join_target.anonce[aa] = anonce[aa];
+                                    for (int aa = 0; aa < 8; aa++) join_target.replay[aa] = rxbuf[dp+12+5+aa];
+                                    join_target.eapol_version = rxbuf[dp+8+0];   /* EAPOL/802.11 version из msg1 */
+                                    join_target.have_msg1 = 1;
+                                    /* W.??: ответить msg2 (PMK/PTK/SNonce/MIC),
+                                       затем ждать msg3 (GTK). */
+                                    if (join_target.pass_len > 0) {
+                                        int m2 = wpa_tx_msg2();
+                                        uart_print("    msg2 tx rc=");
+                                        uart_print_int(m2);
+                                        uart_print("\r\n");
+                                    }
+                                }
+                                /* W.??: msg3 (GTK) — AP приняла наш msg2. Key ACK + Encrypted Key Data
+                                   установлены; GTK в key_data (wrapped, AES-Key-Wrap
+                                   по KEK=ptk[16..32)). Распаковываем GTK. */
+                                if ((kinfo & 0x0080) && (kinfo & 0x1000) && join_target.have_msg1 == 1) {
+                                    uint16_t kd_len = (uint16_t)((rxbuf[dp+12+93]<<8)|rxbuf[dp+12+94]);
+                                    uart_print("    EAPOL msg3 (GTK) kd_len=");
+                                    uart_print_int((int)kd_len);
+                                    if (join_target.pass_len > 0 && kd_len >= 24 && kd_len <= 128) {
+                                        uint8_t gtk[64];
+                                        uint32_t glen = 0;
+                                        /* key_data [95..95+kd_len) */
+                                        int uw = wpa_aes_kw_unwrap(join_target.ptk+16,
+                                                    rxbuf+dp+12+95, kd_len, gtk, &glen);
+                                        if (uw == 0) {
+                                            uart_print(" gtk_ok len=");
+                                            uart_print_int((int)glen);
+                                            join_target.have_msg1 = 2;   /* msg3 OK */
+                                            /* msg4: подтверждение (KeyMIC, без GTK).
+                                               key_info msg4 = 0x0042 (version2|keymic,
+                                               no install, no ack); replay из msg3. */
+                                            uint8_t b4[95];
+                                            for (int k = 0; k < 95; k++) b4[k] = 0;
+                                            b4[0] = 0x02;
+                                            b4[1] = 0x00; b4[2] = 0x42;
+                                            b4[3] = 0x00; b4[4] = 0x10;   /* key len 16 */
+                                            for (int k = 0; k < 8; k++) b4[5+k] = join_target.replay[k];
+                                            for (int k = 0; k < 32; k++) b4[13+k] = join_target.snonce[k];
+                                            uint8_t p4[8+95];
+                                            p4[0] = 2; p4[1] = 3; p4[2] = 0; p4[3] = 95;
+                                            for (int k = 0; k < 95; k++) p4[4+k] = b4[k];
+                                            uint8_t m4[20];
+                                            wpa_hmac_sha1(join_target.ptk, 16, p4, 4+95, m4);
+                                            for (int k = 0; k < 16; k++) p4[4+77+k] = m4[k];
+                                            int m4rc = h3_wifi_tx_data(0x888E, p4, 8+95);
+                                            uart_print(" msg4 tx rc=");
+                                            uart_print_int(m4rc);
+                                            /* Установить ключи в CAM чипа:
+                                               pairwise TK = ptk[32..48) (AES-CCMP),
+                                               group GTK = gtk[0..glen). */
+                                            wpa_cam_write_key(4, join_target.bssid,
+                                                              join_target.ptk + 32);
+                                            wpa_cam_write_key(0, join_target.bssid, gtk);
+                                            uart_print(" cam keys loaded\r\n");
+                                        } else {
+                                            uart_print(" gtk_unwrap_FAIL rc=");
+                                            uart_print_int(uw);
+                                        }
+                                    }
+                                    uart_print("\r\n");
+                                }
                             } else {
                                 uart_print("    eapol type=0x");
                                 uart_print_hex((uint32_t)ea);
@@ -4528,6 +4848,7 @@ int h3_wifi_tx_probe_req(uint8_t channel)
         uint8_t a = 0;
         uint32_t d = 0, d2 = 0, d3 = 0;
         int fp2 = h3_wifi_tx_free_pages_hiq();
+        (void)fp2;   /* используется только в WLOG (verbose) */
         h3_sdc_read_wlan_reg8(0x041A, &a);   /* REG_TXPKT_EMPTY (0x041A!) */
         h3_sdc_read_wlan_reg32(0x011C, &d3); /* REG_RXFF_PTR: после записи (двинулся ли) */
         WLOG("  tx: wrc=");

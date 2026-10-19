@@ -21,4 +21,9 @@ int wifi_layer_started(void);
    (см. h3_wifi_join_ap; -4 — AuthResp не пришла). */
 int wifi_layer_connect(int index);
 
+/* Повторный скан эфира (UI «Transfer»): сбросить список найденных сетей и
+   заново прогнать скан 13 каналов (h3_wifi_rf_rx_test), чтобы обновить
+   список AP без перепрошивки. Возвращает 0 при успехе старта скана. */
+int wifi_layer_rescan(void);
+
 #endif /* WIFI_LAYER_H */

@@ -179,7 +179,7 @@ static void draw_ui(void)
             }
         }
         if (wifi_layer_started() && n > 0)
-            fb_text(60, 420, "A=connect  B=back", 0x00A0C0D0, 0x000D1A33);
+            fb_text(60, 420, "A=connect  START=rescan  B=back", 0x00A0C0D0, 0x000D1A33);
         else
             fb_text(60, 420, "A=start WiFi  B=back", 0x00A0C0D0, 0x000D1A33);
     }
@@ -268,6 +268,16 @@ static void handle_buttons(uint32_t btns)
                 uart_print_int(transfer_sel);
                 uart_print("\r\n");
                 wifi_layer_connect(transfer_sel);
+            }
+            draw_ui();
+        } else if (pressed & BTN_START) {
+            /* Rescan эфира: обновить список сетей без перепрошивки. */
+            if (!wifi_layer_started()) {
+                uart_print("transfer: wifi layer start...\r\n");
+                wifi_layer_start();
+            } else {
+                uart_print("transfer: rescan...\r\n");
+                wifi_layer_rescan();
             }
             draw_ui();
         } else if (pressed & BTN_B) {

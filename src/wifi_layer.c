@@ -316,11 +316,16 @@ int wifi_layer_connect(int index)
     /* WPA2: передать RSN IE выбранной сети в цель — без него AssocReq к
        WPA2-AP уходит без Privacy+RSN (cap=1) и AP не ассоциирует (rc=-6). */
     h3_wifi_set_target_rsn(&ap);
-    /* W.412: для WPA2-сети (rsn_len>0) зафиксировать PSK passphrase целевой
-       сети MTS_GPON_9290e0. PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32)
-       вычисляется при приёме EAPOL msg1 в 4-way handshake. */
+    /* W.412: для WPA2-сети (rsn_len>0) зафиксировать PSK passphrase по SSID.
+       PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32) вычисляется при приёме
+       EAPOL msg1 в 4-way handshake. Сети известны заранее: A05s (тестовая,
+       пароль 8645449Qq), MTS_GPON_9290e0 (B236f8g4). */
     if (ap.rsn_len > 0) {
-        h3_wifi_set_passphrase("B236f8g4", 8);
+        if (ap.ssid_len >= 4 &&
+            ap.ssid[0]=='A' && ap.ssid[1]=='0' && ap.ssid[2]=='5' && ap.ssid[3]=='s')
+            h3_wifi_set_passphrase("8645449Qq", 9);
+        else
+            h3_wifi_set_passphrase("B236f8g4", 8);
         uart_print("  wpa2 passphrase set (rsn_len=");
         uart_print_int((int)ap.rsn_len);
         uart_print(")\r\n");
@@ -331,4 +336,22 @@ int wifi_layer_connect(int index)
     uart_print_int(rc);
     uart_print("\r\n");
     return rc;
+}
+
+int wifi_layer_rescan(void)
+{
+    if (!wifi_started)
+        return -2;                       /* слой не инициализирован */
+
+    uart_print("wifi: rescan...\r\n");
+    /* Сбросить список найденных сетей и захват цели (join_target.bssid_captured),
+       затем заново прогнать скан 13 каналов — иначе повторный скан не обновит
+       BSSID/SSID захваченной сети и автоjoin возьмёт старую цель. */
+    h3_wifi_scan_ap_reset();
+    h3_wifi_set_target("", 0);      /* сброс цели (bssid_captured=0) */
+    h3_wifi_rf_rx_test();
+    uart_print("wifi: rescan done (");
+    uart_print_int(h3_wifi_scan_ap_count());
+    uart_print(" ap)\r\n");
+    return 0;
 }

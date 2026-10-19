@@ -41,4 +41,9 @@ int wpa_mic_check(const uint8_t *kck, const uint8_t *eapol, uint32_t len,
    Заполняет dst[0..16). Вызывающий подмешивает AP nonce. */
 void wpa_fill_nonce(uint8_t dst[32], uint32_t seed);
 
+/* RFC 3394 AES-Key-Wrap unwrap: расшифровать wrapped (кратно 8, >=24) ключом
+   kek[16], положить в plain (out_len = in_len-8). 0 при успехе (AIV 0xa6..). */
+int wpa_aes_kw_unwrap(const uint8_t *kek, const uint8_t *wrapped, uint32_t in_len,
+                      uint8_t *plain, uint32_t *out_len);
+
 #endif /* WPA_CRYPTO_H */
