@@ -3778,9 +3778,8 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
        addr1 (ra) = BSSID ВСЕГДА (unicast к AP, даже для broadcast-пакета),
        addr3 = L2 dst (для DHCP DISCOVER = ff:ff:ff:ff:ff:ff). Пакет к AP
        шифруется pairwise-ключом (cam4, MAC=BSSID), поэтому BMC=0. */
-    int l2bcast = (ethertype == 0x0800);   /* DHCP DISCOVER: адресация ff */
+    int l2bcast = (ethertype == 0x0800);   /* DHCP DISCOVER: addr3 = broadcast */
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
-    if (l2bcast) buf[3] |= (1u << 0);                        /* BMC для broadcast */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
 
     /* кадр с базы buf+40 */
@@ -3789,6 +3788,13 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     h3_wifi_get_mac(m);
 
     f[0] = 0x08; f[1] = 0x01;      /* data, ToDS(bit1)=1 */
+    /* W.502 [корневой фикс]: для WMM-AP (MTS_GPON_9290e0) не-EAPOL данные
+       должны идти как QoS Data (subtype 0x88) с 2-байтным QoS Control.
+       WMM-AP принимает EAPOL обычным Data как special case 4-way, но
+       IPv4/DHCP без QoS от associated STA ДРОПАЕТ — отсюда «4-way ок,
+       DISCOVER молча теряется». EAPOL (0x888E) оставляем обычным Data. */
+    int qos_data = (ethertype != 0x888E);
+    if (qos_data) f[0] = 0x88;     /* QoS Data */
     /* W.462/W.465: после 4-way (secure=1) data-кадры ДОЛЖНЫ уходить зашифрованными.
        Два обязательных маркера, что чип реально применит TK/CCMP:
        1) Protected-бит (fc bit11=0x40),
@@ -3806,16 +3812,17 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
         buf[6] = (uint8_t)((buf[6] & 0x3Fu) | 0xC0u);   /* SEC_TYPE bits = 0b11 */
     }
     if (l2bcast) {
-        /* W.500: настоящий L2 broadcast — addr1=addr3=ff, BMC=1 (см. выше),
-           чип шифрует групповым ключом GTK (cam0). Если OFFER придёт, значит
-           pairwise-TX не работает, а GTK-TX — да. */
-        for (i = 0; i < 6; i++) { f[4+i] = 0xFF; f[10+i] = m[i]; f[16+i] = 0xFF; }
+        /* W.502: addr1=BSSID (unicast к AP), addr3=ff (L2 dst broadcast) —
+           по эталону rtw_xmit.c: для STA ra=get_bssid всегда. */
+        for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = 0xFF; }
     } else {
         for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
     }
     f[22] = 0; f[23] = 0;          /* seq */
 
     uint32_t p = 24;
+    /* W.502: QoS Control (TID=0 BE, ack_policy=normal) — только для QoS Data. */
+    if (qos_data) { f[p++] = 0x00; f[p++] = 0x00; }
     /* LLC/SNAP: AA AA 03 00 00 00 + ethertype (big-endian) */
     f[p++] = 0xAA; f[p++] = 0xAA; f[p++] = 0x03; f[p++] = 0x00; f[p++] = 0x00; f[p++] = 0x00;
     f[p++] = (uint8_t)(ethertype >> 8); f[p++] = (uint8_t)(ethertype & 0xFF);
@@ -4784,6 +4791,9 @@ int h3_wifi_join_ap(void)
                                                по BSSID AP. */
                                             {
                                                 uint8_t macz[6] = {0,0,0,0,0,0};
+                                                /* W.502: эталонная раскладка (pairwise=4 по BSSID,
+                                                   GTK=0 null+group). Диагностический swap W.501 отменён —
+                                                   гипотеза TX-поиска по MACID не подтвердилась. */
                                                 wpa_cam_write_key(4, join_target.bssid,
                                                                   join_target.ptk + 32, 0);
                                                 /* W.468/471: GTK = group/default key (cam 0), null-addr
@@ -4863,13 +4873,6 @@ int h3_wifi_join_ap(void)
                                                 unicast DISCOVER → AP ждал pairwise и не мог
                                                 расшифровать. 0xCC = TxEnc|RxDec|TXBCUSEDK|RXBCUSEDK. */
                                              h3_sdc_write_wlan_reg8(0x0680, 0xCC);
-                                             /* W.500 [диагностика]: переключаем на 0xCF, чтобы
-                                                отличить «AP не отвечает» от «AP отвечает, но
-                                                decrypt не проходит». При 0xCF чип не дропает
-                                                нерасшифрованный кадр молча, а отдаёт его как
-                                                garbage-ethertype (0x9A00/0x3208/0xABC3).
-                                                После диагностики вернуть 0xCC. */
-                                             h3_sdc_write_wlan_reg8(0x0680, 0xCF);
                                             /* W.459 [диагностика]: дамп CAM после загрузки ключей.
                                                seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
                                                реально активны; camcmd 0x0670 покажет занятость. */
