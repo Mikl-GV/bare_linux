@@ -3781,13 +3781,12 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     int l2bcast = (ethertype == 0x0800);   /* DHCP DISCOVER: addr3 = broadcast */
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
-    /* W.503 [диагностика rate]: IPv4/DHCP отправляем на 6M OFDM (0x0C) вместо
-       CCK 1M по умолчанию. 4-way (EAPOL 1M) AP слышит, но data может требовать
-       OFDM-скорости (HT-AP). Проверяем: если OFFER появится — дело было в rate. */
-    if (ethertype == 0x0800) {
-        buf[16] = 0x0Cu;                                /* TX_RATE = DESC_RATE6M */
-        buf[13] |= 0x01u;                               /* USE_RATE (pDesc+12, bit8) —
-                                                           без него rate игнорируется */
+    /* W.507 [по эталону]: DHCP(0x0800) и EAPOL(0x888E) — special packets,
+       шлются на basic rate CCK 1M. Явно ставим TX_RATE=1M (0x00) и USE_RATE=1
+       (pDesc+12 bit8 = byte13 bit0). 6M-тест (W.503-505) результата не дал. */
+    if (ethertype == 0x0800 || ethertype == 0x888E) {
+        buf[16] = 0x00u;                                /* TX_RATE = DESC_RATE1M */
+        buf[13] |= 0x01u;                               /* USE_RATE */
     }
 
     /* кадр с базы buf+40 */
@@ -3812,11 +3811,7 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
        в CAM и seccfg=0xCF. EAPOL msg4 НЕ защищается (уходит до установки
        ключей на AP), поэтому для ethertype 0x888E Protected и SEC_TYPE не
        ставятся. */
-    /* W.505 [тест шифрования TX]: DHCP (0x0800) шлём БЕЗ Protected/SEC_TYPE.
-       Теперь LPQ=8 и кадр реально уходит (W.504: txempty=0xFF, loq 5->8).
-       Если AP ответит на plaintext — значит шифрование TX не применяется/
-       ломает кадр; если тишина — проблема в доставке, не в ключах. */
-    if (join_target.secure && ethertype != 0x888E && ethertype != 0x0800) {
+    if (join_target.secure && ethertype != 0x888E) {
         f[1] |= 0x40;              /* Protected (fc bit11) */
         /* SEC_TYPE = AES (0x3): SET_BITS_TO_LE_4BYTE(pDesc+4,22,2,val) —
            LE 32-бит слово на байтах txdesc[4..7]; бит22 = бит6 байта
@@ -3845,21 +3840,7 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     buf[0] = (uint8_t)(p & 0xFF);
     buf[1] = (uint8_t)((p >> 8) & 0xFF);
 
-    /* W.504 [диагностика]: фактический fc/rate/qos и длина кадра — проверить,
-       что QoS-фикс и rate реально применились. */
-    if (ethertype == 0x0800) {
-        uart_print("  tx fc=0x");
-        uart_print_hex((uint32_t)(f[0] | ((uint32_t)f[1] << 8)));
-        uart_print(" rate=0x");
-        uart_print_hex((uint32_t)buf[16]);
-        uart_print(" userate=");
-        uart_print_int((int)(buf[13] & 1));
-        uart_print(" qos=0x");
-        uart_print_hex((uint32_t)(qos_data ? (f[24] | ((uint32_t)f[25] << 8)) : 0xFFFFu));
-        uart_print(" len=");
-        uart_print_int((int)p);
-        uart_print("\r\n");
-    }
+    /* W.507: диагностика tx fc/rate/qos убрана из hot-path (подтверждена в W.504). */
 
     /* W.498 [корневой фикс]: TX-страница чипа = 128 байт
        (rtl8189fs_xmit.c:612: pg_num = (len+127)/128). Раньше ждали всего
@@ -4176,7 +4157,7 @@ static void wpa_cam_write_key(uint8_t addr, const uint8_t *mac,
                                 ((uint32_t)CAM_CONTENT_COUNT * addr + (uint32_t)i));
         /* wait polling bit clears. W.484: 1000x10мс = до 10 с на слово при
            залипании POLLINIG, что рвало тайминги 4-way. 100x1мс достаточно. */
-        for (int p = 0; p < 100; p++) {
+        for (int p = 0; p < 20; p++) {
             uint32_t rd = 0;
             h3_sdc_read_wlan_reg32(0x0670, &rd);
             if (!(rd & CAM_POLLINIG)) break;
@@ -4593,20 +4574,13 @@ int h3_wifi_join_ap(void)
                НЕ инициирует 4-way сама, если клиент молчит после AssocResp.
                Шлём EAPOL-Start (ver=1,type=1, len=0) как plaintext trigger,
                чтобы AP отправила EAPOL-Key msg1. */
-            /* W.506 [тест длины]: EAPOL-Start шлём 300 байт (первые 4 значимые,
-               остальное нули). Если AP всё равно ответит msg1 — длинные кадры
-               доходят, и проблема DISCOVER в содержимом; если msg1 не придёт —
-               не доставляются длинные (>~200Б) кадры. */
-            uint8_t eapol_start[300];
-            for (int z = 0; z < 300; z++) eapol_start[z] = 0;
-            eapol_start[0] = 0x01; eapol_start[1] = 0x01;
-            h3_wifi_tx_data(0x888E, eapol_start, 300);
+            uint8_t eapol_start[4] = {0x01, 0x01, 0x00, 0x00};
+            h3_wifi_tx_data(0x888E, eapol_start, 4);
             uart_print("  join: wpa2 net — dhcp deferred, eapol-start sent\r\n");
         }
         int eapol_count = 0;
         int wpa2_done = 0;      /* W.459: handshake завершён (PTK/GTK в CAM) */
         int dhcp_resent = 0;    /* W.459: DHCP повторно отправлен после WPA2 */
-        int rx_dbg_done = 0;    /* W.494: RX-счётчики напечатаны один раз */
 
         while (waited < 6000) {   /* W.469: увеличено 1500→6000 — DHCP OFFER на WPA2 после
                                 4-way идёт broadcast и может прийти с задержкой; окно 3с
@@ -4633,46 +4607,9 @@ int h3_wifi_join_ap(void)
                     uart_print("\r\n");
                 }
                 dhcp_resent++;
-                /* W.495 [TX-диагностика]: TXPKT_EMPTY (0x041A) бит0=1 — очередь
-                   TX пуста (кадр ушёл в эфир). 0 — застрял в очереди.
-                   LOQ free pages — сколько страниц осталось. */
-                {
-                    uint8_t txe = 0xFF;
-                    int loq = h3_wifi_tx_free_pages_loq();
-                    h3_sdc_read_wlan_reg8(0x041A, &txe);
-                    uart_print("  join: tx-dbg txempty=0x");
-                    uart_print_hex((uint32_t)txe);
-                    uart_print(" loq=");
-                    uart_print_int(loq);
-                    uart_print("\r\n");
-                }
+                /* W.507: tx-dbg (TXPKT_EMPTY/loq) убран из hot-path (подтверждён в W.495). */
             }
-            /* W.494 [диагностика RX]: через ~500 мс после DISCOVER прочитать
-               счётчики приёма FW. RXPKT_NUM (0x0284): cnt[15:0]=пакетов в
-               буфере FW; b18=RW_RELEASE_EN. RXERR_RPT (0x0664): счётчик по
-               выбранному типу. Если cnt>0 — FW приняла кадры от AP (значит
-               проблема в дешифровке/выдаче), если 0 — AP не ответила. */
-            {
-                if (dhcp_resent && !rx_dbg_done && waited >= 500) {
-                    uint32_t rxn = 0, rxerr = 0;
-                    h3_sdc_read_wlan_reg32(0x0284, &rxn);
-                    h3_sdc_read_wlan_reg32(0x0664, &rxerr);
-                    uart_print("  join: RX-dbg rxpk=0x");
-                    uart_print_hex(rxn);
-                    uart_print(" cnt=");
-                    uart_print_int((int)(rxn & 0xFFFF));
-                    uart_print(" b18=");
-                    uart_print_int((int)((rxn >> 18) & 1));
-                    /* W.500: разделяем счётчик: CRC-ошибки (шум эфира) vs
-                       ICV-ошибки (нерасшифровка CCMP → проблема ключей). */
-                    uart_print(" crc=");
-                    uart_print_int((int)(rxerr & 0xFFFF));
-                    uart_print(" icv=");
-                    uart_print_int((int)(rxerr >> 16));
-                    uart_print("\r\n");
-                    rx_dbg_done = 1;
-                }
-            }
+            /* W.507: RX-dbg (RXPKT_NUM/RXERR) убран из hot-path (подтверждён в W.494/500). */
             if (rx_read_packet(rxbuf, sizeof(rxbuf), &acc) != 0) { udelay(2000); waited += 2; continue; }
             if (acc == 0) { udelay(2000); waited += 2; continue; }
             uint32_t off = 0;
@@ -4867,29 +4804,24 @@ int h3_wifi_join_ap(void)
                                                     word0 достаточно, чтобы подтвердить раскладку:
                                                     slot0 (GTK) = VALID|AES|GROUP, MAC=00:00;
                                                     slot4 (pairwise) = VALID|AES, MAC=BSSID. */
-                                                 /* W.500 [диагностика]: полный дамп CAM —
-                                                    words 0..7 слотов 0 (GTK) и 4 (pairwise).
-                                                    Проверяем реальные байты ключей: не начинаются
-                                                    ли они с RSN IE (30 14 01 00) или KDE (DD .. 00 0F AC). */
+                                                 /* W.507: полный CAM dump свёрнут до word0 —
+                                                    ключи уже проверены в W.501 (чистые TK/GTK). */
                                                  for (int cam_slot = 0; cam_slot < 8; cam_slot += 4) {
+                                                     h3_sdc_write_wlan_reg32(0x0670,
+                                                         CAM_POLLINIG | CAM_READ |
+                                                         (uint32_t)(cam_slot * 8));
+                                                     for (int p = 0; p < 20; p++) {
+                                                         uint32_t rd = 0;
+                                                         h3_sdc_read_wlan_reg32(0x0670, &rd);
+                                                         if (!(rd & CAM_POLLINIG)) break;
+                                                         udelay(1);
+                                                     }
+                                                     uint32_t cv = 0;
+                                                     h3_sdc_read_wlan_reg32(0x0678, &cv);
                                                      uart_print(" cam");
                                                      uart_print_int(cam_slot);
                                                      uart_print("=");
-                                                     for (int w = 0; w < 8; w++) {
-                                                         h3_sdc_write_wlan_reg32(0x0670,
-                                                             CAM_POLLINIG | CAM_READ |
-                                                             (uint32_t)(cam_slot * 8 + w));
-                                                         for (int p = 0; p < 100; p++) {
-                                                             uint32_t rd = 0;
-                                                             h3_sdc_read_wlan_reg32(0x0670, &rd);
-                                                             if (!(rd & CAM_POLLINIG)) break;
-                                                             udelay(1);
-                                                         }
-                                                         uint32_t cv = 0;
-                                                         h3_sdc_read_wlan_reg32(0x0678, &cv);
-                                                         if (w) uart_print(":");
-                                                         uart_print_hex(cv);
-                                                     }
+                                                     uart_print_hex(cv);
                                                  }
                                             }
                                             /* W.462: включить CCMP TxEnc/RxDec в чипе — БЕЗ этого
