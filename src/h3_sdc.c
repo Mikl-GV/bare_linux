@@ -3812,7 +3812,11 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
        в CAM и seccfg=0xCF. EAPOL msg4 НЕ защищается (уходит до установки
        ключей на AP), поэтому для ethertype 0x888E Protected и SEC_TYPE не
        ставятся. */
-    if (join_target.secure && ethertype != 0x888E) {
+    /* W.505 [тест шифрования TX]: DHCP (0x0800) шлём БЕЗ Protected/SEC_TYPE.
+       Теперь LPQ=8 и кадр реально уходит (W.504: txempty=0xFF, loq 5->8).
+       Если AP ответит на plaintext — значит шифрование TX не применяется/
+       ломает кадр; если тишина — проблема в доставке, не в ключах. */
+    if (join_target.secure && ethertype != 0x888E && ethertype != 0x0800) {
         f[1] |= 0x40;              /* Protected (fc bit11) */
         /* SEC_TYPE = AES (0x3): SET_BITS_TO_LE_4BYTE(pDesc+4,22,2,val) —
            LE 32-бит слово на байтах txdesc[4..7]; бит22 = бит6 байта
