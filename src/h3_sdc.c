@@ -3776,14 +3776,22 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len)
     h3_wifi_get_mac(m);
 
     f[0] = 0x08; f[1] = 0x01;      /* data, ToDS(bit1)=1 */
-    /* W.462: после 4-way (secure=1) data-кадры обязаны идти С Protected-битом
-       (fc bit11=0x40) — иначе чип не зашифрует их TK/CCMP и AP дропнет.
-       EAPOL msg4 сам не защищается (уходит до установки ключей в AP), поэтому
-       Secure ставится ТОЛЬКО для обычного data (DHCP/ARP/ICMP), но не для
-       самого msg4. Ниже flag=NORMAL(0) оставляет msg4 как есть; флаг варится
-       по ethertype: 0x888E (EAPOL) — без Protected. */
-    if (join_target.secure && ethertype != 0x888E)
-        f[1] |= 0x40;              /* Protected */
+    /* W.462/W.465: после 4-way (secure=1) data-кадры ДОЛЖНЫ уходить зашифрованными.
+       Два обязательных маркера, что чип реально применит TK/CCMP:
+       1) Protected-бит (fc bit11=0x40),
+       2) SET_TX_DESC_SEC_TYPE = AES (0x3) в TX-descriptor: биты[23:22]
+          байта txdesc[4] (rtl8188f_hal_init.c:3258, SET_TX_DESC_SEC_TYPE_8188F).
+       БЕЗ SEC_TYPE в txdesc чип отправляет кадр plaintext, даже если ключи
+       в CAM и seccfg=0xCF. EAPOL msg4 НЕ защищается (уходит до установки
+       ключей на AP), поэтому для ethertype 0x888E Protected и SEC_TYPE не
+       ставятся. */
+    if (join_target.secure && ethertype != 0x888E) {
+        f[1] |= 0x40;              /* Protected (fc bit11) */
+        /* SEC_TYPE = AES (0x3): SET_BITS_TO_LE_4BYTE(pDesc+4,22,2,val) —
+           LE 32-бит слово на байтах txdesc[4..7]; бит22 = бит6 байта
+           txdesc[6]; биты[23:22] = биты 7,6 байта txdesc[6]. 0x3 = 11. */
+        buf[6] = (uint8_t)((buf[6] & 0x3Fu) | 0xC0u);   /* SEC_TYPE bits = 0b11 */
+    }
     for (i = 0; i < 6; i++) { f[4+i] = join_target.bssid[i]; f[10+i] = m[i]; f[16+i] = join_target.bssid[i]; }
     f[22] = 0; f[23] = 0;          /* seq */
 
