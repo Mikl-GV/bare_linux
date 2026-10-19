@@ -4501,6 +4501,20 @@ int h3_wifi_join_ap(void)
         uint32_t acc = 0;
         int waited = 0;
 
+        /* W.496: снять паузу TX. REG_TXPAUSE(0x0522)=0xFF означает «все очереди
+           на паузе» — драйвер ставит его при init/стопе и снимает (0x00) в
+           рабочем режиме. Мы этот регистр не трогали, поэтому data-очередь LOQ
+           могла стоять: тот же путь TX, что у mgmt (который ходит иначе), из-за
+           чего auth/assoc проходили, а data (DISCOVER/msg2) — нет. */
+        {
+            uint8_t txp = 0xFF;
+            h3_sdc_read_wlan_reg8(0x0522, &txp);
+            h3_sdc_write_wlan_reg8(0x0522, 0x00);
+            uart_print("  join: txpause was=0x");
+            uart_print_hex((uint32_t)txp);
+            uart_print(" -> 0x00\r\n");
+        }
+
         /* W.472: для WPA2-сети первый DISCOVER НЕ шлём в plaintext (AP после
            assoc ждёт только CCMP-encrypted; plaintext кадр дропается и висит
            в LOQ, задерживая msg4). Отправляем DISCOVER только ПОСЛЕ 4-way
