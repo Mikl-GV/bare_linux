@@ -4635,9 +4635,21 @@ int h3_wifi_join_ap(void)
                                             uint8_t m4[20];
                                             wpa_hmac_sha1(join_target.ptk, 16, p4, 4+95, m4);
                                             for (int k = 0; k < 16; k++) p4[4+77+k] = m4[k];
-                                            int m4rc = h3_wifi_tx_data(0x888E, p4, 8+95);
+                                            /* W.464: ДЛИНА кадра msg4 = 4(EAPOL hdr) + 95(тело) = 99,
+                                               а не 8+95=103 (был мусор-хвост 4 байта — строгий AP
+                                               игнорирует/отбрасывает). У msg2 длина уже точная. */
+                                            int m4rc = h3_wifi_tx_data(0x888E, p4, 4+95);
                                             uart_print(" msg4 tx rc=");
                                             uart_print_int(m4rc);
+                                            /* W.464 [диагностика]: msg4 — что уходит в эфир. kinfo
+                                               должен = 0x030A (TYPE|KEY_TYPE|MIC|SECURE), replay =
+                                               из msg3, nonce=0, kd_len=0, MIC!=0. */
+                                            uart_print(" kinfo=0x");
+                                            uart_print_hex((uint32_t)((b4[1]<<8)|b4[2]));
+                                            uart_print(" replay=");
+                                            for (int k = 0; k < 8; k++) { uart_print_hex((uint32_t)b4[5+k]); if (k<7) uart_print(":"); }
+                                            uart_print(" kdlen=");
+                                            uart_print_int((int)((b4[93]<<8)|b4[94]));
                                             /* Установить ключи в CAM чипа:
                                                pairwise TK = ptk[32..48) (AES-CCMP),
                                                group GTK = gtk[0..glen). */
