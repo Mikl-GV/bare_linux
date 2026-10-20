@@ -42,3 +42,8 @@ build_log.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+# Секреты (НИКОГДА не коммитить)
+docs/GITHUB-TOKEN.md
+# Локальные UART-каптуры
+uart_capture.txt
+
