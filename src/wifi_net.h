@@ -3,21 +3,27 @@
 
 #include <stdint.h>
 
-/* Состояние IPv4 после DHCP (задача «пинг с компа»). */
+/* Состояние IPv4 после DHCP. */
 struct net_state {
-    uint8_t have;      /* 1 = IP получен */
-    uint8_t ip[4];     /* наш IP (x.x.x.199) */
-    uint8_t net[4];    /* сеть (например 192.168.43.0) */
-    uint8_t mask[4];   /* маска подсети (из DHCP) */
-    uint8_t gw[4];     /* шлюз (опция 3, если есть) */
+    uint8_t have;      /* 1 = адрес подтверждён DHCP ACK */
+    uint8_t ip[4];     /* наш IP (из yiaddr OFFER'а) */
+    uint8_t net[4];    /* сеть (не заполняется) */
+    uint8_t mask[4];   /* маска подсети (DHCP опция 1) */
+    uint8_t gw[4];     /* шлюз (DHCP опция 3) */
 };
 
-/* Главная точка: отправить DHCP DISCOVER и подождать OFFER.
-   При успехе заполняет *st (have=1, ip=net+0.199). Возвращает 0 при успехе. */
+/* Отправить DHCP DISCOVER (broadcast). Возвращает 0 при успешной отправке. */
 int net_dhcp_discover(struct net_state *st);
 
-/* Реакция на входящий data-фрейм с ethertype=0x0800 (IPv4).
-   Парсит DHCP OFFER/ACK и настраивает IP. Вызывается из RX-обработчика data. */
-void net_handle_ipv4(const uint8_t *pkt, uint16_t len, struct net_state *st);
+/* Входящий IPv4 (после 802.11 + LLC/SNAP + ethertype).
+   src_mac — L2-адрес отправителя из 802.11-заголовка.
+   Обрабатывает DHCP (OFFER -> REQUEST, ACK -> фиксация адреса) и ICMP
+   echo request (отправляет echo reply). */
+void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
+                     struct net_state *st);
+
+/* Входящий ARP: отвечает на request, адресованный нашему IP. */
+void net_handle_arp(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
+                    struct net_state *st);
 
 #endif /* WIFI_NET_H */

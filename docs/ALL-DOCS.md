@@ -18,10 +18,13 @@
   11. [rtl8189fs-live-snapshot-big.md](#rtl8189fs-live-snapshot-big.md)
   12. [rtl8189fs-lakka-live-dump.md](#rtl8189fs-lakka-live-dump.md)
   13. [rtl8189fs-lakka-live-rx-dump-w7.md](#rtl8189fs-lakka-live-rx-dump-w7.md)
-  14. [W233-SDIO-TRACE.md](#W233-SDIO-TRACE.md)
-  15. [WIFI-FW-DOWNLOAD.md](#WIFI-FW-DOWNLOAD.md)
-  16. [I2S-REFERENCE.md](#I2S-REFERENCE.md)
-  17. [NEXT-CHAT-PROMPT.md](#NEXT-CHAT-PROMPT.md)
+  14. [lakka-live/LAKKA-LIVE-SNAPSHOT-W537.md](#lakka-live/LAKKA-LIVE-SNAPSHOT-W537.md)
+  15. [lakka-live/LAKKA-CAM-SECURITY.md](#lakka-live/LAKKA-CAM-SECURITY.md)
+  16. [lakka-live/LAKKA-MACREG-FULL.txt](#lakka-live/LAKKA-MACREG-FULL.txt)
+  17. [W233-SDIO-TRACE.md](#W233-SDIO-TRACE.md)
+  18. [WIFI-FW-DOWNLOAD.md](#WIFI-FW-DOWNLOAD.md)
+  19. [I2S-REFERENCE.md](#I2S-REFERENCE.md)
+  20. [NEXT-CHAT-PROMPT.md](#NEXT-CHAT-PROMPT.md)
 
 ---
 
@@ -35,14 +38,22 @@
 Прошивка **с нуля, без ОС и без библиотек**, для одноплатника
 **Orange Pi Lite** на SoC **Allwinner H3** (SUN8I 1680, 4× Cortex-A7).
 
-Цель проекта — поднять на голом железе всю переферию платы и её модули:
-сейчас работает **звук I2S0 → MAX98357A** и идёт разработка **WiFi-стека
-RTL8189FTV (SDIO)** — от инициализации чипа до RF-калибровки.
+Цель проекта — поднять на голем железе всю периферию платы и её модули:
+сейчас работают **звук I2S0 → MAX98357A**, **HDMI-меню**, **SDIO-доступ
+к WiFi-чипу RTL8189FTV (приём эфира, сканирование beacon/SSID)**. В планах —
+превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние: RTL8189FTV полностью инициализирован
-> (PowerSeq → загрузка FW → программный MAC), **RF-часть ожила**:
-> LSSI-доступ к RF-регистрам работает, калибровка **LCK** выполнена,
-> шина SDIO — 4-bit/6 МГц по эталонному dtb (образ Lakka 2.3.1).
+> Рабочее состояние (W.459): **полная host-ассоциация + завершённый 4-way
+> handshake WPA2 работают end-to-end**.
+> К любой сети из скана проходит ассоциация (AuthResp=0 → AssocReq → AssocResp=0 →
+> MSR=STA, rc=0). К открытым и WPA2-сетям (A05s, MTS_GPON_9290e0). Криптоядро
+> host-supplicant (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap —
+> проверено на хосте). Против WPA2-AP 4-way handshake доведён до конца:
+> EAPOL msg1 → msg2 (принят AP) → msg3 (GTK unwrap OK) → msg4 (tx rc=0) →
+> PTK/GTK в CAM чипа (`cam keys loaded`). DHCP DISCOVER после handshake
+> пересылается зашифрованным (CCMP). Стадия «получить DHCP OFFER → IP» — в работе.
+> Шина SDIO — 1-bit/50 МГц (4-bit ломает data-фазу CMD53). host не тянет
+> многоблочный SDIO read (только 1 блок/CMD53).
 
 ---
 
@@ -51,8 +62,8 @@ RTL8189FTV (SDIO)** — от инициализации чипа до RF-кал�
 | Блок | Статус | Подробности |
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
-| **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без FB U-Boot), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 в разработке | Скан 13 каналов работает (beacon/SSID); RPWM/HIMR через fn1; JOINBSS-движок (Auth/AssocReq) готов; до ассоциации (обработка AssocResp). |
+| **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join (rc=0, MSR=STA) к открытой и WPA2-сети; **WPA2 4-way handshake завершён** (msg1→msg2→msg3 GTK unwrap→msg4, PTK/GTK в CAM); DHCP DISCOVER переслан после handshake; ждём DHCP OFFER → IP. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -65,16 +76,49 @@ RTL8189FTV (SDIO)** — от инициализации чипа до RF-кал�
 3. Загрузка прошивки чипа (fwdl rc=0), eFuse (на OPi Lite пуст),
    программный MAC в REG_MACID 0x610-0x615 (readback совпал).
 4. **RF-часть**: включение BB/RF по `PHY_BBConfig8188F`, загрузка полного
-   BB-конфига (209 рег.), **LSSI-доступ к RF-регистрам**, калибровки **LCK/IQK**.
-5. **RX-приём** (W.329+): скан 13 каналов, парсер beacon/SSID. RPWM/CPWM/HIMR/
-   HISR через fn1. Эксперимент W.338: маска 0xC1 у драйвера не баг, C2H-ABSENT
-   не связана с RPWM.
-6. **JOINBSS-движок** (W.332+): host передаёт Auth/AssocReq кадры (не H2C 0x23),
-   захват BSSID+channel цели из скана, Retry.
+   BB-конфига (207 рег.), **LSSI-доступ к RF-регистрам**, калибров **LCK** и **IQK**.
+5. **RX-приём** (W.329+): чип принимает эфир на всех 13 каналах, выдача из
+   RX FIFO работает (по 1 блоку 512 б за CMD53 — host не тянет многоблок),
+   **парсер извлекает beacon и SSID** (`BCN plen=0x10F ch=2 ssid=midea_b8_6515`).
+6. **RPWM/CPWM/HIMR/HISR — через fn1** (SDIO-local, не fn0): с W.329 FW
+   подтверждает ACTIVE по смене toggle (cpwm=0x80, tog_sw=1), HIMR=0x01.
+   Эксперимент W.338: запись 0xCC в HRPWM1 даёт readback 0xCC, но CPWM
+   state[3:0] всё равно 0 — ACK на связке идёт только через toggle.
+7. **JOINBSS-движок** (W.332-W.413): host передаёт Auth/AssocReq кадры
+   (не H2C 0x23 — это P2P_LPS_PARAM); захват BSSID+channel из скана,
+   вызов из пункта меню Transfer с Retry (3 скана). Полная ассоциация
+   (rc=0, MSR=STA) к открытым и WPA2-сетям; при смене BSSID шлётся deauth
+   и выполняется drain RX FIFO перед новым auth (фикс flaky rc=-4).
+8. **DHCP (W.395-W.410)**: после assoc отправляется DHCP DISCOVER
+   (IP proto=UDP, broadcast); приём data-кадров после assoc (ARP/IPv6)
+   подтверждён. При WPA2 — пересылается после handshake (зашифрованный CCMP).
+   Цель — IP от AP (из yiaddr OFFER).
+9. **WPA2 (W.412-W.459)**: криптоядро host-supplicant готово; против WPA2-AP
+   проходит полный 4-way handshake: EAPOL msg1 → msg2 (принят AP, nonce min/max
+   фикс) → msg3 (GTK unwrap через RFC3394) → msg4 (key_info 0x030A, secure bit)
+   → PTK/GTK в CAM чипа. Handshake завершён; DHCP OFFER после него — в работе.
 
-Дальше — обработка Auth/AssocResp из RX-пути для подтверждения ассоциации,
-затем TCP/IP (фикс IP 192.168.x.199). Подробности и следующие шаги:
-`NEXT-CHAT-PROMPT.md`, `HARDWARE-REF.md`.
+### Известные ограничения (W.338+)
+
+- **host SDIO не тянет многоблочный read** — только 1 блок (512 б) за CMD53;
+  попытка прочитать большими записями даёт `rc=-1` и зависание. Поэтому RX-FIFO
+  выгребается по одному блоку в цикле.
+- **`RX0_REQ_LEN` (0x1C) может показывать большой накопленный объём**, не равный
+  размеру одного кадра; ориентиром для завершения служит сброс в 0 после выдачи.
+- **Парсер берёт 802.11-кадр на смещении off+24** (RX-дескриптор 24 байта,
+  drvinfo в этом build равен 0). SSID из IE с id=0.
+- **IPv4/arp приём** — ethertype читается big-endian (0x0800/0x86DD/0x888E),
+  что соответствует порядку байт в проводе.
+- **RX-агрегация**: чип может выдавать несколько кадров в одном окне
+  RX FIFO; парсер проходит по цепочке кадров (24+drvsz+plen, round 8).
+- **C2H-ABSENT**: FW не отдаёт C2H-пакеты в scan/связанном состоянии по
+  причине, зависящей от power-state. Ассоциация идёт host-кадрами
+  Auth/Assoc через RX-путь.
+
+Ближайший шаг: добиться **DHCP OFFER после WPA2 handshake** (после `cam keys
+loaded` DISCOVER пересылается зашифрованным CCMP; ждём OFFER → IP 10.72.75.x),
+затем пинг с ПК. Цель — «эмулятор + сетевой доступ к ROM на SD».
+Подробности: `NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
 
 ---
 
@@ -103,7 +147,7 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ на 0
 - Сборка многопоточная при желании: `make -j8 bin`.
 - Версия прошивки (`FW vW.xxx`) авто-инкрементируется при сборке
   (`tools/scripts/bump_version.sh`), выводится по UART и на экран.
-- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (размер ~10 КБ).
+- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~88 КБ).
 
 ## Заливка
 
@@ -157,15 +201,23 @@ Makefile       сборка (MSYS2 make, arm-none-eabi-gcc)
 | `HARDWARE-REF.md` | Аппаратная справка: регистры H3, звук, DMA, JTAG, WiFi/SDIO/RF. |
 | `KNOWLEDGE.md` | База знаний: проверенные факты, источники, уроки отладки. |
 | `REGISTER-MAP.md` | Снимки значений регистров со стенда (эталон). |
-| `NEXT-CHAT-PROMPT.md` | Контекст для продолжения разработки (WiFi: шина SDIO, RF-калибровки, RX). |
+| `NEXT-CHAT-PROMPT.md` | Контекст для продолжения разработки (WiFi: ассоциация, WPA2 4-way, DHCP). |
 | `HARDWARE-WIFI.md` | Справка по чипу RTL8189FTV и драйверу. |
 
 ## Git / точки восстановления
 
-Каждая рабочая точка фиксируется тегом:
+Каждая рабочая точка фиксируется коммитом (в `origin/main`) и, для ключевых
+вех, тегом. Последняя точка восстановления — **W.459** (4-way handshake WPA2
+завершён; коммиты `369c018` и последующий). Лог ветки:
 
 ```
-restore-W099-fw-ok     звук + базовый каркас (после чистки репо)
+git log --oneline -15
+```
+
+Примеры ранних тегов:
+
+```
+restore-W099-fw-ok     звук + базовый каркас
 w119-wifi-init         полная инициализация чипа (FW, MAC)
 w139-rf-lck            RF-часть: BB-конфиг, LSSI, калибровка LCK
 ```
@@ -718,29 +770,34 @@ I2C bit-bang: SCL=PG9, SDA=PG8, PCF8574 @0x27. Детект нажатий — �
 
 ---
 
-## 7. Поток выполнения WiFi-этапа (сводно, по логу W.338)
+## 7. Поток выполнения WiFi-этапа (сводно, актуально на W.316)
 
 ```
 SDIO CMD5→3→7 → CCCR → chip_id 0x024C:F179 → PowerSeq CARDEMU→ACTIVE
  → Fn1 enable → FW download (5 страниц, chksum OK, MCUFWDL=0xC6)
  → eFuse/MAC (программный 02:00:00:xx) → REG_MACID verify
  → LCD: MAC(101)+BB(207)+AGC(66)+RF(136) → LCK
- → RX: RPWM/CPWM/HIMR через fn1 (cpwm=0x80 tog_sw=1, HIMR=0x01),
-   H2C SET_PWR_MODE, IGI/MSR, FBR/CCCR, RFMOD, RQPN/LLT/bndy,
-   antenna_sel, BWOPMODE, CR=0x206FF
+ → RX: FW active (RPWM/CPWM), H2C SET_PWR_MODE, IGI/MSR, FBR/CCCR,
+   RFMOD, RQPN/LLT/bndy, antenna_sel, BWOPMODE, CR=0x206FF
  → IQK: PI, Tx/Rx one-shot, LOK_Result, restore
  → RX-sweep ch 1..13, probe request, чтение RX FIFO по 1 блоку
-   → парсер beacon → SSID (W.329: BCN plen= ch= ssid= на всех 13 каналах)
- → JOINBSS: захват BSSID+channel цели из скана, host Auth/AssocReq
-   (join: bssid=... ch=..., rc=0 — отправлены; подтверждение — след. шаг)
+   → парсер beacon → SSID (W.316: BCN plen= ch= ssid=)
+ → C2H-ping (H2C 0x43) → C2H-ABSENT (см. NEXT-CHAT-PROMPT)
 ```
 
 **Текущий статус (W.338):** хост-инициализация 1:1 с драйвером, **RX-приём
-работает** (beacon/SSID на 13 каналах). RPWM/CPWM/HIMR/HISR — через fn1;
-эксперимент W.338 показал: маска 0xC1 у драйвера не баг (0xCC не даёт state в
-CPWM), C2H-ABSENT не связана с RPWM. Реализован JOINBSS-движок (host
-Auth/AssocReq). Дальнейшие шаги (обработка Auth/AssocResp, TCP/IP) —
-в `NEXT-CHAT-PROMPT.md`.
+работает** — чип принимает beacon'ы на всех 13 каналах, парсер извлекает SSID.
+Хост-чтение RX-FIFO по 1 блоку (512 б)/CMD53 (host H3 не тянет многоблок).
+RPWM/CPWM/HIMR/HISR пишутся через **fn1** (SDIO-local), не fn0 — с W.329 FW
+подтверждает переход в ACTIVE по смене toggle (cpwm=0x80, tog_sw=1), HIMR=0x01.
+Эксперимент W.337/W.338: регистр HRPWM1 принимает полный 0xCC (rb=0xCC), но
+CPWM state[3:0] остаётся 0 — на этой связке FW репортит ACK только через
+toggle; маска 0xC1 у драйвера не баг, C2H-ABSENT **не связана** с RPWM.
+Реализован JOINBSS-движок (host передаёт Auth/AssocReq кадры, не H2C 0x23;
+захват BSSID+channel из скана; вызов из wifi_layer с Retry). Осталось:
+обработка Auth/AssocResp из RX-пути для подтверждения ассоциации, затем
+фикс IP (192.168.x.199) к цели «эмулятор + сетевой доступ к ROM на SD».
+Дальнейшие шаги — в `NEXT-CHAT-PROMPT.md`.
 
 ======================================================================
 # ДОКУМЕНТ: H3-BAREMETAL-GUIDE.md
@@ -750,12 +807,14 @@ Auth/AssocReq). Дальнейшие шаги (обработка Auth/AssocResp
 
 > Оранж Пи Лайт (Orange Pi Lite), SoC Allwinner H3 (SUN8I 1680, Cortex-A7).
 
-> **Версия:** 1.5
-> **Дата:** 2026-10-13
-> **Изменения (1.5):** WiFi-этап: RF-часть ожила — включение BB/RF по драйверу,
-> загрузка полного BB-конфига (209 рег.), LSSI-доступ к RF-регистрам (канал
-> читается/пишется) и калибровка LCK. Ранее (1.4): полная инициализация
-> RTL8189FTV — PowerSeq, fwdl rc=0, eFuse пуст, программный MAC в REG_MACID.
+> **Версия:** 1.7
+> **Дата:** 2026-10-19
+> **Изменения (1.7):** WiFi-этап: **ассоциация + полный 4-way handshake WPA2**
+> (W.369-W.459) — полный join (AuthResp=0→AssocResp=0→MSR=STA, rc=0) к открытым
+> и WPA2-сетям; криптоядро host-supplicant (SHA-1/HMAC/PBKDF2/PRF, AES-128,
+> RFC3394) и доведённый до конца 4-way (msg2 принят AP→msg3 GTK unwrap→msg4
+> secure→PTK/GTK в CAM). Ранее (1.5): полная инициализация RTL8189FTV — PowerSeq,
+> fwdl rc=0, eFuse пуст, программный MAC в REG_MACID.
 
 ---
 
@@ -769,6 +828,10 @@ Auth/AssocReq). Дальнейшие шаги (обработка Auth/AssocResp
 | 1.3 | 2026-10-11 | Этап WiFi (W.040+): CMD53-блок-запись заработала, CIS (Realtek 0x024C), 4-bit, power-on; добавлены `fw_blob.S` + `fw_nic.bin` и первый запуск загрузки прошивки. |
 | 1.4 | 2026-10-13 | WiFi-этап: рабочая последовательность init чипа — PowerSeq до Fn1, fwdl rc=0, eFuse пуст, программный MAC в REG_MACID (mac_set=OK, readback совпал). CMD53: фикс хвостов (write/read) и noinc-доступ к 0x610/0x614. |
 | 1.5 | 2026-10-13 | WiFi-этап: RF-часть ожила — включение BB/RF по `PHY_BBConfig8188F`, загрузка полного BB-конфига (209 рег.), LSSI-доступ к RF (канал читается/пишется), калибровка **LCK**. |
+| 1.6 | 2026-10-18 | WiFi-этап: **RX-приём заработал** (W.316). Чип принимает beacon'ы эфира, парсер извлекает SSID. Причина прошлых «мёртвых» сессий: host SDIO H3 не тянет многоблочный read (30 блоков → rc=-1) и сдвиг смещения кадра в парсере (off+28 вместо off+24). |
+| 1.7 | 2026-10-19 | WiFi-этап (W.369-W.459): **ассоциация + полный 4-way handshake WPA2**. Полный join (AuthResp=0 → AssocResp=0 → MSR=STA, rc=0) к открытым и WPA2-сетям; криптоядро host-supplicant (SHA-1/HMAC/PBKDF2/PRF, AES-128, RFC3394 unwrap); 4-way доведён до конца (msg1→msg2 принят AP→msg3 GTK unwrap→msg4 secure→PTK/GTK в CAM). DHCP OFFER на WPA2-сети — в работе. |
+| 1.7 | 2026-10-18 | **Дисплей выведен с нуля** (W.328): полный порт DE2/TCON1/HDMI по u-boot, картинка на стенде без FB U-Boot. display_init в начале kmain. Меню: Sound test / Transfer (WiFi) / Settings; WiFi вынесен в отдельный слой `wifi_layer.c`, вызывается из пункта Transfer. |
+| 1.8 | 2026-10-18 | WiFi-этап (W.329-W.338): **RPWM/CPWM/HIMR/HISR через fn1** (SDIO-local, не fn0) — скан на всех 13 каналах, декодирование beacon/SSID стабильно. Эксперимент W.338: запись 0xCC в HRPWM1 даёт rb=0xCC, но CPWM state[3:0]=0 — ACK идёт только через toggle, маска 0xC1 у драйвера не баг. Реализован JOINBSS-движок (host Auth/AssocReq кадры, захват BSSID+channel из скана, Retry). Дальше — обработка Auth/AssocResp из RX-пути для подтверждения ассоциации (цель «эмулятор + сетевой доступ к ROM на SD», фикс IP 192.168.x.199). |
 
 ### Версия прошивки
 - Определена в `include/version.h` (`FW_VERSION_STR`).
@@ -789,8 +852,13 @@ Auth/AssocReq). Дальнейшие шаги (обработка Auth/AssocResp
   (на Orange Pi Lite пуст) и **программная установка MAC** в REG_MACID 0x610-0x615
   с подтверждением readback. **RF-часть работает**: включение BB/RF + полный
   BB-конфиг (LSSI-интерфейс), RF-регистры читаются/пишутся через LSSI, канал
-  устанавливается, калибровка **LCK** выполнена.
-  с подтверждением readback. Полный стек WiFi (802.11/WPA2/TCP/IP) — в разработке.
+  устанавливается, калибровка **LCK** и **IQK** выполнены. **RX-приём работает
+  (W.338, 13 каналов)**: чип принимает beacon'ы эфира, парсер извлекает SSID
+  (`BCN plen= ch= ssid=`). RPWM/CPWM/HIMR/HISR через fn1; реализован
+  JOINBSS-движок (host Auth/AssocReq кадры, захват BSSID+channel из скана).
+  Хост-чтение RX-FIFO — по 1 блоку (512 б)/CMD53 (host H3 не тянет многоблок).
+  **Ассоциация (rc=0, MSR=STA)** и **полный 4-way handshake WPA2** (msg1→msg4,
+  PTK/GTK в CAM) работают; стадия DHCP OFFER → IP — в работе.
 
 ---
 
@@ -826,7 +894,7 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ гру
 ```
 
 - Артефакты: `h3_bare.elf`, `h3_bare.bin` (в корне проекта).
-- Размер бинаря ~10 КБ.
+- Размер бинаря ~88 КБ.
 
 ---
 
@@ -1347,23 +1415,49 @@ WIFI_EN — обычный GPIO (порт L, R_PIO), HIGHT — чип включ
   прошивка, power-seq, регистры чипа; соответствует драйверу в эталоне (образ 2.3.1).
 - Собственный SDC1-драйвер `src/h3_sdc.c` + `include/h3_sdc.h`.
 - SDIO-обмен работает: CMD5→CMD3→CMD7, CMD52 (обе функции), CMD53-блок-запись.
-- Чтение CIS: адрес 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek).
+- Чтение CIS: адрес 0x1000, тюпл 0x20/0x02 → Manufacturer 0x024C (Realtek), PID 0xF179.
 - 4-bit режим по эталону (dtb): CCCR 0x07 bit1=1 + SDC_CTYPE=1 +
   pinctrl drive-strength=30/pull-up (регистры DRV/PUL порта G).
 - Такт: OSC24M/2/2 = 6 МГц (фазы output/sample по таблице sunxi-mmc).
 - Reset контроллера: 20 мс стабилизации (патч u-boot 0015).
 - Power-on чипа: PowerSeq CARDEMU→ACTIVE (WIFI_EN=PL7).
 - Загрузка прошивки: протокол MCUFWDL (`h3_wifi_download_fw`), FW встроена
-  в бинарь (`src/fw_blob.S` + `fw_nic.bin`), загрузка на 4-bit/6 МГц.
-- RF-калибровка LCK, RX-тест, probe request (механика 802.11, TX FIFO HIQ).
+  в бинарь (`src/fw_blob.S` + `fw_nic.bin`), загрузка на 1-bit/50 МГц
+  (4-bit ломает data-фазу CMD53 на этом стенде).
+- RF-калибровки LCK/IQK, RX-приём (beacon/SSID), probe request (TX FIFO HIQ).
 
-### В работе
-- Завершить RX: счётчик принятых пакетов (RXPKT_NUM) — цель.
-- Ключевые наблюдения по SDC1:
+### В работе (W.329+)
+- **RX-приём работает**: чип принимает beacon'ы на всех 13 каналах, парсер
+  извлекает SSID (`BCN plen= ch= ssid=`), скан стабилен (5+ уникальных SSID).
+- **RPWM/CPWM/HIMR/HISR — через fn1** (SDIO-local, device id 0), не fn0.
+  С W.329 FW подтверждает переход в ACTIVE по смене toggle (cpwm=0x80, tog_sw=1),
+  HIMR=0x01. Эксперимент W.337/W.338: HRPWM1 принимает 0xCC (rb=0xCC), но
+  CPWM state[3:0] остаётся 0 — на связке чип/FW ACK идёт только через toggle;
+  маска 0xC1 в драйвере не баг, C2H-ABSENT не связана с RPWM.
+- Наблюдения по SDC1:
   - Для data-команд SDC1 не взводит CMD_DONE — ждать DATA_DONE.
   - Шина MMC1 — OLD mode (бит30=0), иначе карта не отвечает.
-  - SDIO-local регистры — device id 0, WLAN IOREG — device id 8.
-- Далее: приём beacon/probe-response, ассоциация, 802.11-стек.
+  - SDIO-local регистры — device id 0, WLAN IOREG — device id 8, RX FIFO — id 7.
+  - **Host SDIO H3 не тянет многоблочный read CMD53** (30 блоков → rc=-1);
+    только 1 блок (512 б) за CMD53.
+- JOINBSS-движок реализован (host Auth/AssocReq кадры; захват BSSID+channel
+  из скана; вызов из wifi_layer с Retry). Далее: обработка Auth/AssocResp из
+  RX-пути для подтверждения ассоциации, затем TCP/IP (фикс IP 192.168.x.199)
+  — цель «эмулятор + сетевой доступ к ROM на SD».
+- **Экран Transfer**: список сетей (дедуп по BSSID, dwell 300 мс), навигация
+  UP/DOWN, A=подключиться к выбранной (wifi_layer_connect). Целевая сеть для
+  теста — `MTS_GPON_9290e0`.
+- **ГЛАВНЫЙ БЛОКЕР TX (W.350-W.353)**: host пишет кадр в HIQ (wrc=0,
+  mgmt→HIQ=4 mapping верен), но **FW не берёт его в TX-очередь**:
+  `txpkt_empty=0xFF` (все очереди пусты) до и после, `TXFF_PTR` не сдвигается,
+  `hiq_free` не убывает. Вероятная причина — **A0=3 (S3 = Card Enable, RF off)**
+  против эталонного A0[1:0]=0x01; в S3 RX работает, TX невозможен. Правки
+  TX-enable (0x101[1]=1, 0x02[1:0]=11, REG_CR|=0xC0), прямая запись A0=1,
+  диагностика TRXFF_BNDY/PBP по 8-бит, udelay 50мс — внесены в W.353 (результат
+  на стенде за W.353). C2H нем на все H2C (SET_PWR_MODE id=0). Пока A0 не станет
+  S0/ACTIVE — JOINBSS/auth невозможны. Известные кандидаты: полная PwrSeq
+  (не упрощённый 7-шаговый seq_ce2ac), RPWM не доводит до S0 (state-биты мертвы,
+  W.337).
 
 ### Снимок JTAG (когда был нужен)
 - После U-Boot (SD): PG0-3 уже function 2 (SDC1), такт MMC1 включён, но WIFI_EN
@@ -1451,22 +1545,40 @@ WIFI_EN — обычный GPIO (порт L, R_PIO), HIGHT — чип включ
       H2C 0x6D={1} отправляется БЕЗ ожидания valid==0 (драйвер не ждёт,
       rtl8188f_cmd.c:96-127); C2H-пинг добавлен: H2C 0x43 (AP_REQ_TXRPT),
       детект по 0x1A0 / HISR bit17 / RXPKT bit16 → **C2H-ABSENT стабильно**.
-    **Симптом (финал, W.269)**: при 1:1 драйверной конфигурации
-    rxlen=0/pkt=0/hisr=0/c2h=0/rxpkt=0x00020000(RXDMA_IDLE)/fifopg=0x00E0020C
-    даже у роутера в 10 см. `trssi/cca/ofdm` — НЕ живые индикаторы (в драйвере
-    не читаются). **FW не приняла ни одного пакета** (счётчик [15:0]=0).
-    Проверено к W.269: H2C SCAN_ENABLE/MEDIA_STATUS/JOINBSSRPT в этом драйвере
-    НЕ используются (grep по .c — 0 вызовов); PHY_SwChnl идёт прямыми RF-записями
-    (не H2C); firmware-бинарник 0x4972 верен (сигнатура F1 88, заголовок 32 б);
-    8051 исполняет код (WINTINI_RDY); H2C mailbox верный (0x1D0/0x1F0/0x1CC);
-    RSVD_PAGE не пререквизит скана (только при connect); C2H идёт двумя путями
-    (регистр 0x1A0 и RX-пакет в FIFO) — оба мертвы; DMA/кэш H3 не причина
-    (CMD53 = PIO, IDMA не используется); fw_nic.bin == драйверный массив
-    (SHA256 C016CF54..., 18802 б). **Вывод**: хост-сторона, BB/RF-конфиг,
-    прошивка, mailbox, тайминги, кэш — исчерпаны полностью; блокер — внутреннее
-    состояние прошивки 8051 (RX-механизм не запущен). Следующие шаги — см.
-    NEXT-CHAT-PROMPT.md (E1: полный REG_CR одним значением; E2: H2C RSSI_SETTING;
-    E3: полный sdio-трейс живого драйвера). Эталон D7: rtl8189fs-lakka-live-rx-dump-w7.md.
+    **Результат сессии RX (финал, W.338): приём эфира работает на 13 каналах.**
+    - **Host SDIO H3 не тянет многоблочный read CMD53** (>1 блок/512 б → `rc=-1`
+      и зависание). Выдать пакет можно ТОЛЬКО по 1 блоку (512 б) за CMD53,
+      поэтому RX-FIFO выгребается в цикле по 512 б, `seq`/окно фиксируется на
+      пакет, инкремент `seq++` только когда `RX0_REQ_LEN` (0x1C) подтвердил 0.
+    - **`RX0_REQ_LEN` (0x1C) показывает накопленный объём, а не один кадр**;
+      ориентир завершения пакета — сброс 0x1C в 0 после выдачи.
+    - **Парсер: 802.11-кадр (beacon) на смещении off+24** (RX-дескриптор 24 б,
+      drvinfo в этом build = 0). SSID — IE с id=0. Парсер идёт по всем пакетам в
+      окне (`off += pkt_total`, round 8), выводит каждый beacon.
+    - **Результат: `BCN plen=0x10F ch=2 ssid=midea_b8_6515`** — реальный beacon
+      декодирован. RX-приём ок. Блокер был НЕ в прошивке 8051 (она как раз
+      принимала и копила в FIFO), а в host-чтении (30-блочный read) и в
+      неправильном смещении кадра (fallback drvsz сдвигал на 28 вместо 24).
+    - **W.329 (RPWM/CPWM/HIMR через fn1)**: SDIO-local регистры (device id 0)
+      доступны только через fн1. После перевода с fn0: cpwm=0x80 (tog_sw=1) —
+      FW подтверждает ACTIVE по смене toggle, HIMR=0x01.
+    - **Эксперимент W.338 (маска RPWM 0xC1 — НЕ баг)**: запись 0xCC в HRPWM1
+      даёт readback 0xCC (регистр хранит полный байт), но CPWM state[3:0]
+      остаётся 0 — на связке чип/FW ACK перехода идёт только через toggle,
+      как и в драйвере (rtw_pwrctrl.c:630). Снять версию «FW не в ACTIVE из-за
+      маски»; C2H-ABSENT не связана с RPWM.
+    - **JOINBSS (host Auth/AssocReq, W.332-W.338)**: ассоциацию в 8189fs делает
+      host, не FW — issue_auth (opensystem) → issue_assocreq, ответ AP идёт
+      в RX-путь. Реализован захват BSSID+channel цели из скана
+      (`join: bssid=... ch=...`), вызов из пункта Transfer с Retry.
+    - **Ассоциация + WPA2 4-way (W.369-W.459)**: полный join (AuthResp=0 →
+      AssocResp=0 → MSR=STA, rc=0) к открытым и WPA2-сетям; 4-way доведён до
+      конца (msg1→msg2 принят→msg3 GTK unwrap→msg4→PTK/GTK в CAM). Осталось:
+      добиться DHCP OFFER на WPA2-сети (после handshake DISCOVER переслан
+      зашифрованным CCMP) → IP 10.72.75.x → пинг с ПК — цель «эмулятор +
+      сетевой доступ к ROM на SD».
+
+    Эталон D7: rtl8189fs-lakka-live-rx-dump-w7.md.
 
 ---
 
@@ -1972,31 +2084,44 @@ RF 0x01 = 0x780   <- RF power-on
 RF 0xB0 = 0xDFBF0 (LDO ON) / 0xDFFF0 (LDO OFF)
 ```
 
+## Снимок RX W.316 — приём РАБОТАЕТ (beacon/SSID декодирован)
+
+> Актуально на W.316 (2026-10-18). Старые снимки ниже про `rxlen=0/pkt=0`
+> и «блокер физический приёмный тракт» — УСТАРЕЛИ: RX-приём ожил.
+
+```
+rx: t=0 ch=1 rxlen=0x0127 blk rc=0 blk rc=0 fifo_rd rc=0 read=0x400 rxlen2=0
+    BCN plen=0x0000010F ch=1 ssid=midea_b8_6515
+```
+
+Ключевые индикаторы живого RX-приёма (по всем 13 каналам):
+- `trxst` (0x11C RXFF_PTR) монотонно растёт (FIFO реально заполняется).
+- `pkt` (0x287) растёт с каждым каналом.
+- `hisr` (0x18) bit0=1 = RX_REQUEST — FW выложила пакет.
+- Парсер выводит `BCN plen= ch= ssid=` — кадр декодирован, SSID извлечён.
+
+Почему раньше «ни один пакет» (W.269-W.315): НЕ прошивка 8051 и НЕ физика.
+Причины: (1) host SDIO H3 не тянет многоблочный read CMD53 (30 блоков → rc=-1
+и зависание) — выдать можно только по 1 блоку 512 б/CMD53; (2) парсер искал
+кадр на off+28 (fallback drvsz=4), а реально beacon лежит на off+24;
+(3) парсер гейтился по `frc==0`, но лишний big-read возвращал -1. Исправлено
+в W.316: чтение по 1 блоку, drvsz из поля (0) без fallback, парсер по `acc>0`.
+
 ## Снимок RX-диагностики (полный init + RX-конфиг)
 
 ```
 rx: mcu=0xC6 (fw_rdy=1 rst=0)      <- 8051 загружена: RDY|ChkSum|WINTINI|RAM_DL_SEL
 rx: sf16=0xFC17 (cpu_en=1)          <- SYS_FUNC_EN (bit10 CPUEN взведён)
-rx: rpwm=0xC0 cpwm=0 (wake=0)       <- handshake не завершён (FW не ответила toggle)
+rx: rpwm=0xC0 cpwm=0x80 (tog_sw=1)  <- ACTIVE подтверждена по смене toggle (fn1)
 rx: rf18=0x401                      <- канал 1, BW 20М
 rx: llt=0x2020                      <- LLT построена (инкремент половины?)
 rx: rx_bndy=0x3EFF                  <- RX_DMA_BOUNDARY (0x0116)
 rx: cr=0x000207FF (bit17=1 bit8=1 bit9=1) <- NETTYPE_AP + MACTXEN + MACRXEN
-rx: rxpk=0x00020000 (rw_release=0)  <- 0x284: RXDMA_IDLE (BIT17; счётчик [15:0]=0); RW_RELEASE снят
-rx: himr_lo=0x07 hi=0x03            <- RX_REQUEST|AVAL|TXERR + C2HCMD
-rx: agg_th=0x03 drvinfo=0x04 rxdma=0x02
-rx: c2h_evt=0x0                     <- FW НЕ генерирует события (0x01A0)
-rx: hisr_before/after=0x0           <- SDIO-прерывания не приходят (0x18)
-rx: flt0/2=0xFFFF flt1=0x0400       <- RXFLTMAP все типы
-rx: fifopg=0x0 rxffptr=0x0          <- FIFOPAGE в порядке (LLT), указатель стоит
-rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0 <- ни одного пакета даже в 10 см от роутера
+rx: rxpkt=0x2X08000 (rw_release=0)  <- счётчик пакетов растёт; RXDMA_IDLE снят
+rx: himr_lo=0x01                    <- RX_REQUEST размаскирован (fn1)
+rx: hisr_before=0x01 (b0=1)         <- RX_REQUEST пришёл от FW
+rx: BCN plen=0x10F ch=2 ssid=midea  <- beacon декодирован (RX-приём работает)
 ```
-
-**Вывод (RX-конфигурация)**: вся RX-конфигурация по драйверу применена и readback подтверждает,
-8051 загружена (0xC6 — штатная маска), но событий нет (c2h=0, hisr=0, rxlen=0,
-pkt=0). Блокер — не регистры хоста, а отсутствие реакции 8051 (не в рабочем
-цикле RX) либо физическая чувствительность (IQK не сходится). Следующие шаги —
-NEXT-CHAT-PROMPT.md.
 
 ## Снимок (финал хост-стороны RX)
 
@@ -2441,6 +2566,43 @@ via SDIO interface on STM32F407». Прямое доказательство, ч
 - `sunxi-mmc-4.14.c` — драйвер хоста (полный, у нас в tools/wifi/rtl8189fs).
 - `ref/Lakka-Allwinner.orangepi_lite.arm-2.3.1.image` — образ (dtb, SYSTEM).
 - `tools/wifi/W233-SDIO-TRACE.md` — наш полный поадресный трейс (для сверки).
+
+## 6. Живая CAM-раскладка и REG_SECCFG (добавлено 2026-10-20)
+
+Снято с той же платы по SSH (10.72.75.55), подключена к той же сети
+**A05s пользователя М** (BSSID `9a:4d:56:7e:81:4f`, ch1, WPA2-PSK).
+Файлы: `docs/lakka-live/LAKKA-CAM-SECURITY.md`, `docs/lakka-live/LAKKA-MACREG-FULL.txt`.
+
+### CAM (HW, /proc/net/rtl8189fs/wlan0/sec_cam)
+
+```
+id ctrl   addr              kid type MK GK valid
+ 4 0x8010 9a:4d:56:7e:81:4f   0 AES  0  0  1   <- pairwise (BSSID)
+ 5 0x8051 9a:4d:56:7e:81:4f   1 AES  0  1  1   <- group GTK (BSSID!, keyid=1)
+```
+
+- **pairwise** → CAM entry **4**, `ctrl = BIT15|BIT6?0|AES<<2|keyid0`, **addr = BSSID**.
+- **group (GTK)** → CAM entry **5** (не 1, не 0), `ctrl = 0x8051` (`BIT15|BIT6|AES<<2|1`),
+  **addr = BSSID** (НЕ null!).
+- Остальные 0..15 — `ctrl=0`, invalid (мусор/остатки, чип их игнорирует).
+
+### REG_SECCFG
+
+```
+reg_scr = 0x010c  (SCR_CHK_KEYID BIT8 | SCR_RxDecEnable BIT3 | SCR_TxEncEnable BIT2)
+```
+
+- **Без** `SCR_CHK_BMC` (BIT9), **без** `TXBCUSEDK/RXBCUSEDK` (BIT6/BIT7) — для
+  WPA2-PSK (802.1X) их в эталоне НЕТ.
+- `sec_info: hw_decrypted=1, aes_sw_dec_cnt=0` — RX-декрипт аппаратный.
+
+### Вывод для bare-metal (W.537)
+
+1. `wpa_cam_write_key(4, bssid, ptk+32, 0)` — pairwise (у нас так).
+2. `wpa_cam_write_key(5, bssid, gk, 1)` — **GTK в slot 5 с MAC=BSSID** (а не 1+null).
+3. `REG_SECCFG = 0x010C` (16-бит), а не 0xCC/0x30C/0x34C.
+4. Прежняя запись GTK в entry 1 с null-MAC не находилась чипом при RX
+   (`cam_cache_chk` сверяет MAC) → `swdec=1` на broadcast.
 
 ======================================================================
 # ДОКУМЕНТ: rtl8189fs-live-snapshot.md
@@ -3565,6 +3727,329 @@ t4      0x000266826      0x0820b000      0x0830ea02     0x8c038300   0x00020000
 Вывод: у живого RX FIFO реально заполняется (RXFF_PTR движется, RX0_REQ_LEN ненулевой) — живой принимает beacon каждые 100 мс. У нас FIFO пуст, RX0_REQ_LEN=0 — чип не принял НИ ОДНОГО кадра, хотя BB 0xA08 (CCA) показывает ту же «занятость эфира». Разница на уровне «декодирования» (0xA50/0xA54) — у живого RX-статистика живая (декодер реально обрабатывает OFDM/CCK-сигнал), у нас статичная заглушка (декодер «слышит» энергию, но не валидные кадры).
 
 ======================================================================
+# ДОКУМЕНТ: lakka-live/LAKKA-LIVE-SNAPSHOT-W537.md
+======================================================================
+
+# Живые замеры с работающей Lakka 2.3.1 (H3 + RTL8189FTV, тот же чип)
+
+Дата: 2026-10-20. Получено напрямую по SSH с платы **10.72.75.55** (root/root), к которой подключена та же сеть **A05s пользователя М** (BSSID `9a:4d:56:7e:81:4f`, ch 1, WPA2-PSK) — ровно та, к которой подключается наш bare-metal.
+
+Это эталонные значения регистров, CAM и security-конфигурации, снятые с **реально работающего** стека на этом железе. Использовать как primary source при сверке.
+
+## Система
+
+```
+Linux Lakka 4.14.18 #1 SMP Fri Sep 13 14:36:07 CEST 2019 armv7l GNU/Linux
+8189fs  987136  0
+cfg80211 245760  1 8189fs
+wlan0: inet 10.72.75.55/24, MAC 02:81:38:27:88:cd
+Driver: v4.3.24_15589.20151023
+```
+
+## Security: CAM (главный ответ на «куда писать ключи»)
+
+```
+===/proc/net/rtl8189fs/wlan0/sec_cam===
+max_num:16, used:0x00000030
+reg_scr:0x010c
+
+HW sec cam:
+id ctrl   addr              key                              kid type MK GK valid
+ 0 0x0000 00:00:00:00:00:00 4c847c50...                       0 N/A  0  0  0
+ 1 0x0000 00:00:00:00:00:00 3d057864...                       0 N/A  0  0  0
+ 2 0x0000 00:00:00:00:00:00 8e232214...                       0 N/A  0  0  0
+ 3 0x0000 00:00:00:00:00:00 9c5eed2e...                       0 N/A  0  0  0
+ 4 0x8010 9a:4d:56:7e:81:4f 1f74306b43415fe984404ddbfc36c865   0 AES  0  0  1   <- pairwise (BSSID!)
+ 5 0x8051 9a:4d:56:7e:81:4f 6d6852f7ac066590331ed4dec354b2e1   1 AES  0  1  1   <- group GTK (BSSID!, keyid=1)
+ 6..15 ctrl=0x0000, invalid
+```
+
+SW-кэш (cache) — те же записи 4 и 5.
+
+**Вывод:** для STA-режима (A05s, WPA2, GTK keyid=1):
+- **pairwise**: CAM entry **4**, `ctrl=0x8010`, `addr = BSSID`.
+- **group (GTK)**: CAM entry **5** (НЕ 1, НЕ 0), `ctrl=0x8051`, `addr = BSSID` (НЕ null!), `kid=1`, group-бит.
+- `reg_scr = 0x010c` = `SCR_CHK_KEYID(BIT8)|SCR_RxDecEnable(BIT3)|SCR_TxEncEnable(BIT2)`.
+
+`sec_info`:
+```
+auth_alg=0x2, enc_alg=0x4, auth_type=0x7, enc_type=0x6
+hw_decrypted=1
+aes_sw_dec_cnt=0  (аппаратный RX-decrypt работает)
+```
+
+## MAC-регистры (выборочно, ключевые)
+
+Из `/proc/net/rtl8189fs/wlan0/mac_reg_dump`:
+
+| Адрес | Значение | Комментарий |
+|---|---|---|
+| 0x600 | `0x000206ff` | CR = MACTXEN\|MACRXEN (наш `0x206FF`) ✔ |
+| 0x608 | `0x700060ce` | **RCR (наш `0x700060CE`) ✔** |
+| 0x610 | `0x27388102` | наш MAC 02:81:38:27:88:cd |
+| 0x618 | `0x7e564d9a` | BSSID: 9a:4d:56:7e:81:4f ✔ |
+| 0x630 | `0x100a2828` | rateset |
+| 0x670 | `0x0000007d` | CAMCMD (последняя операция, bit17/read?) |
+| 0x674 | `0x4d9a8051` | **CAMWRITE word0 = 0x8051\|9a<<16\|4d<<24 → entry 5 GTK BSSID** ✔ |
+| 0x680 | `0x0000010c` | **REG_SECCFG = 0x10C** ✔ |
+| 0x6a0 | `0x0400ffff` | RXFLTMAP |
+
+## MLME/состояние
+
+```
+fwstate=0x9
+pmlmeinfo->state=0x4402
+qos_option=1, ht_option=1
+macid_info: id=0 (9a:4d:56:7e:81:4f, state C AP), id=1 (ff:.. bmc RSVD)
+current_tx_rate: macid 0 → MCS7
+```
+
+## Соответствие нашему bare-metal (W.537)
+
+| Параметр | Lakka (эталон) | Наш код до W.537 | Наш код W.537 |
+|---|---|---|---|
+| pairwise CAM | entry 4, BSSID, 0x8010 | entry 4, BSSID, 0x8010 ✔ | ✔ |
+| GTK CAM | entry 5, **BSSID**, 0x8051 | entry 1, **null**, 0x8051 ✘ | **entry 5, BSSID, 0x8051** ✔ |
+| REG_SECCFG | 0x010C | 0x030C/0x034C ✘ | **0x010C** ✔ |
+| RCR | 0x700060CE | 0x700060CE ✔ | ✔ |
+
+## Полный MAC-дамп сохранён
+
+Полный `mac_reg_dump` (0x000..0x7f0) — в файле `LAKKA-MACREG-FULL.txt` рядом.
+
+======================================================================
+# ДОКУМЕНТ: lakka-live/LAKKA-CAM-SECURITY.md
+======================================================================
+
+LAKKA 2.3.1 live, H3 + RTL8189FTV, A05s пользователя М (9a:4d:56:7e:81:4f)
+Снято 2026-10-20 по SSH (10.72.75.55). Полный дамп для сверки с bare-metal.
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/sec_cam (HW CAM)
+==========================================================================
+sec_cap:0x00
+flags:0x00000000
+max_num:16
+used:0x00000030
+reg_scr:0x010c
+HW sec cam:
+id ctrl   addr              key                              kid type    MK GK valid
+ 0 0x0000 00:00:00:00:00:00 4c847c507b546458d02c180daf3bbe77   0 N/A      0  0     0
+ 1 0x0000 00:00:00:00:00:00 3d05786404fa39d0a8667724ed471467   0 N/A      0  0     0
+ 2 0x0000 00:00:00:00:00:00 8e2322141383b3577c0b4fa45ca98014   0 N/A      0  0     0
+ 3 0x0000 00:00:00:00:00:00 9c5eed2ece4fbe45ef26cd675a523a45   0 N/A      0  0     0
+ 4 0x8010 9a:4d:56:7e:81:4f 1f74306b43415fe984404ddbfc36c865   0 AES      0  0     1
+ 5 0x8051 9a:4d:56:7e:81:4f 6d6852f7ac066590331ed4dec354b2e1   1 AES      0  1     1
+ 6 0x0000 00:00:00:00:00:00 1c9fbc724a74ff2d9484a48b05f67b4f   0 N/A      0  0     0
+ 7 0x0000 00:00:00:00:00:00 c6043b60f16f8527cbcef8b301ad9f7a   0 N/A      0  0     0
+ 8 0x0000 00:00:00:00:00:00 030a9f47b72ed7a03948de228f2c3986   0 N/A      0  0     0
+ 9 0x0000 00:00:00:00:00:00 6104d9d660aa1c73bf135ffe510a7066   0 N/A      0  0     0
+10 0x0000 00:00:00:00:00:00 b53b9642076d793342c7648f001d8bbb   0 N/A      0  0     0
+11 0x0000 00:00:00:00:00:00 f52dbfee6f42040af74c56849a5896a2   0 N/A      0  0     0
+12 0x0000 00:00:00:00:00:00 df0440b0367fd10c7679a0831e259506   0 N/A      0  0     0
+13 0x0000 00:00:00:00:00:00 0302c43c75ca37071db6c83d02601f1d   0 N/A      0  0     0
+14 0x0000 00:00:00:00:00:00 621d3a0191f9a6be12941f7ae6160362   0 N/A      0  0     0
+15 0x0000 00:00:00:00:00:00 e9bd2231ac4c04514a1194bd779d7607   0 N/A      0  0     0
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/sec_cam_cache (SW CAM cache)
+==========================================================================
+SW sec cam cache:
+id ctrl   addr              key                              kid type    MK GK valid
+ 4 0x8010 9a:4d:56:7e:81:4f 1f74306b43415fe984404ddbfc36c865   0 AES      0  0     1
+ 5 0x8051 9a:4d:56:7e:81:4f 6d6852f7ac066590331ed4dec354b2e1   1 AES      0  1     1
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/sec_info
+==========================================================================
+auth_alg=0x2, enc_alg=0x4, auth_type=0x7, enc_type=0x6
+hw_decrypted=1
+wep_sw_enc_cnt=0, 0, 0
+wep_sw_dec_cnt=0, 0, 0
+tkip_sw_enc_cnt=0, 0, 0
+tkip_sw_dec_cnt=0, 0, 0
+aes_sw_enc_cnt=0, 0, 2
+aes_sw_dec_cnt=0, 0, 0
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/ap_info
+==========================================================================
+SSID=A05s пользователя М
+sta's macaddr:9a:4d:56:7e:81:4f
+cur_channel=1, cur_bwmode=0, cur_ch_offset=0
+wireless_mode=0xb, rtsen=0, cts2slef=0
+state=0x1, aid=8, macid=0, raid=3
+qos_en=1, ht_en=1, init_rate=19
+bwmode=0, ch_offset=0, sgi_20m=1,sgi_40m=0
+ampdu_enable = 1
+agg_enable_bitmap=0, candidate_tid_bitmap=0
+ldpc_cap=0x0, stbc_cap=0x0, beamform_cap=0x0
+tid=0, enable=1, ampdu_size=16, indicate_seq=236
+tid=6, enable=0, ampdu_size=255, indicate_seq=2
+tid=7, enable=1, ampdu_size=16, indicate_seq=65535
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/macid_info
+==========================================================================
+max_num:16
+used:0x00000003
+id  bmc if_g ch_g macaddr           status
+  0   0    0   -1 9a:4d:56:7e:81:4f  C AP
+  1   1   -1   -1 ff:ff:ff:ff:ff:ff  RSVD
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/current_tx_rate
+==========================================================================
+macid if_g macaddr           tx_rate
+    0    0 9a:4d:56:7e:81:4f MCS7
+
+==========================================================================
+/proc/net/rtl8189fs/wlan0/fwstate / mlmext_state / qos_option / ht_option
+==========================================================================
+fwstate=0x9
+pmlmeinfo->state=0x4402
+qos_option=1
+ht_option=1
+
+======================================================================
+# ДОКУМЕНТ: lakka-live/LAKKA-MACREG-FULL.txt
+======================================================================
+
+LAKKA 2.3.1 live, H3 + RTL8189FTV, A05s пользователя М (9a:4d:56:7e:81:4f)
+Полный MAC-регистровый дамп, снят 2026-10-20 по SSH.
+Любые значения нашего bare-metal можно сверять с этим списком.
+
+======= MAC REG =======
+0x000 0xfc1706fa  0x00020002  0x0020fca3  0x00000000
+0x010 0x00417041  0x04000000  0x00400100  0x078ff900
+0x020 0x0c0000c1  0x354107df  0x1c2cb1f1  0x00001c15
+0x030 0x8020fdfb  0x3c000000  0x00000843  0x00002e22
+0x040 0x00000008  0x00000003  0x0000f000  0x01028282
+0x050 0x80000000  0x00000000  0x00000000  0x00000000
+0x060 0xeaeaeaea  0x00800000  0x00002000  0x80020002
+0x070 0x00030080  0x000000a0  0x94018041  0x00000003
+0x080 0x070405c6  0x80000000  0x00000c0c  0x00000000
+0x090 0xff000000  0xeaeaeaea  0xeaeaeaea  0x00000000
+0x0a0 0x0200000f  0x36789abc  0xeaeaeaea  0xeaeaeaea
+0x0b0 0x00000000  0x60d00000  0x00000000  0x00000200
+0x0c0 0x06677889  0x0000000c  0x00000000  0x00068129
+0x0d0 0x0001f802  0x00000000  0x00000000  0x00000000
+0x0e0 0x00000000  0xeaeaeaea  0xeaeaeaea  0x98013f15
+0x0f0 0x60441523  0x00000000  0xc2030000  0x6700000c
+0x100 0x000206ff  0x00000110  0x00000000  0x0000f5b4
+0x110 0x00000000  0x3f7f0ff8  0x00000000  0x32103210
+0x120 0x00000000  0x00000080  0x00000000  0x00000000
+0x130 0x32070012  0x00000009  0x62030106  0x10000200
+0x140 0x00000000  0x00000000  0x00000000  0x00000000
+0x150 0x00000000  0x00000000  0x00000000  0x00000000
+0x160 0x00000000  0x00000001  0x00000000  0x00000000
+0x170 0x00000000  0x00000002  0xffffffc0  0xffe00000
+0x180 0x00000000  0x00000000  0x00000000  0x00000000
+0x190 0x00000000  0x10000001  0x00000880  0x00000000
+0x1a0 0x00000000  0x00000000  0x00000000  0x00000000
+0x1b0 0x00000000  0x00000000  0x12340808  0x00000000
+0x1c0 0x006d1001  0xfe00b75d  0x00000093  0x00000000
+0x1d0 0x44000042  0x44000042  0x44000042  0x44000042
+0x1e0 0x00000000  0x00200701  0x00070000  0x00000000
+0x1f0 0x00000004  0x00000004  0x00000004  0x00000004
+0x200 0x00e7020c  0x00e7020c  0x9900f810  0x00fd0000
+0x210 0x00000000  0x00000202  0x00000000  0x00000000
+0x220 0x00000000  0x00002020  0x0000f800  0x00000000
+0x230 0x00000000  0x00000000  0x00000000  0x00000000
+0x240 0x00000000  0x00000000  0x00000000  0x00000000
+0x250 0x00000000  0x00000000  0x00000000  0x00000000
+0x260 0x00000000  0x00000000  0x00000000  0x00000000
+0x270 0x00000000  0x00000000  0x00000000  0x00000000
+0x280 0x2000010f  0x00020000  0x00000000  0x00000000
+0x290 0x0000000e  0x00003f80  0x00000000  0x00000000
+0x2a0 0x00000000  0x00000000  0x00000000  0x00000000
+0x2b0 0x00000000  0x00000000  0x00000000  0x00000000
+0x2c0 0x00000000  0x00000000  0x00000000  0x00000000
+0x2d0 0x00000000  0x00000000  0x00000000  0x00000000
+0x2e0 0x00000000  0x00000000  0x00000000  0x00000000
+0x2f0 0x00000000  0x00000000  0x00000000  0x00000000
+0x300 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x310 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x320 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x330 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x340 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x350 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x360 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x370 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x380 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x390 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x3a0 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x3b0 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x3c0 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x3d0 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x3e0 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x3f0 0xeaeaeaea  0xeaeaeaea  0xeaeaeaea  0xeaeaeaea
+0x400 0x014d8299  0x007f80ff  0x007f80ff  0x007f80ff
+0x410 0x027f80ff  0x007f80ff  0x0ffe00f8  0x000000f8
+0x420 0xff311f00  0x9a30f8f8  0x3030100a  0x00004000
+0x430 0x00000000  0x04030201  0x04030201  0x08070504
+0x440 0x0080015f  0x00000010  0xfffff000  0x00000010
+0x450 0x003ff000  0xf6700005  0x00003fff  0x1000f800
+0x460 0x03084444  0x00ff00ff  0x007f80ff  0x007f80ff
+0x470 0x007f80ff  0x007f80ff  0x00000000  0x06060001
+0x480 0x000c0400  0x00000000  0x00000000  0x00000000
+0x490 0x00000000  0x00000000  0x00000000  0x00000000
+0x4a0 0x00000000  0x00000000  0x00000000  0x12010200
+0x4b0 0x40404040  0x00000000  0x00000000  0x000400c0
+0x4c0 0x04000400  0x80040340  0x0c1f08ff  0x0201ff7f
+0x4d0 0x00000000  0x00000000  0x00000000  0x000002bc
+0x4e0 0x06000000  0x25240c0c  0x06060606  0x00000000
+0x4f0 0x0000c100  0x00200001  0x00000000  0xffff0000
+0x500 0x002f3222  0x005e4322  0x005ea42b  0x0000a44f
+0x510 0x2800660f  0x100a100a  0x0914fe00  0x00000000
+0x520 0x00003f0f  0x21ff4f0f  0x806c0a8f  0x00000000
+0x530 0x00000000  0x00000000  0x00000000  0x00000000
+0x540 0x80006404  0x00400180  0x00000000  0x00000000
+0x550 0x00001009  0x00640064  0x00020202  0x0f0fff28
+0x560 0x21f6007c  0x000000a6  0x1f77a1b7  0x00000000
+0x570 0x000a0002  0x03ff1000  0x00000000  0x00000000
+0x580 0x00000000  0x00000000  0x00000000  0x06200060
+0x590 0x300f000f  0x00000000  0x00000000  0x00000000
+0x5a0 0x02020202  0x00010202  0x00000000  0x00000000
+0x5b0 0x00000000  0x00000000  0x00000000  0x00000000
+0x5c0 0x00000000  0x00000000  0x00000000  0x11e21051
+0x5d0 0x00000000  0x00000000  0x00000000  0x00000000
+0x5e0 0x00001000  0x00003000  0x00001000  0x00000003
+0x5f0 0x00000000  0x00000000  0x00000000  0xffff0000
+0x600 0x00000000  0x00003000  0x700060ce  0x04000418
+0x610 0x27388102  0x0000cd88  0x7e564d9a  0x00004f81
+0x620 0xffffffff  0xffffffff  0x00000000  0x00000000
+0x630 0x00000000  0x00000000  0x100a2828  0x0a0a0808
+0x640 0x00401440  0x00000000  0x00000000  0x00000000
+0x650 0x00eb0426  0x00000000  0xffffffff  0xffffffff
+0x660 0x00b40010  0xa0000000  0x0e301000  0x00052000
+0x670 0x0000007d  0x4d9a8051  0x07769d77  0x0000c004
+0x680 0x0000010c  0x00000000  0x00000000  0x00000000
+0x690 0x000f0020  0x000a0200  0x00000000  0x00000000
+0x6a0 0x0400ffff  0x0000ffff  0x00000000  0x00000000
+0x6b0 0x00000000  0x00000000  0x00010008  0x00000000
+0x6c0 0x00000000  0x00000000  0x00000000  0x00000000
+0x6d0 0x00000000  0x00000000  0x0000003f  0x00000000
+0x6e0 0x7e564d9a  0x00004f81  0x7e564d9a  0x00004f81
+0x6f0 0x00011404  0x00000000  0x00000000  0x00000000
+0x700 0x87654321  0x00000000  0x87654321  0x00000000
+0x710 0x00000000  0x00000000  0x20000200  0x00000000
+0x720 0x00000000  0x00000000  0x00000000  0x00000000
+0x730 0x00000000  0x00000000  0x00000000  0x00000000
+0x740 0x00000000  0x00000000  0x00000000  0x00000000
+0x750 0x00000000  0x00000000  0x00000000  0x00000000
+0x760 0x00000000  0x00000000  0x00000000  0x00000000
+0x770 0x00000000  0x00000000  0x00000000  0x00000000
+0x780 0x00000000  0x00000000  0x00000000  0x00000000
+0x790 0x00000000  0x00000000  0x00000000  0x00000000
+0x7a0 0x00000000  0x00000000  0x00000000  0x00000000
+0x7b0 0x00000000  0x00000000  0x00000000  0x00000000
+0x7c0 0x00000000  0x00000000  0x00000000  0x00000000
+0x7d0 0x00000000  0x00000000  0x00000000  0x00000000
+0x7e0 0x00000000  0x00000000  0x00000000  0x00000000
+0x7f0 0x00000000  0x00000000  0x00000000  0x00000000
+
+======================================================================
 # ДОКУМЕНТ: W233-SDIO-TRACE.md
 ======================================================================
 
@@ -3886,11 +4371,11 @@ f1 88 10 00 01 00 07 00 10 22 17 28 52 49 02 00 e7 26 00 00 00 00 00 00 00 00 00
 # ДОКУМЕНТ: NEXT-CHAT-PROMPT.md
 ======================================================================
 
-# Промпт для следующего чата (продолжение WiFi-этапа: RX)
+# Промпт для следующего чата (продолжение WiFi-этапа: DHCP после WPA2)
 
 > Вставьте этот текст в начало нового чата с MultiTool, чтобы восстановить контекст.
-> Дата: 2026-10-17. Проект: `E:\Giga_1\Bare_linux` (Allwinner H3, Orange Pi Lite, RTL8189FTV по SDIO).
-> Точка стенда: W.269 собрана/залита/запущена (лог — ниже). Рабочая точка git: до тега w210-rx-fifo-iqk добавлены W.248-W.269 (не коммичено).
+> Дата: 2026-10-19. Проект: `E:\Giga_1\Bare_linux` (Allwinner H3, Orange Pi Lite, RTL8189FTV по SDIO).
+> Точка стенда: **W.459**. Рабочая точка git: коммит `369c018` (пушнут); правки W.459 в рабочем дереве.
 
 ---
 
@@ -3901,128 +4386,62 @@ f1 88 10 00 01 00 07 00 10 22 17 28 52 49 02 00 e7 26 00 00 00 00 00 00 00 00 00
 (полный, с поддержкой 8188F; версия v4.3.24_15589.20151023 — та же, что в
 эталонном образе Lakka 2.3.1, ядро 4.14.18). Сравнивай ТОЛЬКО с ним.
 
-## Текущее состояние (подтверждено на стенде, W.248-W.269)
+## Текущее состояние (подтверждено на стенде, W.458/W.459)
 
-Полная цепочка инициализации работает 1:1 с драйвером:
-1. SDIO (1-bit/50 МГц — рабочая шина стенда; 4-bit ломает CMD53): CMD5→CMD3→
-   CMD7, chip_id (manf=0x024C, card=0xF179), PowerSeq CARDEMU→ACTIVE, Fn1,
-   загрузка FW (fwdl rc=0, MCUFWDL=0xC6 штатное), eFuse/программный MAC.
-2. Конфигурация: MAC_REG (101) + BB-конфиг (207) + AGC (66) + RF RadioA (136,
-   пропуск записи 0x18) + LSSI + LCK (70 мс) + RFMOD(0x800)=0x83045700
-   (bCCKEn=bit24, bOFDMEn=bit25).
-3. RX-конфиг 1:1: RQPN(0x200=0xE7020C)+NPQ(0x214=0x02) → TX-границы → LLT →
-   rx_bndy(0x116=0x3F7F) → BWOPMODE(0x603=0x04) → SIFS/RL/EDCA → PBP/DRVINFO →
-   NETTYPE_AP → RCR=0x7000604E → RRSR=0x1F5F → RXFLTMAP → MAR → RXDMA agg →
-   REG_CR=0x206FF (MACTXEN/MACRXEN) → HSIMR/C2H clear → HIMR → HISR clear →
-   RXPKT_NUM(0x284) → H2C SET_PWR_MODE (box0 0x1D0 + EX 0x1F0) → CCCR/FBR INT →
-   RPWM=0x00/CPWM=0x00 → antenna_sel (LEDCFG2 |= BIT7, W.264).
-4. IQK (W.261-W.265): в точке драйвера, PI/SI-режим, MAC/BB/RF-обвязка
-   полная. W.265: сохранение LOK_Result (RF 0x08) после Tx one-shot и
-   восстановление после каждого Rx one-shot (как драйвер :737/:894) →
-   **RF 0x08 = 0x8F800** (было 0x85000; у живого 0xF800). Tx OK/Rx OK.
-5. W.267: убран тяжёлый UART-вывод из цикла свипа (cca/trssi/rxrpt) —
-   тайминги не искажаются.
-6. W.268/W.269: H2C 0x6D={1} отправляется БЕЗ ожидания valid==0 (драйвер не
-   ждёт, rtl8188f_cmd.c:96-127); финальный 0x6D={0} — с ожиданием снятия valid.
+**Ассоциация к открытым и WPA2-сетям + полный 4-way handshake WPA2 РАБОТАЮТ.**
 
-## Симптом (что не работает) — НЕ ИЗМЕНИЛСЯ
+- Полный 802.11 join (rc=0, MSR=STA) к A05s и к WPA2-сетям (A05s закрытая,
+  pass `8645449Qq`, и MTS_GPON_9290e0).
+- **WPA2 4-way доведён до конца** (лог W.458, 3 повтора стабильно):
+  `msg2 tx rc=0` (AP принял) → `EAPOL msg3 (GTK) gtk_ok len=48` (RFC3394 unwrap) →
+  `msg4 tx rc=0` → `cam keys loaded` (PTK/GTK в CAM чипа).
+- Правки W.459 в рабочем дереве:
+  1. **msg4 key_info = 0x030A** (вер2|pairwise|MIC|**secure**) — было 0x0042 (без
+     Secure-бита), из-за чего AP не принимал msg4 и повторял msg3.
+  2. msg4: Nonce=0, EAPOL ver=1, replay из msg3, key_len=0.
+  3. DHCP DISCOVER пересылается **после** handshake (wpa2_done) — первый ушёл
+     plaintext до PTK и был дропнут AP.
+  4. Диагностика после загрузки ключей: дамп `cam: seccfg=0x0680 camcmd=0x0670`.
 
-```
-rx: mcu=0xC6 (fw_rdy=1 rst=0)        <- 8051 исполняет FW (WINTINI_RDY=1)
-rx: h2c_pwrmode 1cc=0x00             <- H2C 0x20 (SET_PWR_MODE) FW ЗАБИРАЕТ
-iqk: h2c_sent 0x6D={1} 1cc=0x01      <- H2C 0x6D (BT_WLAN_CALIBRATION) valid НЕ
-                                       снимает (калибрует), 1e7 cal_ready=0
-iqk: h2c0_pre 1cc=0x01 / h2c0_after 1cc=0x01  <- финал 0x6D={0} НЕ ушёл
-rx: c2h_ping 0x1A0=0 payload=0 hisr=0 rxpk=0x20000 C2H-ABSENT  <- 8051 не
-                                       генерирует C2H (ни регистром, ни в FIFO)
-rx: t=0..11 ch=1/6/11 rxlen=0 pkt=0  <- ни одного кадра
-rx: rxpk=0x00020000 (RXDMA_IDLE bit17, счётчик [15:0]=0)
-```
+## Симптом (что осталось неработающим)
 
-Главный вывод D10: 8051 читает H2C-боксы ЧАСТИЧНО (0x20 забирает, 0x6D/0x43 —
-нет), но **RX-механизм FW не запущен**: RX FIFO пуст, C2H не идёт ни одним из
-двух путей, TX-страницы (hiq_free=12) не расходуются. Проблема во внутреннем
-состоянии прошивки 8051, а НЕ в хост-конфиге (он 1:1), не в mailbox (верный),
-не в таймингах UART (W.267 — тишина не помогла) и не в прошивке (идентична
-драйверной, SHA256 C016CF54..., 18802 байта).
+После `cam keys loaded` AP продолжал повторять msg3 (не принимал msg4), поэтому
+DHCP OFFER не приходил (`WPA2 pending (eapol=3), no DHCP/IP`). W.459 лечит это
+правкой key_info msg4; после неё ждём завершения handshake и DHCP OFFER.
 
-## Проверено и ЗАКРЫТО (не возвращаться без новой информации)
-
-- H2C mailbox: box0=0x01D0, ext=0x01F0, poll 0x1CC (HMETFR — статус, бит N=«box
-  N занят»). Пишем правильно (не в 0x1CC).
-- C2H у 8188F идёт двумя путями: регистровый REG_C2HEVT_CMD_ID 0x1A0
-  (id=[3:0], len=[7:4], seq=0x1A1, payload 0x1A2+, clear 0x1AF=0x00) и RX-пакет
-  в FIFO (rtl8188f_c2h_packet_handler, rtl8189fs_recv.c:343). Оба мертвы.
-- RSVD_PAGE (H2C 0x00) — НЕ пререквизит скана (вызывается только при connect,
-  rtl8188f_cmd.c:889). site_survey не шлёт H2C.
-- H2C SCAN_ENABLE(0x02)/MEDIA_STATUS_RPT(0x01)/JOINBSSRPT в реальном скане не
-  вызываются (grep=0). PHY_SwChnl — прямые RF-записи, не H2C.
-- MCUFWDL=0xC6 — ШТАТНОЕ. RCR 0x7000604E — верный для скана (CBSSID_DATA вкл,
-  BCN снят). RFMOD: bCCKEn=bit24/bOFDMEn=bit25.
-- DMA/кэш H3: CMD53 — чистый PIO (FIFO-регистр контроллера, IDMA не
-  используется — регистры DLDA/DTDL не трогаем). Uncached стоит только там,
-  где реально читает DMAC (звук/LLI). Кэш-когерентность НЕ причина.
-- Прошивка: fw_nic.bin == Array_MP_8188F_FW_NIC из драйвера (SHA256
-  C016CF54..., 18802 б) — дерево решений «равнозначность FW» закрыто.
-- Регистр чипа: RTL_ID=BIT23 в REG_SYS_CFG(0xF0) — драйвер различает
-  TEST_CHIP/NORMAL_CHIP, RX-путь не меняет.
-- RX-дескрипторы: в SDIO-ветке 8188F их НЕТ (rtl8188fs_init_recv_priv — только
-  буферы+tasklet; REG_RX_DESA не используется). Приём через RX FIFO+HISR.
-- Живой эталон (D7, rtl8189fs-lakka-live-rx-dump-w7.md): совпадает 1:1 с нами
-  по всем ключевым регистрам; отличается только RXFF_PTR (у живого движется,
-  у нас 0), RX0_REQ_LEN (живой ненулевой), RF 0x08 (живой 0xF800, наш 0x8F800).
-- Деревья решений «дескрипторы», «mailbox», «RSVD_PAGE», «кэш/DMA»,
-  «прошивка», «тайминги» — ВСЕ ЗАКРЫТЫ. Упираемся в 8051/RX-механизм FW.
-
-## ОСТАЛОСЬ (следующие шаги по порядку — выбирай один)
-
-### E1. [НЕ ПРОБОВАЛОСЬ] Включить RX DMA агрессивнее
-В драйвере sdio_halinit.c:196 `value16 |= (HCI_TXDMA_EN | HCI_RXDMA_EN |
-TXDMA_EN | RXDMA_EN | PROTOCOL_EN | SCHEDULE_EN | ENSEC | CALTMR_EN)` — это
-REG_CR (0x102, 16-бит) как ЕДИНОЕ значение 0x0206FF. У нас CR=0x206FF читается
-как 0x06FF0002 (эндью), но в RX-блоке мы делаем bit6+bit7+bit17 в несколько
-заходов. Стоит проверить, что REG_CR полное значение = 0x0206FF (все биты
-HCI_RXDMA/RXDMA_EN/SCHEDULE/ENSEC/CALTMR) — возможно, не хватает CALTMR/SCHEDULE.
-
-### E2. [НЕ ПРОБОВАЛОСЬ] H2C RSSI_SETTING (0x42) перед сканом
-Драйвер шлёт rtw_hal_set_FwRssiSetting перед работой. Возможно, FW не
-активирует RX без настройки MACID/RSSI. Один H2C — дёшево.
-
-### E3. [РЕКОМЕНДУЕТСЯ] Полный sdio-трейс живого драйвера
-Единственный способ увидеть, что драйвер делает МЕЖДУ известными точками:
-модифицированный rtl8189fs с логом каждой sdio_write/read на старте + первый
-пробе, побайтовый дифф с нашей инициализацией (мы прошли ~90% его путей, но
-может быть скрытая операция до scan).
-
-### E4. [НЕ ПРОБОВАЛОСЬ] Разные FW
-Хотя FW идентична драйверной, попробовать слить из Lakka /lib/firmware/rtlwifi/
-реальный rtl8188efw.bin (вместо встроенного массива) — вдруг в образе другой
-билд (хотя сигнатура совпадает — маловероятно).
+Следующий шаг — **добиться DHCP OFFER на WPA2-сети** (после `cam keys loaded`
+DISCOVER переслан зашифрованным CCMP) → IP 10.72.75.x → пинг с ПК. Цель —
+«эмулятор + сетевой доступ к ROM на SD».
 
 ## Критические предостережения (не наступить дважды)
 
 - `MCUFWDL=0xC6` — ШТАТНОЕ, не сбрасывать биты.
 - `REG_CR` — 32-бит RMW (bit17/8/9 теряются при 16-бит).
-- HIMR (0x14) — писать 4-байтно CMD53 (CMD52-байт не прилипал: himr_lo=0x07).
+- HIMR (0x14) — писать 4-байтно CMD53 CMD53 через fn1 (CMD52-байт не прилипал).
 - H2C многословный: box0 0x1D0 (id+b0..b2) + EX 0x1F0 (остальные),
   НЕ 0x1D4/0x1D6. **НЕ ПИСАТЬ 0x00 в 0x1CC (HMETFR)** — сбивает valid.
-  После 0x6D={1} НЕ ждать valid==0 (драйвер не ждёт) — FW калибрует.
-- RPWM: 0x00 = active (0xC0 = запрос LPS!). CPWM 0x38.
-- Каналы в работе: RF 0x18 = 0xC01/0xC06/0xC0B (BW20 | ch, маска 0x3FF),
-  НЕ 0x8C01/0x401 (0x8C01 включает бит15 — режим калибровки, ломает приём).
-- REG_CR бит6/7 (MACTXEN=6, MACRXEN=7) обязательны.
+- **H2C 0x6D (BT_WLAN_CALIBRATION) и 0x42 (RSSI_SETTING) НЕ отправлять** — FW
+  вешает box0 (valid не снимает), калибрует вхолостую, ломает последующие H2C.
+- RPWM: активный запрос = S4 (0x0C)|toggle(0x80) с маской 0xC1 (+0x40 при
+  переходе), через fn1. CPWM поллить по СМЕНЕ bit7 (tog_sw), не по state.
+- Каналы в работе: RF 0x18 = (BW20 0xC00) | ch в [7:0], маска канала 0x3FF.
+  НЕ 0x8C01 (bit15 — режим калибровки, ломает приём).
 - RFMOD: bCCKEn=BIT24, bOFDMEn=BIT25 (НЕ 16/17!).
-- RF-таблицу грузить с ПРОПУСКОМ записи 0x18; после неё явно 0x401.
-- RCR: для скана снимать CBSSID_BCN (bit7), AM(bit2)+CBSSID_DATA(bit6) оставлять.
-- REG_RXPKT_NUM = 0x284 (НЕ 0x287 — это старший байт 0x284+RXDMA_STATUS).
-- PI-режим IQK: 0x860/0x868 = 0x01000100 (ON) / 0x01000000 (OFF, НЕ 0).
-- LOK_Result (RF 0x08) сохранять после Tx one-shot и восстанавливать после
-  каждого Rx one-shot (W.265) — иначе 0x85000 вместо 0xF800.
+- **RX-FIFO выгребается по 1 блоку (512 б) за CMD53** — host SDIO H3 НЕ тянет
+  многоблочный read (30 блоков → `rc=-1` + зависание). seq/окно фиксируется на
+  пакет, `seq++` только когда RX0_REQ_LEN подтвердил 0.
+- **Парсер: 802.11-кадр на смещении off+24** (RX-дескриптор 24 байта, drvinfo
+  в этом build = 0). SSID = IE id=0.
+- CrystalCap (0x24): маска `~0x007FF800`, `cc=(cs<<6)|cs`, `(cc<<11)`.
 - Шина стенда: 1-bit/50 МГц (4-bit ломает CMD53 data-фазу).
-- Методика: один шаг → лог → анализ; после успеха — комменты+доки+git+тег.
+- Сборка: **`make -j` многопоточно** (AGENTS.md); bump_version идёт в Makefile
+  отдельным таргетом. После сборки проверять `strings h3_bare.bin | grep 'W\.[0-9]'`
+  и что `FW_VERSION_STR`= последней W.minor (версия бампается автоматически при
+  каждой сборке).
+- **Бэкапы (`*.bak`) хранить в `backups/` в корне**, не в src/.
+- Методика: один шаг → лог → анализ; после успеха — комментарии+доки+git+тег.
 
 ## Git
 
-Рабочая точка: тег `w210-rx-fifo-iqk` (база w181-rx-h2c). W.248-W.269
-добавлены, НЕ закоммичено: h3_sdc.c (все правки), version.h (W.269),
-rtl8189fs-lakka-live-rx-dump-w7.md (D7-эталон). После результата — коммит + тег.
+Рабочая точка: `369c018` (W.441-W.458, пушнут в origin/main). Правки W.459
+(msg4 secure bit, DHCP resend, CAM-дамп) — в рабочем дереве, будут в след. коммите.

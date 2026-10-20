@@ -287,6 +287,7 @@ int wifi_layer_connect(int index)
     /* WPA2: передать RSN IE выбранной сети в цель — без него AssocReq к
        WPA2-AP уходит без Privacy+RSN (cap=1) и AP не ассоциирует (rc=-6). */
     h3_wifi_set_target_rsn(&ap);
+    h3_wifi_set_target_wmm(&ap);
     /* W.412: для WPA2-сети (rsn_len>0) зафиксировать PSK passphrase по SSID.
        PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32) предвычисляется сразу в
        h3_wifi_set_passphrase (кэш, вне hot-path — чтобы не платить 5.5с на
@@ -306,8 +307,9 @@ int wifi_layer_connect(int index)
             h3_wifi_set_passphrase("B236f8g4", 8);
             uart_print("  passphrase: MTS guess B236f8g4 (верен только для 9290e0)\r\n");
         } else {
-            h3_wifi_set_passphrase("B236f8g4", 8);
-            uart_print("  passphrase: GUESS B236f8g4 (SSID неизвестен)\r\n");
+            /* Незнакомый SSID: не угадывать пароль (ложный handshake). */
+            h3_wifi_set_passphrase("", 0);
+            uart_print("  passphrase: unknown SSID, none\r\n");
         }
         uart_print("  wpa2 passphrase set (rsn_len=");
         uart_print_int((int)ap.rsn_len);
@@ -322,6 +324,11 @@ int wifi_layer_connect(int index)
             uart_print_int((int)((caps0 >> 6) & 1));
         }
         uart_print(")\r\n");
+    } else {
+        /* Открытая сеть: сбросить passphrase предыдущей цели (иначе в
+           join_ap останется pass_len>0 и DHCP в WPA2-ветке не отправится). */
+        h3_wifi_set_passphrase("", 0);
+        uart_print("  open network (no passphrase)\r\n");
     }
 
     rc = h3_wifi_join_ap();

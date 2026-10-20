@@ -328,6 +328,11 @@ struct h3_wifi_ap {
        Нужен для AssocReq с Privacy+RSN, иначе WPA2-AP даёт rc=-6. */
     uint8_t rsn_ie[64];
     uint8_t rsn_len;
+    /* WMM Parameter IE (id=221, OUI 00:50:F2, OUI type 2) из beacon'а.
+       Нужен, чтобы AssocReq содержал WMM IE (иначе мы non-QoS STA и QoS Data
+       слать нельзя), и чтобы data-кадры шли как QoS. wmm_len=0 — сеть без WMM. */
+    uint8_t wmm_ie[32];
+    uint8_t wmm_len;
 };
 
 /* Сколько сетей найдено в последнем скане. */
@@ -343,13 +348,20 @@ void h3_wifi_scan_ap_add(struct h3_wifi_ap *ap);
    где RSN не заполняется полным beacon-парсером). */
 void h3_wifi_set_target_rsn(const struct h3_wifi_ap *ap);
 
+/* Установить WMM IE целевой сети из структуры AP. Нужен для AssocReq
+   (WMM IE) и для решения «QoS Data или обычный Data». */
+void h3_wifi_set_target_wmm(const struct h3_wifi_ap *ap);
+
 /* W.412: задать PSK passphrase (для WPA2 4-way). PMK будет вычислен из него
    при построении handshake. pass_len>0 — сеть WPA2. */
 void h3_wifi_set_passphrase(const char *pass, uint8_t pass_len);
 
 /* Передать 802.11 data-фрейм (ToDS) с payload (LLC/SNAP+ethertype+data)
-   в LOW-очередь. Используется для DHCP/ARP/ICMP/EAPOL. 0 при успехе. */
-int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *data, uint16_t len);
+    в LOW-очередь. dst_mac — L2-адрес получателя (addr3): broadcast для
+    DHCP DISCOVER/ARP request, MAC пира для ARP reply/ICMP.
+    Используется для DHCP/ARP/ICMP/EAPOL. 0 при успехе. */
+int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
+                    const uint8_t *data, uint16_t len);
 
 /* Прочитать наш MAC (REG_MACID 0x610-0x615). Публичный для сетевого слоя. */
 void h3_wifi_get_mac(uint8_t m[6]);

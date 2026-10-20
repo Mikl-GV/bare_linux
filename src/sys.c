@@ -55,7 +55,10 @@ void udelay(uint32_t us)
     /* W.278: пока ждём — фоново сливаем UART-буфер (машино-быстрая запись
        уже не тормозит протокол; реальная передача идёт в паузах). */
     uint32_t next_flush = HSTMR_CURNT_LO;
-    uint32_t flush_gap = HSTMR_MHZ / 20;    /* ~50 мкс между сливами */
+    /* 50 мкс в тиках HSTMR. Раньше было HSTMR_MHZ/20 = 4 тика (~41 нс)
+       из-за целочисленного деления — uart_flush() вызывался на каждой
+       итерации цикла задержки. */
+    uint32_t flush_gap = HSTMR_MHZ * 50u / 1000000u;
     while ((uint32_t)(cur - HSTMR_CURNT_LO) < ticks) {
         if ((uint32_t)(next_flush - HSTMR_CURNT_LO) >= flush_gap) {
             next_flush = HSTMR_CURNT_LO;

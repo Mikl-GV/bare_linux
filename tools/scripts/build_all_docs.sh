@@ -16,6 +16,9 @@ docs=(
   rtl8189fs-live-snapshot-big.md
   rtl8189fs-lakka-live-dump.md
   rtl8189fs-lakka-live-rx-dump-w7.md
+  lakka-live/LAKKA-LIVE-SNAPSHOT-W537.md
+  lakka-live/LAKKA-CAM-SECURITY.md
+  lakka-live/LAKKA-MACREG-FULL.txt
   W233-SDIO-TRACE.md
   WIFI-FW-DOWNLOAD.md
   I2S-REFERENCE.md

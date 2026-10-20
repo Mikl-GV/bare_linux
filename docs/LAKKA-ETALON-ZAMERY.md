@@ -64,3 +64,40 @@
 - `sunxi-mmc-4.14.c` — драйвер хоста (полный, у нас в tools/wifi/rtl8189fs).
 - `ref/Lakka-Allwinner.orangepi_lite.arm-2.3.1.image` — образ (dtb, SYSTEM).
 - `tools/wifi/W233-SDIO-TRACE.md` — наш полный поадресный трейс (для сверки).
+
+## 6. Живая CAM-раскладка и REG_SECCFG (добавлено 2026-10-20)
+
+Снято с той же платы по SSH (10.72.75.55), подключена к той же сети
+**A05s пользователя М** (BSSID `9a:4d:56:7e:81:4f`, ch1, WPA2-PSK).
+Файлы: `docs/lakka-live/LAKKA-CAM-SECURITY.md`, `docs/lakka-live/LAKKA-MACREG-FULL.txt`.
+
+### CAM (HW, /proc/net/rtl8189fs/wlan0/sec_cam)
+
+```
+id ctrl   addr              kid type MK GK valid
+ 4 0x8010 9a:4d:56:7e:81:4f   0 AES  0  0  1   <- pairwise (BSSID)
+ 5 0x8051 9a:4d:56:7e:81:4f   1 AES  0  1  1   <- group GTK (BSSID!, keyid=1)
+```
+
+- **pairwise** → CAM entry **4**, `ctrl = BIT15|BIT6?0|AES<<2|keyid0`, **addr = BSSID**.
+- **group (GTK)** → CAM entry **5** (не 1, не 0), `ctrl = 0x8051` (`BIT15|BIT6|AES<<2|1`),
+  **addr = BSSID** (НЕ null!).
+- Остальные 0..15 — `ctrl=0`, invalid (мусор/остатки, чип их игнорирует).
+
+### REG_SECCFG
+
+```
+reg_scr = 0x010c  (SCR_CHK_KEYID BIT8 | SCR_RxDecEnable BIT3 | SCR_TxEncEnable BIT2)
+```
+
+- **Без** `SCR_CHK_BMC` (BIT9), **без** `TXBCUSEDK/RXBCUSEDK` (BIT6/BIT7) — для
+  WPA2-PSK (802.1X) их в эталоне НЕТ.
+- `sec_info: hw_decrypted=1, aes_sw_dec_cnt=0` — RX-декрипт аппаратный.
+
+### Вывод для bare-metal (W.537)
+
+1. `wpa_cam_write_key(4, bssid, ptk+32, 0)` — pairwise (у нас так).
+2. `wpa_cam_write_key(5, bssid, gk, 1)` — **GTK в slot 5 с MAC=BSSID** (а не 1+null).
+3. `REG_SECCFG = 0x010C` (16-бит), а не 0xCC/0x30C/0x34C.
+4. Прежняя запись GTK в entry 1 с null-MAC не находилась чипом при RX
+   (`cam_cache_chk` сверяет MAC) → `swdec=1` на broadcast.

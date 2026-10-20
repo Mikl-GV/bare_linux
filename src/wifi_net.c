@@ -3,6 +3,12 @@
 #include "uart.h"
 
 static uint32_t dhcp_xid = 0x12345678;
+static const uint8_t bcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+/* Состояние между OFFER и ACK (SELECTING). */
+static uint8_t dhcp_offer_ip[4];
+static uint8_t dhcp_server_id[4];
+static uint8_t dhcp_offer_seen;
 
 static uint16_t csum(const uint8_t *p, uint16_t len)
 {
@@ -14,144 +20,220 @@ static uint16_t csum(const uint8_t *p, uint16_t len)
     return (uint16_t)~s;
 }
 
-/* Построить Ethernet+IPv4+UDP+DHCP-DISCOVER и отправить через wifi TX data.
-   src_ip=0.0.0.0, dst=255.255.255.255:67. */
-int net_dhcp_discover(struct net_state *st)
+/* Собрать и отправить DHCP-пакет: msg_type 1=DISCOVER, 3=REQUEST.
+   Для REQUEST передаются requested IP (опция 50) и server id (опция 54). */
+static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv_id)
 {
     uint8_t pkt[400];
     uint32_t p = 0;
     uint8_t m[6];
     uint16_t i;
-    (void)st;   /* st заполняется из OFFER/ACK в net_handle_ipv4 */
 
-    /* IPv4 header (20) */
-    pkt[p++] = 0x45;                 /* v4, IHL 5 */
-    pkt[p++] = 0x00;                 /* TOS */
-    pkt[p++] = 0x01; pkt[p++] = 0x48;/* total len 328 (заполним ниже) */
-    pkt[p++] = 0x00; pkt[p++] = 0x01;/* id */
-    pkt[p++] = 0x00; pkt[p++] = 0x00;/* flags/frag */
-    pkt[p++] = 0x40;                 /* TTL 64 (один байт, offset 8) */
-    pkt[p++] = 0x11;                 /* protocol = UDP (offset 9) */
-    pkt[p++] = 0x00;                 /* ip csum hi (рассчитаем ниже) */
-    pkt[p++] = 0x00;                 /* ip csum lo (рассчитаем ниже) */
-    /* src IP 0.0.0.0 */
-    pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0;
-    /* dst 255.255.255.255 */
-    pkt[p++] = 0xFF; pkt[p++] = 0xFF; pkt[p++] = 0xFF; pkt[p++] = 0xFF;
+    /* IPv4 (20) */
+    pkt[p++] = 0x45; pkt[p++] = 0x00;
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* total len — ниже */
+    pkt[p++] = 0x00; pkt[p++] = 0x01;   /* id */
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* flags/frag */
+    pkt[p++] = 0x40;                    /* TTL */
+    pkt[p++] = 0x11;                    /* UDP */
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* csum — ниже */
+    pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0;          /* src 0.0.0.0 */
+    pkt[p++] = 0xFF; pkt[p++] = 0xFF; pkt[p++] = 0xFF; pkt[p++] = 0xFF; /* dst 255.255.255.255 */
 
-    /* UDP header (8): src 68, dst 67 */
-    pkt[p++] = 0x00; pkt[p++] = 0x44;   /* src 68 */
-    pkt[p++] = 0x00; pkt[p++] = 0x43;   /* dst 67 */
-    pkt[p++] = 0x01; pkt[p++] = 0x28;   /* udp len 296 */
-    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* udp csum */
+    /* UDP (8): 68 -> 67 */
+    pkt[p++] = 0x00; pkt[p++] = 0x44;
+    pkt[p++] = 0x00; pkt[p++] = 0x43;
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* udp len — ниже */
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* udp csum = 0 (IPv4 допускает) */
 
-    /* DHCP header (фиксированная часть 236 байт, RFC 2131) */
+    /* BOOTP/DHCP фиксированная часть 236 */
     pkt[p++] = 0x01; pkt[p++] = 0x01;   /* op=BOOTREQUEST, htype=eth */
-    pkt[p++] = 0x06;                    /* hlen=6 */
-    pkt[p++] = 0x00;                    /* hops=0 */
-    /* xid */
+    pkt[p++] = 0x06;                    /* hlen */
+    pkt[p++] = 0x00;                    /* hops */
     pkt[p++] = (uint8_t)(dhcp_xid >> 24); pkt[p++] = (uint8_t)(dhcp_xid >> 16);
     pkt[p++] = (uint8_t)(dhcp_xid >> 8);  pkt[p++] = (uint8_t)dhcp_xid;
-    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* secs=0 */
-    /* W.504 [тест]: broadcast-флаг 0x8000 — AP отвечает OFFER на
-       ff:ff:ff:ff:ff:ff (расшифровка GTK, слот 0). Если unicast-ответ
-       не доходил, broadcast может пройти. */
+    pkt[p++] = 0x00; pkt[p++] = 0x00;   /* secs */
     pkt[p++] = 0x80; pkt[p++] = 0x00;   /* flags: broadcast reply */
-    /* ciaddr, yiaddr, siaddr, giaddr = 0 (16 байт) — до chaddr */
-    for (i = 0; i < 16; i++) pkt[p++] = 0;
-    /* chaddr (16 байт): наш MAC + 10 нулей */
+    for (i = 0; i < 16; i++) pkt[p++] = 0;          /* ciaddr/yiaddr/siaddr/giaddr */
     h3_wifi_get_mac(m);
-    for (i = 0; i < 6; i++) pkt[p++] = m[i];
+    for (i = 0; i < 6; i++) pkt[p++] = m[i];        /* chaddr */
     for (i = 0; i < 10; i++) pkt[p++] = 0;
-    /* sname (64) + file (128) = нули */
-    for (i = 0; i < 192; i++) pkt[p++] = 0;
+    for (i = 0; i < 192; i++) pkt[p++] = 0;         /* sname + file */
 
-    /* cookie */
-    pkt[p++] = 0x63; pkt[p++] = 0x82; pkt[p++] = 0x53; pkt[p++] = 0x63;
-    /* DHCP message type = 1 (DISCOVER), options end */
-    pkt[p++] = 53; pkt[p++] = 1; pkt[p++] = 1;
-    /* request params: 1 (mask), 3 (gw), 6 (dns), 15 (domain) */
+    pkt[p++] = 0x63; pkt[p++] = 0x82; pkt[p++] = 0x53; pkt[p++] = 0x63;  /* cookie */
+    pkt[p++] = 53; pkt[p++] = 1; pkt[p++] = msg_type;
+    if (msg_type == 3 && req_ip && srv_id) {
+        pkt[p++] = 50; pkt[p++] = 4;
+        for (i = 0; i < 4; i++) pkt[p++] = req_ip[i];
+        pkt[p++] = 54; pkt[p++] = 4;
+        for (i = 0; i < 4; i++) pkt[p++] = srv_id[i];
+    }
     pkt[p++] = 55; pkt[p++] = 4; pkt[p++] = 1; pkt[p++] = 3; pkt[p++] = 6; pkt[p++] = 15;
-    pkt[p++] = 255;                  /* END */
+    pkt[p++] = 255;
 
-    /* total length поля: по реальному размеру пакета p (не фикс 328). */
     pkt[2] = (uint8_t)(p >> 8); pkt[3] = (uint8_t)p;
-    /* W.407 [P3]: UDP length тоже по реальному размеру (p - IP header 20),
-       а не зашитый 296. DHCP-сервер (телефон) может дропать пакет, где
-       UDP len не совпал с фактическим размером дейтаграммы. */
-    pkt[22] = (uint8_t)((p - 20) >> 8); pkt[23] = (uint8_t)(p - 20);
-    /* IP checksum (20 байт до UDP) */
+    /* W.531: UDP length — поле pkt[24..25], НЕ pkt[22..23].
+       pkt[22..23] = UDP dst port (67), его перезапись на (p-20)=258
+       уводила DISCOVER на порт 258 — DHCP-сервер на 67 не получал
+       пакет, OFFER не приходил. Длина 258 = p - 20 (IP payload). */
+    pkt[24] = (uint8_t)((p - 20) >> 8); pkt[25] = (uint8_t)(p - 20);
     pkt[10] = (uint8_t)(csum(pkt, 20) >> 8);
     pkt[11] = (uint8_t)(csum(pkt, 20) & 0xFF);
 
-    /* W.407 [P2]: диагностика DISCOVER — первые 32 байта (IP-заголовок +
-       начало UDP/DHCP) + ключевые поля. Сверять с эталоном: IP proto=11,
-       src 0.0.0.0, dst 255.255.255.255, DHCP op=1, flags broadcast 0x80 0x00. */
-    uart_print("  dhcp DISCOVER len=");
+    uart_print(msg_type == 1 ? "  dhcp DISCOVER len=" : "  dhcp REQUEST len=");
     uart_print_int((int)p);
-    uart_print(" IP.total=");
+    uart_print(" IP.total=0x");
     uart_print_hex((uint32_t)((pkt[2] << 8) | pkt[3]));
-    uart_print(" UDP.len=");
-    uart_print_hex((uint32_t)((pkt[22] << 8) | pkt[23]));
+    uart_print(" UDP.len=0x");
+    uart_print_hex((uint32_t)((pkt[24] << 8) | pkt[25]));
+    uart_print(" sport=");
+    uart_print_int((pkt[20] << 8) | pkt[21]);
+    uart_print(" dport=");
+    uart_print_int((pkt[22] << 8) | pkt[23]);
     uart_print(" proto=0x");
     uart_print_hex((uint32_t)pkt[9]);
-    uart_print(" src=");
-    uart_print_hex((uint32_t)((pkt[12]<<24)|(pkt[13]<<16)|(pkt[14]<<8)|pkt[15]));
-    uart_print(" dst=");
-    uart_print_hex((uint32_t)((pkt[16]<<24)|(pkt[17]<<16)|(pkt[18]<<8)|pkt[19]));
-    uart_print(" op=0x");
-    uart_print_hex((uint32_t)pkt[28]);
     uart_print(" flags=0x");
     uart_print_hex((uint32_t)((pkt[38] << 8) | pkt[39]));
     uart_print("\r\n");
 
-    return h3_wifi_tx_data(0x0800, pkt, p);
+    return h3_wifi_tx_data(0x0800, bcast_mac, pkt, (uint16_t)p);
 }
 
-/* Входящий IPv4 (уже после 802.11 data + LLC/SNAP + ethertype на входе).
-   Парсим UDP/DHCP: если OFFER/ACK (msg type 2/5) на наш xid — берём yiaddr
-   как выданный AP адрес напрямую (не подставляем .199). */
-void net_handle_ipv4(const uint8_t *pkt, uint16_t len, struct net_state *st)
+int net_dhcp_discover(struct net_state *st)
 {
-    /* pkt указывает на начало IPv4-заголовка. Минимум 20+8+dhcp. */
-    if (!st || len < 20 + 8 + 240) return;
-    uint8_t ihl = (uint8_t)((pkt[0] & 0x0F) * 4);
-    if (pkt[9] != 0x11) return;      /* не UDP */
-    uint16_t udp_off = ihl;
-    uint16_t udp_len = (uint16_t)((pkt[udp_off+4] << 8) | pkt[udp_off+5]);
+    (void)st;
+    dhcp_offer_seen = 0;
+    return dhcp_send(1, 0, 0);
+}
+
+static int net_dhcp_request(void)
+{
+    return dhcp_send(3, dhcp_offer_ip, dhcp_server_id);
+}
+
+/* ICMP echo request -> echo reply. */
+static void net_icmp_reply(const uint8_t *pkt, uint16_t len, uint8_t ihl,
+                           const uint8_t *src_mac, const struct net_state *st)
+{
+    uint8_t rep[20 + 1500];
+    uint16_t icmp_len, ip_len, ic;
+    int k;
+
+    if (!st->have || len < (uint16_t)(ihl + 8)) return;
+    if (pkt[ihl] != 8 || pkt[ihl+1] != 0) return;    /* только echo request */
+    for (k = 0; k < 4; k++) if (pkt[16+k] != st->ip[k]) return;   /* не нам */
+
+    ip_len = (uint16_t)((pkt[2] << 8) | pkt[3]);
+    if (ip_len <= ihl) return;
+    icmp_len = (uint16_t)(ip_len - ihl);
+    if (icmp_len > len - ihl) icmp_len = (uint16_t)(len - ihl);
+    if (icmp_len < 8 || icmp_len > 1500) return;
+
+    for (uint16_t i = 0; i < icmp_len; i++) rep[20+i] = pkt[ihl+i];
+    rep[20] = 0; rep[21] = 0;                         /* type=0 (reply), code=0 */
+    rep[22] = 0; rep[23] = 0;                         /* checksum */
+    ic = csum(&rep[20], icmp_len);
+    rep[22] = (uint8_t)(ic >> 8); rep[23] = (uint8_t)ic;
+
+    for (k = 0; k < 20; k++) rep[k] = 0;
+    rep[0] = 0x45;
+    rep[2] = (uint8_t)((20 + icmp_len) >> 8); rep[3] = (uint8_t)(20 + icmp_len);
+    rep[8] = 64; rep[9] = 1;
+    for (k = 0; k < 4; k++) { rep[12+k] = pkt[16+k]; rep[16+k] = pkt[12+k]; }
+    ic = csum(rep, 20);
+    rep[10] = (uint8_t)(ic >> 8); rep[11] = (uint8_t)ic;
+
+    h3_wifi_tx_data(0x0800, src_mac, rep, (uint16_t)(20 + icmp_len));
+}
+
+/* Входящий IPv4 (после 802.11 + LLC/SNAP). src_mac — L2-адрес отправителя
+   из 802.11-заголовка (addr3 для FromDS, addr2 для ToDS). */
+void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
+                     struct net_state *st)
+{
+    uint8_t ihl, proto;
+    uint16_t udp_off, udp_len, dh, opt, end;
+    int k;
+
+    if (!st || len < 20) return;
+    ihl = (uint8_t)((pkt[0] & 0x0F) * 4);
+    if (ihl < 20 || ihl > len) return;
+    proto = pkt[9];
+
+    if (proto == 1) {                 /* ICMP */
+        net_icmp_reply(pkt, len, ihl, src_mac, st);
+        return;
+    }
+    if (proto != 17) return;          /* не UDP */
+    if (len < (uint16_t)(ihl + 8 + 240)) return;
+
+    udp_off = ihl;
+    if (pkt[udp_off+0] != 0x00 || pkt[udp_off+1] != 0x44) return;   /* src 68 */
+    if (pkt[udp_off+2] != 0x00 || pkt[udp_off+3] != 0x43) return;   /* dst 67 */
+    udp_len = (uint16_t)((pkt[udp_off+4] << 8) | pkt[udp_off+5]);
     if (udp_len < 8) return;
-    if (pkt[udp_off+0] != 0x00 || pkt[udp_off+3] != 0x43) return;   /* src 67 */
 
-    uint16_t dh = udp_off + 8;
-    if ((dh+4) <= len && (pkt[dh] == 0x02 || pkt[dh] == 0x05)) { /* BOOTREPLY/OFFER/ACK */
-        uint8_t yiaddr[4] = { pkt[dh+16], pkt[dh+17], pkt[dh+18], pkt[dh+19] };
-        if (yiaddr[0] == 0) return;
-        st->have = 1;
-        for (int k = 0; k < 4; k++) st->ip[k] = yiaddr[k];
+    dh = (uint16_t)(udp_off + 8);     /* BOOTP */
+    if ((uint16_t)(dh + 240) > len) return;
+    if (pkt[dh] != 0x02) return;      /* op = BOOTREPLY */
 
-        /* W.521 [фикс]: маска сети = НЕ IP. Раньше писали st->net[k]=yiaddr[k],
-           из-за чего «маска» совпадала с адресом (мусор для расчётов). Теперь
-           берём реальные DHCP-опции: 1 = subnet mask, 3 = router (gw).
-           Правило-подстановка .199 удалено ещё в W.407 — IP только из yiaddr. */
-        for (int k = 0; k < 4; k++) { st->net[k] = 0; st->mask[k] = 0; st->gw[k] = 0; }
-        uint16_t opt = (uint16_t)(dh + 240);          /* cookie+fixed 236 */
-        uint16_t end = (uint16_t)(dh + (udp_len - 8));
-        if (end > len) end = len;
-        while (opt + 2 <= end) {
-            uint8_t code = pkt[opt];
-            if (code == 0) { opt++; continue; }        /* pad */
-            if (code == 255) break;                    /* end */
-            uint8_t olen = pkt[opt + 1];
-            if (opt + 2 + olen > end) break;
-            if (code == 1 && olen == 4) {
-                for (int k = 0; k < 4; k++) st->mask[k] = pkt[opt + 2 + k];
-            } else if (code == 3 && olen >= 4) {
-                for (int k = 0; k < 4; k++) st->gw[k] = pkt[opt + 2 + k];
-            }
-            opt = (uint16_t)(opt + 2 + olen);
+    /* xid: чужой reply игнорируем. */
+    if (pkt[dh+4] != (uint8_t)(dhcp_xid >> 24) ||
+        pkt[dh+5] != (uint8_t)(dhcp_xid >> 16) ||
+        pkt[dh+6] != (uint8_t)(dhcp_xid >> 8)  ||
+        pkt[dh+7] != (uint8_t)dhcp_xid) return;
+
+    /* Разбор опций: 53 (тип), 1 (маска), 3 (шлюз), 54 (server id). */
+    uint8_t msg_type = 0;
+    uint8_t mask[4] = {0,0,0,0}, gw[4] = {0,0,0,0}, srv[4] = {0,0,0,0};
+    opt = (uint16_t)(dh + 240);       /* cookie + фикс. часть 236 */
+    end = (uint16_t)(dh + (udp_len - 8));
+    if (end > len) end = len;
+    while (opt + 2 <= end) {
+        uint8_t code = pkt[opt];
+        if (code == 0) { opt++; continue; }            /* pad */
+        if (code == 255) break;                        /* end */
+        uint8_t olen = pkt[opt + 1];
+        if (opt + 2 + olen > end) break;
+        if (code == 53 && olen == 1) {
+            msg_type = pkt[opt + 2];
+        } else if (code == 1 && olen == 4) {
+            for (k = 0; k < 4; k++) mask[k] = pkt[opt + 2 + k];
+        } else if (code == 3 && olen >= 4) {
+            for (k = 0; k < 4; k++) gw[k] = pkt[opt + 2 + k];
+        } else if (code == 54 && olen == 4) {
+            for (k = 0; k < 4; k++) srv[k] = pkt[opt + 2 + k];
         }
+        opt = (uint16_t)(opt + 2 + olen);
+    }
 
-        uart_print("  net: DHCP OK ip=");
+    if (msg_type == 2) {              /* OFFER -> DHCPREQUEST */
+        if (pkt[dh+16] == 0 && pkt[dh+17] == 0 && pkt[dh+18] == 0 && pkt[dh+19] == 0)
+            return;
+        for (k = 0; k < 4; k++) dhcp_offer_ip[k] = pkt[dh+16+k];
+        for (k = 0; k < 4; k++) dhcp_server_id[k] = srv[k];
+        dhcp_offer_seen = 1;
+        uart_print("  net: DHCP OFFER ip=");
+        for (k = 0; k < 4; k++) { uart_print_int((int)dhcp_offer_ip[k]); if (k<3) uart_print("."); }
+        uart_print(" srv=");
+        for (k = 0; k < 4; k++) { uart_print_int((int)dhcp_server_id[k]); if (k<3) uart_print("."); }
+        uart_print("\r\n");
+        net_dhcp_request();
+        return;
+    }
+
+    if (msg_type == 6) {              /* NAK: адрес не выдан */
+        uart_print("  net: DHCP NAK\r\n");
+        dhcp_offer_seen = 0;
+        return;
+    }
+
+    if (msg_type == 5) {              /* ACK: фиксируем адрес */
+        if (!dhcp_offer_seen) return;
+        st->have = 1;
+        for (k = 0; k < 4; k++) st->ip[k] = dhcp_offer_ip[k];
+        for (k = 0; k < 4; k++) { st->mask[k] = mask[k]; st->gw[k] = gw[k]; st->net[k] = 0; }
+        uart_print("  net: DHCP ACK ip=");
         uart_print_int((int)st->ip[0]); uart_print(".");
         uart_print_int((int)st->ip[1]); uart_print(".");
         uart_print_int((int)st->ip[2]); uart_print(".");
@@ -168,4 +250,33 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, struct net_state *st)
         uart_print_int((int)st->gw[3]);
         uart_print("\r\n");
     }
+}
+
+/* Входящий ARP: отвечаем на request, адресованный нашему IP.
+   src_mac — L2-адрес отправителя (addr3/addr2 из 802.11-заголовка). */
+void net_handle_arp(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
+                    struct net_state *st)
+{
+    uint8_t rep[28];
+    uint8_t m[6];
+    int k;
+
+    if (!st || !st->have || len < 28) return;
+    if (pkt[1] != 0x01 || pkt[2] != 0x08 || pkt[3] != 0x00) return;  /* eth/IPv4 */
+    if (pkt[4] != 6 || pkt[5] != 4) return;                          /* MAC/IP */
+    if (pkt[6] != 0x00 || pkt[7] != 0x01) return;                    /* request */
+    for (k = 0; k < 4; k++) if (pkt[24+k] != st->ip[k]) return;      /* tpa != наш IP */
+
+    rep[0] = 0x00; rep[1] = 0x01;   /* htype = Ethernet */
+    rep[2] = 0x08; rep[3] = 0x00;   /* ptype = IPv4 */
+    rep[4] = 6; rep[5] = 4;
+    rep[6] = 0x00; rep[7] = 0x02;   /* op = reply */
+    h3_wifi_get_mac(m);
+    for (k = 0; k < 6; k++) rep[8+k] = m[k];          /* SHA = наш MAC */
+    for (k = 0; k < 4; k++) rep[14+k] = st->ip[k];    /* SPA = наш IP */
+    for (k = 0; k < 6; k++) rep[18+k] = pkt[8+k];     /* THA = запросивший */
+    for (k = 0; k < 4; k++) rep[24+k] = pkt[14+k];    /* TPA = его IP */
+
+    uart_print("  net: ARP reply\r\n");
+    h3_wifi_tx_data(0x0806, src_mac, rep, 28);
 }
