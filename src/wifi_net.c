@@ -80,33 +80,58 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv
     pkt[10] = (uint8_t)(csum(pkt, 20) >> 8);
     pkt[11] = (uint8_t)(csum(pkt, 20) & 0xFF);
 
-    uart_print(msg_type == 1 ? "  dhcp DISCOVER len=" : "  dhcp REQUEST len=");
-    uart_print_int((int)p);
-    uart_print(" IP.total=0x");
-    uart_print_hex((uint32_t)((pkt[2] << 8) | pkt[3]));
-    uart_print(" UDP.len=0x");
-    uart_print_hex((uint32_t)((pkt[24] << 8) | pkt[25]));
-    uart_print(" sport=");
-    uart_print_int((pkt[20] << 8) | pkt[21]);
-    uart_print(" dport=");
-    uart_print_int((pkt[22] << 8) | pkt[23]);
-    uart_print(" proto=0x");
-    uart_print_hex((uint32_t)pkt[9]);
-    uart_print(" flags=0x");
-    uart_print_hex((uint32_t)((pkt[38] << 8) | pkt[39]));
-    uart_print("\r\n");
+    #if WIFI_TX_DIAG
+    TXDIAG(msg_type == 1 ? "  dhcp DISCOVER len=" : "  dhcp REQUEST len=");
+    TXDIAG_INT((int)p);
+    TXDIAG(" IP.total=0x");
+    TXDIAG_HEX((uint32_t)((pkt[2] << 8) | pkt[3]));
+    TXDIAG(" UDP.len=0x");
+    TXDIAG_HEX((uint32_t)((pkt[24] << 8) | pkt[25]));
+    TXDIAG(" sport=");
+    TXDIAG_INT((pkt[20] << 8) | pkt[21]);
+    TXDIAG(" dport=");
+    TXDIAG_INT((pkt[22] << 8) | pkt[23]);
+    TXDIAG(" proto=0x");
+    TXDIAG_HEX((uint32_t)pkt[9]);
+    TXDIAG(" flags=0x");
+    TXDIAG_HEX((uint32_t)((pkt[38] << 8) | pkt[39]));
+    TXDIAG("\r\n");
+#endif
 
     return h3_wifi_tx_data(0x0800, bcast_mac, pkt, (uint16_t)p);
 }
 
 int net_dhcp_discover(struct net_state *st)
 {
+    /* W.592 [корень]: НЕ сбрасываем dhcp_offer_seen здесь. Раньше циклический
+       retry DISCOVER обнулял флаг после того, как OFFER уже пришёл, и
+       пришедший затем ACK отбрасывался (`if (!dhcp_offer_seen) return`).
+       Теперь флаг хранит факт «OFFER получен» до ACK/NAK. */
     (void)st;
-    dhcp_offer_seen = 0;
     return dhcp_send(1, 0, 0);
 }
 
-static int net_dhcp_request(void)
+/* W.592: 1 = OFFER получен (в стадии SELECTING), ACK ещё не пришёл.
+   Цикл DHCP в h3_sdc.c использует это, чтобы НЕ слать повторный DISCOVER
+   и ждать ACK. */
+int net_dhcp_offer_pending(void)
+{
+    return dhcp_offer_seen ? 1 : 0;
+}
+
+/* W.594 [корень]: сброс состояния DHCP на старте нового join. Раньше
+   dhcp_offer_seen (static) не сбрасывался между join — после успешного
+   OFFER во 2-й сессии флаг оставался =1, и третий join не отправлял
+   DISCOVER (`!net_dhcp_offer_pending()` == false). Третий join зависал
+   без DHCP. Вызывается в начале h3_wifi_join_ap. */
+void net_dhcp_reset(void)
+{
+    dhcp_offer_seen = 0;
+}
+
+/* W.594: повторная отправка DHCP REQUEST (после OFFER, если ACK задержался).
+   Стандартное поведение DHCP-клиента: ретраить REQUEST. */
+int net_dhcp_request(void)
 {
     return dhcp_send(3, dhcp_offer_ip, dhcp_server_id);
 }
@@ -168,14 +193,43 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
     if (len < (uint16_t)(ihl + 8 + 240)) return;
 
     udp_off = ihl;
-    if (pkt[udp_off+0] != 0x00 || pkt[udp_off+1] != 0x44) return;   /* src 68 */
-    if (pkt[udp_off+2] != 0x00 || pkt[udp_off+3] != 0x43) return;   /* dst 67 */
+    /* W.590 [корень]: входящий OFFER/ACK приходит от ДХКП-сервера: src=67,
+       dst=68 (обратно DISCOVER/REQUEST 68→67). Раньше проверяли только
+       src=68/dst=67 и каждый OFFER отбрасывался — OFFER приходил (W.589
+       rx etype=0x0800 plen=386), но net_handle_ipv4 его дропал.
+       Принимаем оба направления. */
+    int is_dhcp_srv = (pkt[udp_off+0] == 0x00 && pkt[udp_off+1] == 0x43 &&
+                       pkt[udp_off+2] == 0x00 && pkt[udp_off+3] == 0x44);  /* 67->68 */
+    int is_dhcp_cli = (pkt[udp_off+0] == 0x00 && pkt[udp_off+1] == 0x44 &&
+                       pkt[udp_off+2] == 0x00 && pkt[udp_off+3] == 0x43);  /* 68->67 */
+    if (!is_dhcp_srv && !is_dhcp_cli) return;
     udp_len = (uint16_t)((pkt[udp_off+4] << 8) | pkt[udp_off+5]);
     if (udp_len < 8) return;
 
     dh = (uint16_t)(udp_off + 8);     /* BOOTP */
     if ((uint16_t)(dh + 240) > len) return;
     if (pkt[dh] != 0x02) return;      /* op = BOOTREPLY */
+
+    /* W.594: краткая диагностика входящего DHCP-сообщения (порты, op,
+       msg_type из опции 53). Покажет, приходит ли ACK и как парсится. */
+    {
+        int di_u0 = (pkt[udp_off+0]<<8)|pkt[udp_off+1];
+        int di_u1 = (pkt[udp_off+2]<<8)|pkt[udp_off+3];
+        int di_mt = -1;
+        for (int oi = 0; oi + 2 <= udp_len; ) {
+            uint8_t c = pkt[dh+240+oi];
+            if (c == 0) { oi++; continue; }
+            if (c == 255) break;
+            uint8_t ol = pkt[dh+240+oi+1];
+            if (c == 53 && ol == 1) di_mt = pkt[dh+240+oi+2];
+            oi += 2 + ol;
+        }
+        uart_print("  net: dhcp ");
+        uart_print_int(di_u0); uart_print("->"); uart_print_int(di_u1);
+        uart_print(" op="); uart_print_int((int)pkt[dh]);
+        uart_print(" msg="); uart_print_int(di_mt);
+        uart_print("\r\n");
+    }
 
     /* xid: чужой reply игнорируем. */
     if (pkt[dh+4] != (uint8_t)(dhcp_xid >> 24) ||

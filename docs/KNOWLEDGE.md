@@ -90,12 +90,28 @@
       (`join: bssid=... ch=...`), вызов из пункта Transfer с Retry.
     - **Ассоциация + WPA2 4-way (W.369-W.459)**: полный join (AuthResp=0 →
       AssocResp=0 → MSR=STA, rc=0) к открытым и WPA2-сетям; 4-way доведён до
-      конца (msg1→msg2 принят→msg3 GTK unwrap→msg4→PTK/GTK в CAM). Осталось:
-      добиться DHCP OFFER на WPA2-сети (после handshake DISCOVER переслан
-      зашифрованным CCMP) → IP 10.72.75.x → пинг с ПК — цель «эмулятор +
-      сетевой доступ к ROM на SD».
+      конца (msg1→msg2 принят→msg3 GTK unwrap→msg4 key_info=0x030A с Secure→
+      PTK/GTK в CAM).
+    - **TX-путь и DHCP (W.540-W.597) — итоги**:
+      * **Дескриптор TX** обязательные блоки: AGG_BREAK (pDesc+8 bit16),
+        checksum (XOR 16 слов → байты 28-29), 8-байтный CCMP IV в кадре
+        (между 802.11 hdr и LLC), OQT-слот (0x002A) перед записью.
+      * **КОРЕНЬ зависания 3-страничных кадров (W.555/W.584)**: DHCP (320 Б =
+        3 страницы) не выгружался LOQ. Решение — слать DHCP (≥3 стр) в **HIQ**
+        (device 4) с QUEUE_SEL=QSLT_MGNT; 2-стр кадры идут в LOQ как раньше.
+      * **Корень «кадр не уходил в очередь»** — блок-режим W.554 был ОШИБКОЙ
+        (писал мимо окна FIFO); только byte-mode CMD53.
+      * **RX-парсер**: OFFER/ACK приходят (src=67→dst=68). Исправлена проверка
+        портов (W.590) — раньше принимала только 68→67 и дропала OFFER.
+      * **DHCP-состояние**: `dhcp_offer_seen` не сбрасывается в DISCOVER,
+        сброс на старте join (W.594); после OFFER не шлём повторный DISCOVER.
+      * **Глобальный IP**: сохранён в join_target (ip/mask/gw/have_ip), раньше
+        net_state был локальным в join и IP терялся (W.595).
+      * Скорость DHCP/EAPOL — 1M (CCK), надёжно (W.568).
 
-    Эталон D7: rtl8189fs-lakka-live-rx-dump-w7.md.
+    Эталон D8: rtl8189fs-lakka-live-dump.md, LAKKA-ETALON-ZAMERY.md §6-7
+    (живая CAM 0x8010/0x8051, REG_SECCFG=0x010C, 0x420=0xff311f00,
+    0x200=0x00E7020C, macid id0=AP/id1=bmc RSVD, TX rate=MCS7).
 
 ---
 

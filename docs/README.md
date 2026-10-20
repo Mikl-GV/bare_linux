@@ -8,15 +8,15 @@
 к WiFi-чипу RTL8189FTV (приём эфира, сканирование beacon/SSID)**. В планах —
 превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние (W.459): **полная host-ассоциация + завершённый 4-way
-> handshake WPA2 работают end-to-end**.
+> Рабочее состояние (W.597): **полная host-ассоциация + WPA2 4-way handshake
+> + передача 3-страничных кадров + DHCP-обмен** (DISCOVER→OFFER→REQUEST).
 > К любой сети из скана проходит ассоциация (AuthResp=0 → AssocReq → AssocResp=0 →
 > MSR=STA, rc=0). К открытым и WPA2-сетям (A05s, MTS_GPON_9290e0). Криптоядро
 > host-supplicant (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap —
-> проверено на хосте). Против WPA2-AP 4-way handshake доведён до конца:
-> EAPOL msg1 → msg2 (принят AP) → msg3 (GTK unwrap OK) → msg4 (tx rc=0) →
-> PTK/GTK в CAM чипа (`cam keys loaded`). DHCP DISCOVER после handshake
-> пересылается зашифрованным (CCMP). Стадия «получить DHCP OFFER → IP» — в работе.
+> проверено на хосте). Против WPA2-AP 4-way handshake доведён до конца.
+> DHCP DISCOVER после handshake уходит в эфир (3-стр кадры — через HIQ),
+> OFFER принимается и распознаётся (`net: DHCP OFFER ip=...`), REQUEST
+> отправлен; получение ACK — в работе. IP сохраняется в global join_target.
 > Шина SDIO — 1-bit/50 МГц (4-bit ломает data-фазу CMD53). host не тянет
 > многоблочный SDIO read (только 1 блок/CMD53).
 
@@ -28,7 +28,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join (rc=0, MSR=STA) к открытой и WPA2-сети; **WPA2 4-way handshake завершён** (msg1→msg2→msg3 GTK unwrap→msg4, PTK/GTK в CAM); DHCP DISCOVER переслан после handshake; ждём DHCP OFFER → IP. |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join + **WPA2 4-way + TX 3-стр кадров** (DHCP через HIQ) + **DHCP OFFER/REQUEST обмен**. DHCP ACK — в работе. IP сохраняется в join_target. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -54,14 +54,19 @@
    вызов из пункта меню Transfer с Retry (3 скана). Полная ассоциация
    (rc=0, MSR=STA) к открытым и WPA2-сетям; при смене BSSID шлётся deauth
    и выполняется drain RX FIFO перед новым auth (фикс flaky rc=-4).
-8. **DHCP (W.395-W.410)**: после assoc отправляется DHCP DISCOVER
+8. **DHCP (W.395-W.597)**: после assoc отправляется DHCP DISCOVER
    (IP proto=UDP, broadcast); приём data-кадров после assoc (ARP/IPv6)
    подтверждён. При WPA2 — пересылается после handshake (зашифрованный CCMP).
-   Цель — IP от AP (из yiaddr OFFER).
-9. **WPA2 (W.412-W.459)**: криптоядро host-supplicant готово; против WPA2-AP
+   Длина кадра с 8-байтным CCMP IV = 320 Б (3 страницы) — такие кадры идут
+   через **HIQ** (W.584), 2-стр — через LOQ. OFFER принимается и распознаётся
+   (`net: DHCP OFFER ip=...`, фикс портов W.590), REQUEST отправлен; получение
+   **DHCP ACK — в работе**. IP сохраняется в global join_target (W.595).
+9. **WPA2 (W.412-W.597)**: криптоядро host-supplicant готово; против WPA2-AP
    проходит полный 4-way handshake: EAPOL msg1 → msg2 (принят AP, nonce min/max
    фикс) → msg3 (GTK unwrap через RFC3394) → msg4 (key_info 0x030A, secure bit)
-   → PTK/GTK в CAM чипа. Handshake завершён; DHCP OFFER после него — в работе.
+   → PTK/GTK в CAM чипа. TX-дескриптор данных: AGG_BREAK, checksum (байты 28-29),
+   8-байт CCMP IV, OQT-слот. DHCP-состояние: `dhcp_offer_seen` не сбрасывается
+   в DISCOVER, сброс на старте join (W.594), после OFFER DISCOVER не повторяем.
 
 ### Известные ограничения (W.338+)
 
@@ -81,8 +86,9 @@
   Auth/Assoc через RX-путь.
 
 Ближайший шаг: добиться **DHCP OFFER после WPA2 handshake** (после `cam keys
-loaded` DISCOVER пересылается зашифрованным CCMP; ждём OFFER → IP 10.72.75.x),
-затем пинг с ПК. Цель — «эмулятор + сетевой доступ к ROM на SD».
+loaded` DISCOVER пересылается зашифрованным CCMP, уходит в эфир; проверить лог
+W.556 с MCS7 — ждём OFFER → IP 10.72.75.x), затем пинг с ПК. Цель — «эмулятор +
+сетевой доступ к ROM на SD».
 Подробности: `NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
 
 ---
@@ -172,8 +178,9 @@ Makefile       сборка (MSYS2 make, arm-none-eabi-gcc)
 ## Git / точки восстановления
 
 Каждая рабочая точка фиксируется коммитом (в `origin/main`) и, для ключевых
-вех, тегом. Последняя точка восстановления — **W.459** (4-way handshake WPA2
-завершён; коммиты `369c018` и последующий). Лог ветки:
+вех, тегом. Последняя точка восстановления — **W.556** (4-way handshake WPA2
+завершён; TX 3-страничных кадров работает — 0x420; коммит `16e6b8e` пушнут,
+правки W.553-W.556 в рабочем дереве). Лог ветки:
 
 ```
 git log --oneline -15

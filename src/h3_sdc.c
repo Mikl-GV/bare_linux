@@ -85,6 +85,13 @@ static struct {
     uint8_t pmk_valid;           /* W.453: PMK предвычислен (в h3_wifi_set_passphrase) */
     uint8_t snonce[32];          /* наш nonce */
     uint8_t secure;              /* 1 = 4-way завершён и PTK/GTK в CAM — TX data шифровать (Protected) */
+    /* W.595 [ответ на вопрос]: глобальное хранилище полученного по DHCP IP.
+       Раньше net_state nst был локальным в h3_wifi_join_ap — IP терялся после
+       join, и ARP/ICMP-ответы вне join-блока не имели адреса. Сохраняем сюда. */
+    uint8_t have_ip;             /* 1 = DHCP ACK получен, ip/mask/gw валидны */
+    uint8_t ip[4];
+    uint8_t mask[4];
+    uint8_t gw[4];
 } join_target;
 
 /* Список найденных сетей для UI «Transfer» (заполняется парсером RX-скана). */
@@ -828,6 +835,31 @@ int h3_wifi_tx_free_pages_loq(void)
 
     if (sdio_local_read_bytes(0x0020u, buf, 8) != 0) return -1;
     return (int)((uint32_t)buf[4] | ((uint32_t)buf[5] << 8));
+}
+
+/* W.581: полный снимок свободных страниц TX (FREE_TXPG 0x20) по эталону
+   HalQueryTxBufferStatus8188FSdio (sdio_ops.c:2273-2299): 8 байт, чётные
+   байты = 16-бит LE: [0]=HIQ, [2]=MIDQ, [4]=LOWQ, [6]=PUBQ.
+   Печатает компактно: h/m/l/p. Возвращает LOWQ (для совместимости). */
+static int txpg_full_print(const char *tag)
+{
+    uint8_t buf[8];
+    if (sdio_local_read_bytes(0x0020u, buf, 8) != 0) return -1;
+    uint32_t hiq = (uint32_t)(buf[0] | (buf[1] << 8));
+    uint32_t mid = (uint32_t)(buf[2] | (buf[3] << 8));
+    uint32_t low = (uint32_t)(buf[4] | (buf[5] << 8));
+    uint32_t pub = (uint32_t)(buf[6] | (buf[7] << 8));
+    uart_print(tag);
+    uart_print(" h=");
+    uart_print_int((int)hiq);
+    uart_print(" m=");
+    uart_print_int((int)mid);
+    uart_print(" l=");
+    uart_print_int((int)low);
+    uart_print(" p=");
+    uart_print_int((int)pub);
+    uart_print("\r\n");
+    return (int)low;
 }
 
 /* Полный power-on чипа: тянет карту из CARDEMU в ACTIVE. */
@@ -2223,14 +2255,19 @@ void h3_wifi_rf_rx_test(void)
     h3_sdc_write_wlan_reg8(0x055C, 0x28);          /* USTIME_TSF */
 
     /* Непокрытые _Init* из sdio_halinit.c:
-       - _InitRetryFunction (sdio_halinit.c:656-663): FWHW_TXQ_CTRL (0x818)
-         |= EN_AMPDU_RTY_NEW (BIT7), ACKTO (0x634) = 0x40;
+       - _InitRetryFunction (sdio_halinit.c:632-642): REG_FWHW_TXQ_CTRL
+         (0x0420, hal_com_reg.h:253) |= EN_AMPDU_RTY_NEW (BIT7),
+         ACKTO (0x634) = 0x40;
        - _InitRDGSetting (sdio_halinit.c:810-815): RD_CTRL (0x524) = 0xFF,
          RD_NAV_NXT (0x544) = 0x200, RD_RESP_PKT_TH (0x463) = 0x05 —
          управление Response Data (ответы/приём). Исправление addr:
          0x524 = REG_RD_CTRL (0x524), 0x544 = REG_RD_NAV_NXT, 0x463 = RD_TH. */
-    h3_sdc_read_wlan_reg8(0x0818, &num);
-    h3_sdc_write_wlan_reg8(0x0818, (uint8_t)(num | (1u << 7)));  /* EN_AMPDU_RTY_NEW */
+    /* W.556 [корень]: EN_AMPDU_RTY_NEW (BIT7) в 0x0420 (REG_FWHW_TXQ_CTRL) —
+       раньше писали в 0x0818 (НЕВЕРНЫЙ адрес! 0x818 — другой регистр).
+       Живая Lakka: 0x420 = 0xff311f00 (BIT7=1). Без этого бита FW не
+       делает retry при неудачной передаче AMPDU-кандидата и держит кадр? */
+    h3_sdc_read_wlan_reg8(0x0420, &num);
+    h3_sdc_write_wlan_reg8(0x0420, (uint8_t)(num | (1u << 7)));  /* EN_AMPDU_RTY_NEW */
     h3_sdc_write_wlan_reg8(0x0634, 0x40);          /* ACKTO */
     h3_sdc_write_wlan_reg8(0x0524, 0xFF);          /* RD_CTRL */
     h3_sdc_write_wlan_reg16(0x0544, 0x0200);       /* RD_NAV_NXT */
@@ -3790,6 +3827,7 @@ void h3_wifi_scan_capture_target(const uint8_t *bssid, uint8_t channel)
     for (int i = 0; i < 6; i++) join_target.bssid[i] = bssid[i];
     join_target.channel = channel;
     join_target.bssid_captured = 1;
+    join_target.have_ip = 0;   /* W.595: новая точка назначения — IP сброшен */
 }
 
 int h3_wifi_target_captured(uint8_t bssid[6], uint8_t *channel)
@@ -3895,6 +3933,7 @@ void h3_wifi_get_mac(uint8_t m[6])
    request, MAC пира для ARP reply/ICMP, BSSID для EAPOL.
    payload = LLC/SNAP(8) + EtherType(2) + данные, length = размер payload без
    LLC-заглушки. Отправка — в LOW-очередь (LOQ, device 6). */
+volatile int g_test_plain = 0;   /* W.586: тестовый флаг — слать без шифрования */
 int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
                     const uint8_t *data, uint16_t len)
 {
@@ -3904,7 +3943,11 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
 
     uint8_t buf[40 + 24 + 8 + 2 + 1500];
     uint32_t i;
-    for (i = 0; i < 40; i++) buf[i] = 0;
+    for (i = 0; i < sizeof(buf); i++) buf[i] = 0;   /* W.576: обнуляем ВЕСЬ буфер,
+        не только txdesc(40). Раньше область кадра (buf[40..]) была мусором стека:
+        duration (f[2..3]) и прочие неявные поля 802.11-заголовка содержали
+        случайные байты (в дампе W.575: probe f[2..3]=0x17 0x1B, DHCP=0x5C 0x5C),
+        что AP могла дропать как невалидный кадр. */
 
     /* tx_desc: как у драйвера для data (rtl8188f_fill_default_txdesc). */
     buf[2] = 40u;                                       /* OFFSET = 40 */
@@ -3925,21 +3968,10 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
     buf[3] = (uint8_t)((1u << 2) | (1u << 3) | (1u << 7));   /* LAST|FIRST|OWN, BMC=0 */
     buf[4] = 0x00u;                                          /* MACID=0 (pairwise/AP-sta) */
     buf[5] = 0x00u;                                     /* QUEUE_SEL = QSLT_BE (data) */
-    /* W.507 [по эталону]: DHCP(0x0800) и EAPOL(0x888E) — special packets,
-       шлются на basic rate CCK 1M. Явно ставим TX_RATE=1M (0x00) и USE_RATE=1
-       (pDesc+12 bit8 = byte13 bit0). 6M-тест (W.503-505) результата не дал. */
-    /* W.541: скорость special packets. Эталон rtl8188f_hal_init.c:4793-4797:
-       для special (EAP/ARP/DHCP) ставит USE_RATE=1 и
-       TX_RATE = MRateToHwRate(pmlmeext->tx_rate) — т.е. текущая скорость
-       драйвера, НЕ жёстко 1M (комментарий «1M» устарел). У Lakka на A05s
-       tx_rate=MCS7, и её DHCP идёт QoS Data на MCS7.
-       Наш DHCP на 1M CCK + QoS в HT-BSS мог не декодироваться AP
-       (OFFER не приходит). Оставляем 1M только для EAPOL (4-way handshake
-       действительно надёжнее на 1M), DHCP шлём без форсирования rate. */
-    /* W.550: DHCP тоже с явным 1M + USE_RATE (как эталон для special
-       packets rtl8188f_hal_init.c:4793-4797 — USE_RATE=1, rate=1M).
-       Раньше для 0x0800 rate был 0 (1M) но USE_RATE=0 — FW мог слать
-       на автоскорости, что для broadcast ненадёжно. */
+/* W.568 [итог]: DHCP и EAPOL шлём на 1M (CCK). Перебрали 1M/MCS7
+       (W.556) — не влияло на доставку: OFFER приходит и на 1M (W.591+).
+       Эталон шлёт special на текущей tx_rate, но 1M надёжнее для первого
+       кадра после 4-way. USE_RATE=1 (pDesc+12 bit8) + TX_RATE=1M. */
     if (ethertype == 0x888E || ethertype == 0x0800) {
         buf[16] = 0x00u;                                /* TX_RATE = DESC_RATE1M */
         buf[13] |= 0x01u;                               /* USE_RATE */
@@ -3958,10 +3990,8 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
        DISCOVER молча теряется». EAPOL (0x888E) оставляем обычным Data. */
     /* QoS Data — только если WMM IE был в beacon'е цели (иначе мы non-QoS STA,
        эталон rtw_xmit.c:631: qos_en = psta->qos_option). EAPOL — всегда Data. */
-/* W.546: QoS для DHCP возвращён (как W.542). Тест W.543 (non-QoS для
-       0x0800) не подтвердил гипотезу «FW не берёт QoS из LOQ» — DISCOVER
-       висел и non-QoS. Эталон: qos_en = psta->qos_option (rtw_xmit.c:631);
-       у Lakka qos_en=1 и DHCP идёт QoS Data. */
+/* W.578 [откат]: DHCP снова QoS (см. W.546). Эксперимент non-QoS не стал
+       приоритетом — сначала размерный свип (W.580), потом уже решит. */
     int qos_data = (join_target.wmm_len > 0) && (ethertype != 0x888E);
     if (qos_data) f[0] = 0x88;     /* QoS Data */
     /* W.462/W.465: после 4-way (secure=1) data-кадры ДОЛЖНЫ уходить зашифрованными.
@@ -3973,7 +4003,7 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
        в CAM и seccfg=0xCF. EAPOL msg4 НЕ защищается (уходит до установки
        ключей на AP), поэтому для ethertype 0x888E Protected и SEC_TYPE не
        ставятся. */
-    if (join_target.secure && ethertype != 0x888E) {
+    if (join_target.secure && !g_test_plain && ethertype != 0x888E) {
         /* W.546: вернуть боевой Protected/SEC_TYPE для ВСЕХ data (в т.ч. DHCP).
            Тест W.544 (plaintext DHCP) невалиден на WPA2: AP дропает
            незащищённые data молча, поэтому sec=0 ничего не доказывало. */
@@ -4001,6 +4031,26 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
     uint32_t p = 24;
     /* W.502: QoS Control (TID=0 BE, ack_policy=normal) — только для QoS Data. */
     if (qos_data) { f[p++] = 0x00; f[p++] = 0x00; }
+    /* W.553 [корень]: 8-байтный CCMP header (IV/PN) для Protected кадров.
+       Эталон rtw_xmit.c:2156/2198: при iv_len=8 (AES) IV ВСЕГДА копируется
+       в кадр (между 802.11 header и LLC) и входит в last_txcmdsz/pkt_size.
+       Без него длина кадра на 8 байт меньше ожидаемой FW: малые кадры
+       (94Б, 2 стр) всё равно проходят, 3-страничные (DHCP 312Б) зависают
+       в очереди — FW не может корректно зашифровать/выгрузить.
+       Формат (rtw_xmit.h:140 AES_IV): PN0 PN1 0 (0x20|keyid<<6) PN2 PN3 PN4 PN5. */
+    int sec_iv = (join_target.secure && !g_test_plain) && ethertype != 0x888E;
+    if (sec_iv) {
+        static uint32_t ccmp_pn = 0;
+        f[p++] = (uint8_t)(ccmp_pn & 0xFF);          /* PN0 */
+        f[p++] = (uint8_t)((ccmp_pn >> 8) & 0xFF);   /* PN1 */
+        f[p++] = 0x00;                               /* reserved */
+        f[p++] = (uint8_t)(0x20 | (0 << 6));         /* ExtIV + keyid 0 */
+        f[p++] = 0x00;                               /* PN2 */
+        f[p++] = 0x00;                               /* PN3 */
+        f[p++] = 0x00;                               /* PN4 */
+        f[p++] = (uint8_t)((ccmp_pn >> 16) & 0xFF);  /* PN5 */
+        ccmp_pn++;
+    }
     /* LLC/SNAP: AA AA 03 00 00 00 + ethertype (big-endian) */
     f[p++] = 0xAA; f[p++] = 0xAA; f[p++] = 0x03; f[p++] = 0x00; f[p++] = 0x00; f[p++] = 0x00;
     f[p++] = (uint8_t)(ethertype >> 8); f[p++] = (uint8_t)(ethertype & 0xFF);
@@ -4011,20 +4061,14 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
     buf[0] = (uint8_t)(p & 0xFF);
     buf[1] = (uint8_t)((p >> 8) & 0xFF);
 
-    /* W.550 [корень]: AGG_BREAK обязателен для одиночного кадра.
-       Эталон rtl8188f_hal_init.c:4749-4754, 4793: для non-AMPDU data
-       (включая DHCP special packet) ставится SET_TX_DESC_AGG_BREAK=1
-       (pDesc+8 bit16 = байт 8 bit0). БЕЗ него FW держит кадр как
-       кандидата на AMPDU-агрегацию, не отправляет в эфир, страницы
-       TX не освобождаются — ровно наш симптом (кадр висит в LOQ/HIQ). */
+    /* AGG_BREAK=1 обязателен для одиночного кадра (эталон
+       rtl8188f_hal_init.c:4749-4754 для non-AMPDU data). Без него FW
+       держит кадр как кандидата AMPDU-агрегации и не отправляет. */
     buf[8] |= 0x01u;               /* AGG_BREAK = 1 (pDesc+8 bit16) */
 
-    /* W.552 [корень]: checksum TX-дескриптора (rtl8188f_cal_txdesc_chksum,
-       rtl8188f_hal_init.c:934-954, вызывается в КОНЦЕ каждого fill_txdesc
-       для SDIO). XOR всех 16 16-бит слов первых 32 байт -> слово 7
-       (байты 28-29). Без него FW отвергает дескриптор больших кадров
-       (>=3 страницы) и кадр висит в очереди вечно — МАЛЫЕ кадры (EAPOL,
-       1-2 стр) проходят, DHCP (3 стр) виснет. */
+    /* checksum TX-дескриптора (rtl8188f_cal_txdesc_chksum, rtl8188f_hal_init.c:934):
+       XOR 16 16-бит слов первых 32 байт -> байты 28-29. Обязателен для SDIO,
+       считается всегда в конце fill_txdesc. */
     {
         uint16_t sum = 0;
         for (int w16 = 0; w16 < 16; w16++) {
@@ -4034,72 +4078,90 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
         buf[28] = (uint8_t)(sum & 0xFF);
         buf[29] = (uint8_t)((sum >> 8) & 0xFF);
     }
-    /* W.546: диагностика выбора ключа TX + фактические поля кадра.
-           Для broadcast/multicast dst чип должен шифровать групповым
-           ключом (GTK, cam5), для unicast — pairwise (cam4). */
+    #if WIFI_TX_DIAG
+    /* W.570 [диагностика]: дамп первых 48 байт TX-буфера для DHCP —
+       txdesc(40) + 802.11 hdr + IV. Увидим, что реально уходит в FIFO:
+       fc, addr1/2/3, QoS, CCMP-IV, SEC_TYPE в txdesc. */
+    if (ethertype == 0x0800) {
+        TXDIAG("  tx dump:");
+        for (int db = 0; db < 48 && db < (int)p + 40; db++) {
+            TXDIAG_HEX(buf[db]);
+            TXDIAG(" ");
+        }
+        TXDIAG("\r\n");
+    }
+    /* W.546/W.557: диагностика выбора ключа TX + фактические поля кадра.
+       Своё отработала (дескриптор подтверждён) — под флагом WIFI_TX_DIAG. */
         if (ethertype == 0x0800 || ethertype == 0x888E) {
-            uart_print("  tx camx dst=");
             int bcast = 1;
             for (int k = 0; k < 6; k++)
                 if (dst_mac[k] != 0xFF) { bcast = 0; break; }
-            uart_print_int(bcast ? 5 : 4);
-            uart_print(" fc=0x");
-            uart_print_hex((uint32_t)(f[0] | ((uint32_t)f[1] << 8)));
-            uart_print(" rate=0x");
-            uart_print_hex((uint32_t)buf[16]);
-            uart_print(" use=");
-            uart_print_int((int)(buf[13] & 1));
-            uart_print(" qos=0x");
-            uart_print_hex((uint32_t)(qos_data ? (f[24] | ((uint32_t)f[25] << 8)) : 0xFFFFu));
-            uart_print(" sec=");
-            uart_print_int((int)((buf[6] >> 6) & 0x3));
-            uart_print(" len=");
-            uart_print_int((int)p);
-            uart_print("\r\n");
+            TXDIAG("  tx camx dst=");
+            TXDIAG_INT(bcast ? 5 : 4);
+            TXDIAG(" fc=0x");
+            TXDIAG_HEX((uint32_t)(f[0] | ((uint32_t)f[1] << 8)));
+            TXDIAG(" rate=0x");
+            TXDIAG_HEX((uint32_t)buf[16]);
+            TXDIAG(" use=");
+            TXDIAG_INT((int)(buf[13] & 1));
+            TXDIAG(" qos=0x");
+            TXDIAG_HEX((uint32_t)(qos_data ? (f[24] | ((uint32_t)f[25] << 8)) : 0xFFFFu));
+            TXDIAG(" sec=");
+            TXDIAG_INT((int)((buf[6] >> 6) & 0x3));
+            TXDIAG(" len=");
+            TXDIAG_INT((int)p);
+            TXDIAG("\r\n");
         }
+#endif /* WIFI_TX_DIAG */
 
     /* W.498 [корневой фикс]: TX-страница чипа = 128 байт
        (rtl8189fs_xmit.c:612: pg_num = (len+127)/128). Раньше ждали всего
        fp >= 1 и писали кадр, которому нужно больше страниц: msg2 (~196Б=2 стр)
        проходил, а DISCOVER (~352Б=3 стр) не влезал в LOQ — висел, loq=0,
        txempty bit0=0. Ждём ровно столько страниц, сколько нужно кадру. */
-    uint32_t total = (40u + p + 3u) & ~3u;
+uint32_t total = (40u + p + 3u) & ~3u;
     int pg_needed = (int)((total + 127u) / 128u);
+
+    /* W.584 [тест]: DHCP (0x0800) ПРИНУДИТЕЛЬНО в HIQ (device 4) с
+       QSLT_MGNT, потому что 3-page кадр в LOQ не обрабатывается FW
+       (размерный свип W.583: bcast 2стр возвращает, 3стр застревает).
+       LOQ не умеет 3-page — для DHCP сразу ждём HIQ-страницы. */
+    int use_hiq = (ethertype == 0x0800) ? 1 : 0;   /* W.584: DHCP -> HIQ */
     int fp = -1;
-    for (int t = 0; t < 200; t++) {
-        fp = h3_wifi_tx_free_pages_loq();
-        if (fp >= pg_needed) break;
-        udelay(1000);
-    }
-    /* W.498 [fallback]: если LOW-страниц не хватает (у нас LPQ мал, ~2),
-       отправляем через HIQ (device 4) — там страниц много. HIQ в 8188F
-       обслуживает и data-кадры, если FW в активном режиме. */
-    int use_hiq = 0;
-    if (fp < pg_needed) {
-        use_hiq = 1;
+    if (use_hiq) {
         for (int t = 0; t < 200; t++) {
             fp = h3_wifi_tx_free_pages_hiq();
             if (fp >= pg_needed) break;
             udelay(1000);
         }
         if (fp < pg_needed) return -2;
+    } else {
+        for (int t = 0; t < 200; t++) {
+            fp = h3_wifi_tx_free_pages_loq();
+            if (fp >= pg_needed) break;
+            udelay(1000);
+        }
+        if (fp < pg_needed) {
+            use_hiq = 1;
+            for (int t = 0; t < 200; t++) {
+                fp = h3_wifi_tx_free_pages_hiq();
+                if (fp >= pg_needed) break;
+                udelay(1000);
+            }
+            if (fp < pg_needed) return -2;
+        }
     }
+    /* Для HIQ ставим QUEUE_SEL=QSLT_MGNT (0x12) — как для mgmt-очереди. */
+    if (use_hiq) buf[5] = 0x12u;
 
     uint32_t tx_dev = use_hiq ? WLAN_TX_HIQ_DEVICE_ID_W220
                               : WLAN_TX_LOQ_DEVICE_ID_W220;
-    /* W.550: DHCP снова в LOQ (BE) — как эталон. Принудительный HIQ
-       (W.547) убран: различающая информация уже получена (HIQ тоже
-       застревал). С AGG_BREAK=1 и LOQ должен выгружать кадры. */
-    /* W.545 [корень]: перед записью в TX-FIFO дождаться OQT-слота.
-       Эталон rtl8189fs_xmit.c:24-48 (rtw_sdio_wait_enough_TxOQT_space):
-       читает SDIO_REG_AC_OQT_FREEPG (0x002A, локальный рег. SDIO) и ждёт
-       SdioTxOQTFreeSpace >= agg_num (для одиночного кадра =1). Без этого
-       FW не берёт кадр из LOQ (txempty bit0=0) — висит, в эфир не уходит.
-       Это объясняет: msg2/msg4 (малые, в начале) проходят, DHCP (310Б,
-       после 4-way) — нет. */
-    /* W.551: диагностика OQT. Перед записью ждём слот 0x002A (AC OQT),
-       как эталон. Если слот не даётся (0x002A остаётся 0) — FW залочен
-       зависшими кадрами и НЕ принимает новые. Печатаем значение до/после. */
+    /* W.550: DHCP в LOQ (BE) — как эталон (rtl8188f_hal_init.c:4793 и
+       Queue2Pipe[BE]=LOQ, device 6). Принудительный HIQ (W.547) убран. */
+    /* W.545/W.551: ожидание OQT-слота (SDIO_REG_AC_OQT_FREEPG 0x002A) перед
+       записью — как эталон rtl8189fs_xmit.c:24-48. НЕ корень зависания:
+       слот всегда был доступен (oqt_before>0). Оставлено как страховка
+       (FW может не брать кадр без OQT при нагрузке). */
     uint8_t oqt_before = 0xFF, oqt_after = 0xFF;
     h3_sdc_cmd52_read(1, (8u << 13) | 0x002Au, &oqt_before);
     for (int oq = 0; oq < 500; oq++) {
@@ -4117,9 +4179,15 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
     }
     uint32_t fifo_addr = (tx_dev << 13)
                        | ((total / 4) & 0x1FFFu);
-    /* W.449 [W.450: спрятан] — tx dump печатался на каждую отправку (dhcp+msg2)
-       и задерживал запись в HIQ. Оставлен в комментарии для справки:
-       frame[24..31] подтверждал LLC/SNAP (AA AA 03 00 00 00) + ethertype. */
+    /* W.571 [регрессия W.554]: УБРАН block-mode CMD53 для кадров >= 3 стр.
+       W.554 был ОШИБКОЙ: блочный CMD53 (512 Б) по адресу (total/4) писал
+       в FIFO ДРУГОЕ окно, FW не принимала кадр (loq не двигался, rc=0
+       лгал). Дамп W.571 доказал: дескриптор DHCP (320 Б) корректен
+       (buf[0..1]=0x40/0x01, offset=0x28, flags=0x8C, sec=0xC0), но при
+       block-mode loq=8→8 — данные в FIFO не попадали.
+       Эталон sdio_write_port пишет byte-mode CMD53 с cnt=360 (не кратно
+       512 → sdio_memcpy_toio выбирает byte-mode). Возвращаем byte-mode
+       для ВСЕХ кадров. */
     rc = h3_sdc_cmd53_write_bytes(1, fifo_addr, total, buf);
     return rc;
 }
@@ -4809,6 +4877,7 @@ int h3_wifi_join_ap(void)
         struct net_state nst;
         for (int k = 0; k < 4; k++) { nst.ip[k]=0; nst.net[k]=0; nst.mask[k]=0; nst.gw[k]=0; }
         nst.have = 0;
+        net_dhcp_reset();   /* W.594: сброс DHCP-состояния на новом join */
         uint8_t rxbuf[0x4000 + 512];
         uint32_t acc = 0;
         int waited = 0;
@@ -4883,76 +4952,68 @@ int h3_wifi_join_ap(void)
             /* W.495: DISCOVER шлём 3 раза с интервалом ~1 с (как стандартный
                DHCP-клиент ретраит). Один потерянный кадр не должен убивать всю
                попытку. Перед первой отправкой — 100 мс на применение ключей. */
-            if (wpa2_done && dhcp_resent < 3 && waited >= dhcp_resent * 1000) {
-                if (dhcp_resent == 0) {
+            /* W.592: если OFFER уже получен (SELECTING), НЕ шлём повторный DISCOVER
+       (он сбрасывал состояние и мешал приёму ACK), а ждём ACK до таймаута. */
+            if (wpa2_done && dhcp_resent < 3 && waited >= dhcp_resent * 1000
+                && !net_dhcp_offer_pending()) {
+                /* W.493 [корень]: пауза 100 мс перед ПЕРВЫМ DISCOVER после 4-way —
+                   иначе кадр уходит в LOQ раньше, чем чип применил ключи из CAM,
+                   AP не может расшифровать (молчаливый дроп). Это функционально,
+                   НЕ диагностика — всегда. */
+                if (dhcp_resent == 0)
                     udelay(100000);
-                    /* W.548 [развилка]: короткий защищённый IPv4-кадр (60 Б
-                       payload = 1-2 страницы) — проверить, уйдёт ли ОН.
-                       Если да (страницы освободятся) — DHCP висит из-за
-                       РАЗМЕРА (3+ страницы); если тоже застрянет — глубже
-                       (шифрование/дескриптор). */
-                    static const uint8_t probe[60] = {
-                        0x45,0x00,0x00,0x3C, 0x00,0x01,0x00,0x00,
-                        0x40,0x11,0x00,0x00, 0x00,0x00,0x00,0x00,
-                        0xFF,0xFF,0xFF,0xFF, 0x00,0x00,0x00,0x00,
-                        0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                        0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                        0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                        0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                        0x00,0x00,0x00,0x00};
-                    int prc = h3_wifi_tx_data(0x0800, join_target.bssid, probe, 60);
-                    uart_print("  join: probe_tx rc=");
-                    uart_print_int(prc);
-                    uart_print(" loq=");
-                    uart_print_int(h3_wifi_tx_free_pages_loq());
-                    uart_print(" hiq=");
-                    uart_print_int(h3_wifi_tx_free_pages_hiq());
-                    uart_print("\r\n");
-                    /* W.549 [развилка]: короткий ЭФИРНО-BROADCAST кадр без
-                       шифрования (dst=ff, но sec=0) — в точности DHCP по
-                       адресации, но plaintext. Если уйдёт (hiq освободится)
-                       — виновато CCMP-TX шифрование (sec=3). Если тоже
-                       застрянет — виновата адресация/QoS broadcast. */
-                    {
-                        static const uint8_t bprobe[60] = {
-                            0x45,0x00,0x00,0x3C, 0x00,0x02,0x00,0x00,
-                            0x40,0x11,0x00,0x00, 0x00,0x00,0x00,0x00,
-                            0xFF,0xFF,0xFF,0xFF, 0x00,0x00,0x00,0x00,
-                            0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                            0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                            0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                            0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                            0x00,0x00,0x00,0x00};
-                        uint8_t ff[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-                        int brc = h3_wifi_tx_data(0x0800, ff, bprobe, 60);
-                        uint32_t h1 = 0, h2 = 0;
-                        h3_sdc_read_wlan_reg32(0x041A, &h1);
-                        h3_sdc_read_wlan_reg32(0x0419, &h2);
-                        uart_print("  join: bcast_plain rc=");
-                        uart_print_int(brc);
-                        uart_print(" loq=");
-                        uart_print_int(h3_wifi_tx_free_pages_loq());
-                        uart_print(" hiq=");
-                        uart_print_int(h3_wifi_tx_free_pages_hiq());
-                        uart_print(" te=0x");
-                        uart_print_hex(h1);
-                        uart_print("(");
-                        uart_print_hex(h2);
-                        uart_print(")\r\n");
-                    }
-                }
-                uart_print("  join: dhcp discover (enc) #");
-                uart_print_int(dhcp_resent + 1);
-                uart_print("\r\n");
+#if WIFI_TX_DIAG
+                /* W.588: диагностические тестовые кадры (probe_tx,
+                   bcast_plain, size-sweep 182/183, plain 225) УБРАНЫ из
+                   первой итерации — они «залипали» HIQ/LOW страницами
+                   (3-page sw182 держал h=9) и DHCP приходил на занятую
+                   очередь. Теперь DHCP идёт ПЕРВЫМ в чистый HIQ (после
+                   100 мс паузы W.493). */
+                (void)0;
+#endif /* WIFI_TX_DIAG */
+                TXDIAG("  join: dhcp discover (enc) #");
+                TXDIAG_INT(dhcp_resent + 1);
+                TXDIAG("\r\n");
                 {
-                    int drc = net_dhcp_discover(&nst);
-                    uart_print("  join: dhcp_tx rc=");
+                        int drc = net_dhcp_discover(&nst);
+                    /* W.564: лёгкая строка-лог каждой отправки DHCP (одна на
+                       DISCOVER, не тяжёлая) — виден сам факт + состояние
+                       очередей, без дампов. */
+                    uart_print("  join: dhcp #");
+                    uart_print_int(dhcp_resent + 1);
+                    uart_print(" rc=");
                     uart_print_int(drc);
-                    uart_print(" loq=");
-                    uart_print_int(h3_wifi_tx_free_pages_loq());
-                    uart_print(" hiq=");
-                    uart_print_int(h3_wifi_tx_free_pages_hiq());
+                    /* W.581: полный снимок FIFO страниц (HIQ/MID/LOW/PUB)
+                       до и после записи — видно, из какого пула iPhone берёт
+                       страницы и возвращает ли их. */
+                    txpg_full_print("  pre:");
+                    txpg_full_print("  post:");
+                    /* W.566: короткий опрос C2H TXRPT (id 0x03) после каждой
+                       отправки — решающий индикатор «дошёл ли кадр до AP».
+                       0 = нет C2H-отчёта (AP не ACK'нула / отчёт не пришёл);
+                       1 = отчёт пришёл. Компактно, 100 мс, не в hot-path тяжёлый. */
+                    {
+                        uint32_t c2h = 0;
+                        int got = 0;
+                        for (int q = 0; q < 100; q++) {
+                            h3_sdc_read_wlan_reg32(0x01A0, &c2h);
+                            if ((c2h & 0x0F) == 0x03) { got = 1; break; }
+                            udelay(1000);
+                        }
+                        uart_print(" txrpt=");
+                        uart_print_int(got);
+                        h3_sdc_write_wlan_reg8(0x01AF, 0x00);   /* C2H_EVT_HOST_CLOSE */
+                    }
                     uart_print("\r\n");
+#if WIFI_TX_DIAG
+                    (void)0;
+                    TXDIAG("  join: dhcp_tx rc=");
+                    TXDIAG_INT(drc);
+                    TXDIAG(" loq=");
+                    TXDIAG_INT(h3_wifi_tx_free_pages_loq());
+                    TXDIAG(" hiq=");
+                    TXDIAG_INT(h3_wifi_tx_free_pages_hiq());
+                    TXDIAG("\r\n");
                     /* W.542: проверить, ушёл ли DISCOVER из очереди чипа.
                        TXPKT_EMPTY (0x041A) bit6 = LOQ emptied? Смотрим 0x041A
                        и 0x041D (TXPKT_EMPTY по очередям). Если кадр висит в
@@ -4962,37 +5023,35 @@ int h3_wifi_join_ap(void)
                         uint32_t txpk = 0, txpk2 = 0;
                         h3_sdc_read_wlan_reg32(0x041A, &txpk);
                         h3_sdc_read_wlan_reg32(0x0419, &txpk2);
-                        uart_print("  join: txempty=0x");
-                        uart_print_hex(txpk);
-                        uart_print("(");
-                        uart_print_hex(txpk2);
-                        uart_print(")\r\n");
+                        TXDIAG("  join: txempty=0x");
+                        TXDIAG_HEX(txpk);
+                        TXDIAG("(");
+                        TXDIAG_HEX(txpk2);
+                        TXDIAG(")\r\n");
                     }
-                    /* W.511: дождаться C2H_CCX_TX_RPT (id 0x03) и показать
-                       retry_over/lifetime_over. Оба 0 = AP ACK'нула кадр
-                       (дошёл); любой 1 = не дошёл (ретраи/таймаут). */
+                    /* W.556: состояние очередей TX (0x400-0x41C) — в какой очереди
+                       застрял кадр: Q0-Q3 (EDCA), MGQ, HGQ, BCNQ. У живой Lakka
+                       в idle 0x400=0x017f80ff, 0x41A=0x0fff00f8. */
                     {
-                        uint32_t c2h = 0;
-                        int got = 0;
-                        /* W.519: SDIO-отчёты приходят с задержкой — для первой
-                           отправки ждём до 2500 мс (как в ядре), для повторов 200 мс,
-                           чтобы не выйти за окно DHCP 6 с. */
-                        /* W.544: txrpt-ожидание сокращено 2500/200 -> 150 мс на все попытки.
-                           Долгое ожидание (2.5с на 1-й попытке) съедало окно
-                           DHCP 6с и сбивало тайминги приёма OFFER. */
-                        int wait_ms = 150;
-                        for (int q = 0; q < wait_ms; q++) {
-                            h3_sdc_read_wlan_reg32(0x01A0, &c2h);
-                            if ((c2h & 0x0F) == 0x03) { got = 1; break; }
-                            udelay(1000);
+                        uint32_t qreg[8];
+                        h3_sdc_read_wlan_reg32(0x0400, &qreg[0]);
+                        h3_sdc_read_wlan_reg32(0x0404, &qreg[1]);
+                        h3_sdc_read_wlan_reg32(0x0408, &qreg[2]);
+                        h3_sdc_read_wlan_reg32(0x040C, &qreg[3]);
+                        h3_sdc_read_wlan_reg32(0x0410, &qreg[4]);
+                        h3_sdc_read_wlan_reg32(0x0414, &qreg[5]);
+                        h3_sdc_read_wlan_reg32(0x0418, &qreg[6]);
+                        h3_sdc_read_wlan_reg32(0x041C, &qreg[7]);
+                        TXDIAG("  join: q0..7=");
+                        for (int qi = 0; qi < 8; qi++) {
+                            TXDIAG_HEX(qreg[qi]);
+                            TXDIAG(" ");
                         }
-                        uart_print("  join: txrpt got=");
-                        uart_print_int(got);
-                        uart_print(" c2h=0x");
-                        uart_print_hex(c2h);
-                        uart_print("\r\n");
-                        h3_sdc_write_wlan_reg8(0x01AF, 0x00);   /* C2H_EVT_HOST_CLOSE */
+                        TXDIAG("\r\n");
                     }
+#else
+                    (void)drc;
+#endif /* WIFI_TX_DIAG */
                 }
                 dhcp_resent++;
                 /* W.507: tx-dbg (TXPKT_EMPTY/loq) убран из hot-path (подтверждён в W.495). */
@@ -5056,16 +5115,16 @@ uint32_t dp = fr + 24 + ((fcfc & 0x0080) ? 2 : 0)
                                    только для первых кадров и DHCP/EAPOL. */
                         {
                             static int dbg_cnt = 0;
-                            if (dbg_cnt < 4 || etype == 0x0800 || etype == 0x888E) {
-                                uart_print("  join: rx etype=0x");
-                                uart_print_hex((uint32_t)etype);
-                                uart_print(" plen=");
-                                uart_print_int((int)plen);
-                                uart_print(" fc=0x");
-                                uart_print_hex((uint32_t)fcfc);
-                                uart_print(" swdec=");
-                                uart_print_int(hw_swdec);
-                                uart_print("\r\n");
+                            if (WIFI_TX_DIAG && (dbg_cnt < 4 || etype == 0x0800 || etype == 0x888E)) {
+                                TXDIAG("  join: rx etype=0x");
+                                TXDIAG_HEX((uint32_t)etype);
+                                TXDIAG(" plen=");
+                                TXDIAG_INT((int)plen);
+                                TXDIAG(" fc=0x");
+                                TXDIAG_HEX((uint32_t)fcfc);
+                                TXDIAG(" swdec=");
+                                TXDIAG_INT(hw_swdec);
+                                TXDIAG("\r\n");
                             }
                             dbg_cnt++;
                         }
@@ -5339,6 +5398,14 @@ uint32_t dp = fr + 24 + ((fcfc & 0x0080) ? 2 : 0)
         /* W.402 [P2/P3]: честный отчёт. DHCP OFFER/ACK с IP — успех; иначе
            WPA2-pending (EAPOL есть) или DHCP FAIL — не выдавать «dhcp done». */
         if (nst.have) {
+            /* W.595: сохранить полученный IP/маску/шлюз в глобальный
+               join_target — доступно после join (ARP/ICMP/сеть выше). */
+            join_target.have_ip = 1;
+            for (int k = 0; k < 4; k++) {
+                join_target.ip[k] = nst.ip[k];
+                join_target.mask[k] = nst.mask[k];
+                join_target.gw[k] = nst.gw[k];
+            }
             uart_print("  join: DHCP OK ip=");
             for (int k = 0; k < 4; k++) { uart_print_int((int)nst.ip[k]); if (k < 3) uart_print("."); }
             uart_print("\r\n");

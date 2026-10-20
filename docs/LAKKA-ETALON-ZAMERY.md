@@ -101,3 +101,64 @@ reg_scr = 0x010c  (SCR_CHK_KEYID BIT8 | SCR_RxDecEnable BIT3 | SCR_TxEncEnable B
 3. `REG_SECCFG = 0x010C` (16-бит), а не 0xCC/0x30C/0x34C.
 4. Прежняя запись GTK в entry 1 с null-MAC не находилась чипом при RX
    (`cam_cache_chk` сверяет MAC) → `swdec=1` на broadcast.
+
+## 7. TX-путь: живые замеры (добавлено 2026-10-20, W.555-W.556)
+
+Снято с той же платы (Lakka 2.3.1, SSH 10.72.75.55), подключена к A05s
+(BSSID 9a:4d:56:7e:81:4f, ch1, WPA2). Послужило основой для фиксов W.555/W.556.
+
+### REG_FWHW_TXQ_CTRL (0x0420) — КОРЕНЬ зависания TX
+
+```
+0x420 = 0xff311f00   (bit7 = EN_AMPDU_RTY_NEW = 1)
+```
+
+- **W.556**: наш код ставил `EN_AMPDU_RTY_NEW` (BIT7) в **0x0818** (неверно!),
+  а эталон — в **0x0420** (`_InitRetryFunction`, sdio_halinit.c:632-642).
+  Пока бит не стоял, 3-страничные кадры (DHCP) висели в LOQ вечно;
+  после исправления — `loq` возвращается, очереди пустеют (лог W.555).
+
+### RQPN (0x0200) — резерв страниц TX
+
+```
+0x200 = 0x00E7020C   (HPQ=0x0C/12, LPQ=0x02/2, PUBQ=0xE7/231, без LD_RQPN после инициализации)
+```
+
+- LPQ у эталона = **2 страницы** (мы ставим 8 — отклонение-страховка, не критично).
+- DHCP (3 стр) у эталона проходит через **PUBQ** (проверка `rtw_hal_sdio_query_tx_freepage`
+  = `FreePage[PageIdx] + FreePage[PUBLIC]`).
+
+### Регистры очередей TX (idle, после DHCP)
+
+```
+0x400 = 0x017f80ff   (Q0)
+0x404 = 0x007f80ff   (Q1)
+0x408 = 0x007f80ff   (Q2/BE)
+0x40C = 0x007f80ff   (Q3)
+0x410 = 0x007f80ff   (MGQ)
+0x414 = 0x007f80ff   (HGQ)
+0x418 = 0x0fff00f8   (BCNQ)
+0x41C = 0x000000f8   (CPU_MGQ)
+0x41A = 0x0fff00f8   (TXPKT_EMPTY, 16-bit: 0x00F8)
+```
+
+- Наша прошивка после фикса W.555 даёт **идентичные** значения (q0..7 в логе W.555).
+- До фикса (W.552): `0x41A = 0x00F80FFE` (bit0=0 — LOQ не пуст, кадр висит).
+
+### TX rate и MACID (живая Lakka)
+
+```
+current_tx_rate: id0 9a:4d:56:7e:81:4f MCS7   (0x13 — используем для DHCP, W.556)
+macid_info:  id 0 bmc=0 mac=9a:4d:56:7e:81:4f C AP
+             id 1 bmc=1 mac=ff:ff:ff:ff:ff:ff RSVD
+```
+
+### SDIO FREE_TXPG (sdio_local 0x20)
+
+```
+0x20 = 0x0002000c → [0]=HIQ=0x0c(12), [2]=MIDQ=0x02(2)
+0x24 = 0x00e70002 → [4]=LOWQ=0x02(2), [6]=PUBQ=0xe7(231)
+```
+
+- Формат `HalQueryTxBufferStatus8188FSdio` (sdio_ops.c:2273): чётные байты 8-байтного
+  блока = HIQ[0], MIDQ[2], LOWQ[4], PUBQ[6] (16-bit LE).

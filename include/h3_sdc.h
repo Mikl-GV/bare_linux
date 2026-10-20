@@ -28,6 +28,25 @@
 #define WLOG_INT(n) do {} while (0)
 #endif
 
+/* W.557: диагностика TX/RX hot-path (дескриптор, loq/txempty/q0..7, txrpt,
+   rx etype, dhcp DISCOVER). UART-вывод в hot path стоил тактов и мог сбивать
+   тайминги (решение пользователя: «прячь логи, которые своё отработали»).
+   Диагностика своё отработала (W.550-W.556: дескриптор/очереди/скорость
+   подтверждены) — по умолчанию ВЫКЛЮЧЕНА. Для отладки включить:
+   #define WIFI_TX_DIAG 1 */
+#ifndef WIFI_TX_DIAG
+#define WIFI_TX_DIAG 1
+#endif
+#if WIFI_TX_DIAG
+#define TXDIAG(...)   uart_print(__VA_ARGS__)
+#define TXDIAG_HEX(n) uart_print_hex((uint32_t)(n))
+#define TXDIAG_INT(n) uart_print_int((int)(n))
+#else
+#define TXDIAG(...)   do {} while (0)
+#define TXDIAG_HEX(n) do {} while (0)
+#define TXDIAG_INT(n) do {} while (0)
+#endif
+
 /* Регистры SD/MMC хоста (offset от базы контроллера) — даташит 5.3.7. */
 #define SDC_GCTL   0x00   /* global control (soft+rst, fifo_rst, dma, int_en) */
 #define SDC_CKCR   0x04   /* clock control (card clock en/div) */

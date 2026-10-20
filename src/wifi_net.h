@@ -15,6 +15,13 @@ struct net_state {
 /* Отправить DHCP DISCOVER (broadcast). Возвращает 0 при успешной отправке. */
 int net_dhcp_discover(struct net_state *st);
 
+/* W.592: 1 если DHCP OFFER уже получен (стадия SELECTING, ждём ACK).
+   Используется циклом DHCP, чтобы не слать повторный DISCOVER. */
+int net_dhcp_offer_pending(void);
+
+/* W.594: сброс состояния DHCP на старте нового join (dhcp_offer_seen=0). */
+void net_dhcp_reset(void);
+
 /* Входящий IPv4 (после 802.11 + LLC/SNAP + ethertype).
    src_mac — L2-адрес отправителя из 802.11-заголовка.
    Обрабатывает DHCP (OFFER -> REQUEST, ACK -> фиксация адреса) и ICMP
