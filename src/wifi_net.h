@@ -22,6 +22,18 @@ int net_dhcp_offer_pending(void);
 /* W.594: сброс состояния DHCP на старте нового join (dhcp_offer_seen=0). */
 void net_dhcp_reset(void);
 
+/* W.648: указать MAC точки доступа (BSSID) — для unicast DHCP REQUEST. */
+void net_dhcp_set_bssid(const uint8_t *bssid);
+
+/* W.601: повторная отправка DHCP REQUEST (после OFFER, если ACK задержался)
+   — ретраи как у dhclient. Идёт broadcast с xid того же DISCOVER. */
+int net_dhcp_request(void);
+
+/* W.650: вернуть текущий адрес для UI. ip/mask/gw заполняются, если адрес
+   известен (OFFER получен); *have_ack=1 только после DHCP ACK.
+   Возвращает 1 при известном адресе. */
+int net_dhcp_get_ip(uint8_t ip[4], uint8_t mask[4], uint8_t gw[4], int *have_ack);
+
 /* Входящий IPv4 (после 802.11 + LLC/SNAP + ethertype).
    src_mac — L2-адрес отправителя из 802.11-заголовка.
    Обрабатывает DHCP (OFFER -> REQUEST, ACK -> фиксация адреса) и ICMP

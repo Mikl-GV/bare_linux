@@ -4,21 +4,20 @@
 **Orange Pi Lite** на SoC **Allwinner H3** (SUN8I 1680, 4× Cortex-A7).
 
 Цель проекта — поднять на голем железе всю периферию платы и её модули:
-сейчас работают **звук I2S0 → MAX98357A**, **HDMI-меню**, **SDIO-доступ
-к WiFi-чипу RTL8189FTV (приём эфира, сканирование beacon/SSID)**. В планах —
-превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
+работают **звук I2S0 → MAX98357A**, **HDMI-меню**, **SDIO-доступ
+к WiFi-чипу RTL8189FTV** (ассоциация, WPA2 4-way handshake, DHCP-обмен).
+В планах — превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние (W.597): **полная host-ассоциация + WPA2 4-way handshake
-> + передача 3-страничных кадров + DHCP-обмен** (DISCOVER→OFFER→REQUEST).
-> К любой сети из скана проходит ассоциация (AuthResp=0 → AssocReq → AssocResp=0 →
-> MSR=STA, rc=0). К открытым и WPA2-сетям (A05s, MTS_GPON_9290e0). Криптоядро
-> host-supplicant (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap —
-> проверено на хосте). Против WPA2-AP 4-way handshake доведён до конца.
-> DHCP DISCOVER после handshake уходит в эфир (3-стр кадры — через HIQ),
-> OFFER принимается и распознаётся (`net: DHCP OFFER ip=...`), REQUEST
-> отправлен; получение ACK — в работе. IP сохраняется в global join_target.
-> Шина SDIO — 1-bit/50 МГц (4-bit ломает data-фазу CMD53). host не тянет
-> многоблочный SDIO read (только 1 блок/CMD53).
+> Рабочее состояние (W.669): **полная host-ассоциация + WPA2 4-way handshake
+> + DHCP-обмен** (DISCOVER→OFFER→REQUEST→(ACK в работе)). К любой сети из скана
+> проходит ассоциация (AuthResp=0 → AssocReq → AssocResp=0 → MSR=STA, rc=0):
+> к открытым и WPA2-сетям (A05s, MTS_GPON_9290e0). Криптоядро host-supplicant
+> (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap — проверено на хосте).
+> OFFER принимается и распознаётся (`net: DHCP OFFER ip=...`), REQUEST отправлен
+> с опциями 50/54/61 и ciaddr, но ACK пока не приходит (в работе). IP сохраняется
+> в global join_target; ARP/ICMP-ответы работают (fallback по OFFER).
+> Шина SDIO — 50 МГц / 4-bit / HS (W.641), host не тянет многоблочный SDIO read
+> (только 1 блок/CMD53). Повторные сканы (rescan) работают (W.664).
 
 ---
 
@@ -28,7 +27,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 подключение | Полный 802.11 join + **WPA2 4-way + TX 3-стр кадров** (DHCP через HIQ) + **DHCP OFFER/REQUEST обмен**. DHCP ACK — в работе. IP сохраняется в join_target. |
+| **WiFi RTL8189FTV (SDIO)** | 🚧 | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров (DHCP через HIQ) + DHCP OFFER/REQUEST. DHCP ACK — в работе. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -41,22 +40,23 @@
 3. Загрузка прошивки чипа (fwdl rc=0), eFuse (на OPi Lite пуст),
    программный MAC в REG_MACID 0x610-0x615 (readback совпал).
 4. **RF-часть**: включение BB/RF по `PHY_BBConfig8188F`, загрузка полного
-   BB-конфига (207 рег.), **LSSI-доступ к RF-регистрам**, калибров **LCK** и **IQK**.
+   BB-конфига (209 рег.), **LSSI-доступ к RF-регистрам**, калибров **LCK** и **IQK**.
 5. **RX-приём** (W.329+): чип принимает эфир на всех 13 каналах, выдача из
    RX FIFO работает (по 1 блоку 512 б за CMD53 — host не тянет многоблок),
    **парсер извлекает beacon и SSID** (`BCN plen=0x10F ch=2 ssid=midea_b8_6515`).
 6. **RPWM/CPWM/HIMR/HISR — через fn1** (SDIO-local, не fn0): с W.329 FW
    подтверждает ACTIVE по смене toggle (cpwm=0x80, tog_sw=1), HIMR=0x01.
-   Эксперимент W.338: запись 0xCC в HRPWM1 даёт readback 0xCC, но CPWM
-   state[3:0] всё равно 0 — ACK на связке идёт только через toggle.
 7. **JOINBSS-движок** (W.332-W.413): host передаёт Auth/AssocReq кадры
    (не H2C 0x23 — это P2P_LPS_PARAM); захват BSSID+channel из скана,
-   вызов из пункта меню Transfer с Retry (3 скана). Полная ассоциация
-   (rc=0, MSR=STA) к открытым и WPA2-сетям; при смене BSSID шлётся deauth
-   и выполняется drain RX FIFO перед новым auth (фикс flaky rc=-4).
-8. **DHCP (W.395-W.597)**: после assoc отправляется DHCP DISCOVER
+   вызов из пункта меню Transfer. Полная ассоциация (rc=0, MSR=STA)
+   к открытым и WPA2-сетям; при смене BSSID шлётся deauth и выполняется
+   drain RX FIFO перед новым auth (фикс flaky rc=-4).
+8. **DHCP (W.395-W.669)**: после assoc отправляется DHCP DISCOVER
    (IP proto=UDP, broadcast); приём data-кадров после assoc (ARP/IPv6)
    подтверждён. При WPA2 — пересылается после handshake (зашифрованный CCMP).
+   OFFER принимается (`net: DHCP OFFER ip=...`), REQUEST (uni/broadcast, опции
+   50/54/61, ciaddr=предлагаемый IP) отправлен + ретраи +3с/+6с; получение
+   **ACK — в работе** (W.669). IP сохраняется в global join_target (W.595).
    Длина кадра с 8-байтным CCMP IV = 320 Б (3 страницы) — такие кадры идут
    через **HIQ** (W.584), 2-стр — через LOQ. OFFER принимается и распознаётся
    (`net: DHCP OFFER ip=...`, фикс портов W.590), REQUEST отправлен; получение
@@ -85,11 +85,11 @@
   причине, зависящей от power-state. Ассоциация идёт host-кадрами
   Auth/Assoc через RX-путь.
 
-Ближайший шаг: добиться **DHCP OFFER после WPA2 handshake** (после `cam keys
-loaded` DISCOVER пересылается зашифрованным CCMP, уходит в эфир; проверить лог
-W.556 с MCS7 — ждём OFFER → IP 10.72.75.x), затем пинг с ПК. Цель — «эмулятор +
+Ближайший шаг: добиться **DHCP ACK после REQUEST** (после `cam keys
+loaded` DISCOVER пересылается зашифрованным CCMP, OFFER принимается, REQUEST
+уходит; ждём ACK → IP), затем пинг с ПК и WebDAV-сервер. Цель — «эмулятор +
 сетевой доступ к ROM на SD».
-Подробности: `NEXT-CHAT-PROMPT.md`, `HARDWARE-WIFI.md`.
+Подробности: `NEXT-QUESTIONS.md`, `HARDWARE.md`.
 
 ---
 
@@ -168,30 +168,21 @@ Makefile       сборка (MSYS2 make, arm-none-eabi-gcc)
 
 | Файл | Содержание |
 |---|---|
-| `H3-BAREMETAL-GUIDE.md` | Руководство: сборка, заливка, версии, разбор этапов. |
-| `HARDWARE-REF.md` | Аппаратная справка: регистры H3, звук, DMA, JTAG, WiFi/SDIO/RF. |
-| `KNOWLEDGE.md` | База знаний: проверенные факты, источники, уроки отладки. |
-| `REGISTER-MAP.md` | Снимки значений регистров со стенда (эталон). |
-| `NEXT-CHAT-PROMPT.md` | Контекст для продолжения разработки (WiFi: ассоциация, WPA2 4-way, DHCP). |
-| `HARDWARE-WIFI.md` | Справка по чипу RTL8189FTV и драйверу. |
+| `README.md` | Канон: статус проекта, сборка, заливка, структура (этот файл). |
+| `HARDWARE.md` | Аппаратная справка H3/OPi Lite: регистры, звук I2S/DMA, CCU/SMTA/GIC, WiFi/SDIO/RF, уроки. |
+| `DEVELOPER-GUIDE.md` | Руководство разработчика: сборка, заливка, отладка, архитектура модулей, чек-листы. |
+| `LAKKA-ETALON.md` | Эталонные замеры живой Lakka 2.3.1 (шина, регистры, CAM, TX) для сверки. |
+| `NEXT-QUESTIONS.md` | Актуальное состояние и ближайшие шаги (DHCP ACK, WebDAV, эмуляторы). |
+| `HISTORY.md` | Хроника этапов проекта и ключевых вех. |
 
 ## Git / точки восстановления
 
-Каждая рабочая точка фиксируется коммитом (в `origin/main`) и, для ключевых
-вех, тегом. Последняя точка восстановления — **W.556** (4-way handshake WPA2
-завершён; TX 3-страничных кадров работает — 0x420; коммит `16e6b8e` пушнут,
-правки W.553-W.556 в рабочем дереве). Лог ветки:
+Точка восстановления — **тег `restore-2026-10-21`** (FW vW.669, после аудита кода
+и ревизии документации). Старые теги (`restore-W099-*`, `w1xx-*`, `w3xx-*`) удалены
+как устаревшие; история этапов — в `HISTORY.md`.
 
 ```
 git log --oneline -15
-```
-
-Примеры ранних тегов:
-
-```
-restore-W099-fw-ok     звук + базовый каркас
-w119-wifi-init         полная инициализация чипа (FW, MAC)
-w139-rf-lck            RF-часть: BB-конфиг, LSSI, калибровка LCK
 ```
 
 ---

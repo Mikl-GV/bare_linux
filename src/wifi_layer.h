@@ -26,4 +26,9 @@ int wifi_layer_connect(int index);
    список AP без перепрошивки. Возвращает 0 при успехе старта скана. */
 int wifi_layer_rescan(void);
 
+/* W.655 [пинг]: постоянный опрос сетевого RX в главном цикле. Принимает
+   адрес (OFFER fallback или ACK) и обрабатывает входящие ARP/ICMP
+   (отвечает на ping). Возвращает число обработанных кадров. */
+int wifi_layer_poll(void);
+
 #endif /* WIFI_LAYER_H */

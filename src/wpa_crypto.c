@@ -255,32 +255,7 @@ static void aes_add_round_key(uint8_t *state, const uint8_t *rk)
     for (int i = 0; i < 16; i++) state[i] ^= rk[i];
 }
 
-/* SubBytes + ShiftRows (шифрование), на месте в state[16]. */
-static void aes_sub_shift(uint8_t *st)
-{
-    uint8_t t[16];
-    for (int i = 0; i < 16; i++) t[i] = aes_sbox[st[i]];
-    st[0]=t[0]; st[1]=t[5]; st[2]=t[10]; st[3]=t[15];
-    st[4]=t[4]; st[5]=t[9]; st[6]=t[14]; st[7]=t[3];
-    st[8]=t[8]; st[9]=t[13]; st[10]=t[2]; st[11]=t[7];
-    st[12]=t[12]; st[13]=t[1]; st[14]=t[6]; st[15]=t[11];
-}
-
 static uint8_t aes_xtime(uint8_t x) { return (uint8_t)((x << 1) ^ (((x >> 7) & 1) ? 0x1b : 0)); }
-
-/* MixColumns шифрования (GF(2^8), полином 0x11b). */
-static void aes_mix_columns(uint8_t *st)
-{
-    for (int c = 0; c < 4; c++) {
-        int i = c*4;
-        uint8_t a0=st[i], a1=st[i+1], a2=st[i+2], a3=st[i+3];
-        uint8_t t = a0 ^ a1 ^ a2 ^ a3;
-        st[i]   = (uint8_t)(a0 ^ aes_xtime((uint8_t)(a0 ^ a1)) ^ t);
-        st[i+1] = (uint8_t)(a1 ^ aes_xtime((uint8_t)(a1 ^ a2)) ^ t);
-        st[i+2] = (uint8_t)(a2 ^ aes_xtime((uint8_t)(a2 ^ a3)) ^ t);
-        st[i+3] = (uint8_t)(a3 ^ aes_xtime((uint8_t)(a3 ^ a0)) ^ t);
-    }
-}
 
 /* Ключевое расписание AES-128: round_key[176] (11 раундовых ключей по 16). */
 static void aes_key_expand(const uint8_t *key, uint8_t *rk)
@@ -307,7 +282,6 @@ static void aes_key_expand(const uint8_t *key, uint8_t *rk)
 }
 
 /* InvMixColumns для дешифрования (аналог MixColumns, обратный полином 0x11b). */
-static uint8_t aes_mul2(uint8_t x) { return aes_xtime(x); }
 static uint8_t aes_mul(uint8_t x, uint8_t y)
 {
     uint8_t r = 0;
@@ -354,21 +328,6 @@ static void aes_inv_sub_shift(uint8_t *st)
     st[4]=t[4];  st[5]=t[1];  st[6]=t[14]; st[7]=t[11];
     st[8]=t[8];  st[9]=t[5];  st[10]=t[2]; st[11]=t[15];
     st[12]=t[12]; st[13]=t[9]; st[14]=t[6]; st[15]=t[3];
-}
-
-/* AES-128 ECB encrypt одного 16-байт блока. */
-static void aes128_enc_block(const uint8_t *key, const uint8_t in[16], uint8_t out[16])
-{
-    uint8_t rk[176], st[16];
-    aes_key_expand(key, rk);
-    for (int i = 0; i < 16; i++) st[i] = in[i];
-    aes_add_round_key(st, rk);
-    for (int r = 1; r <= 10; r++) {
-        aes_sub_shift(st);
-        if (r < 10) aes_mix_columns(st);
-        aes_add_round_key(st, rk + r*16);
-    }
-    for (int i = 0; i < 16; i++) out[i] = st[i];
 }
 
 /* AES-128 ECB decrypt одного 16-байт блока. */

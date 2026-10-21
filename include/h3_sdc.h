@@ -24,20 +24,35 @@
 #define WLOG_INT(n) uart_print_int((int)(n))
 #else
 #define WLOG(...)   do {} while (0)
-#define WLOG_HEX(n) do {} while (0)
-#define WLOG_INT(n) do {} while (0)
+#define WLOG_HEX(n) do { (void)(n); } while (0)
+#define WLOG_INT(n) do { (void)(n); } while (0)
 #endif
 
-/* W.557: диагностика TX/RX hot-path (дескриптор, loq/txempty/q0..7, txrpt,
-   rx etype, dhcp DISCOVER). UART-вывод в hot path стоил тактов и мог сбивать
-   тайминги (решение пользователя: «прячь логи, которые своё отработали»).
-   Диагностика своё отработала (W.550-W.556: дескриптор/очереди/скорость
-   подтверждены) — по умолчанию ВЫКЛЮЧЕНА. Для отладки включить:
+/* W.557/W.557 [итог]: диагностика TX/RX hot-path своё отработала
+   (W.550-W.556: дескриптор/очереди/скорость подтверждены). UART-вывод
+   в hot path стоил тактов и мог сбивать приём/передачу — ПО УМОЛЧАНИЮ
+   ВЫКЛЮЧЕН. Для отладки раскомментируй:
    #define WIFI_TX_DIAG 1 */
 #ifndef WIFI_TX_DIAG
-#define WIFI_TX_DIAG 1
+#define WIFI_TX_DIAG 0
 #endif
-#if WIFI_TX_DIAG
+/* W.625/W.634/W.641: перевести SDIO-шину на 50 МГц / 4-bit / HS
+   (эталон Lakka), фазы sample/output по ccu_phase H3 (50 МГц: output=90°,
+   sample=120°). W.625-W.634 data-фаза слетала из-за неверной записи EHS
+   (били бит0 CCCR 0x13 вместо бит1) и незаведённых PG4/PG5 — после фиксов
+   (W.636/W.639) 50 МГц/4-bit/HS РАБОТАЕТ, data-probe проходит (W.641).
+   Флаг: 1 = 50 МГц/4-bit/HS, 2 = тест «4-bit на низкой частоте»,
+   0 = 1-bit/низкая сетка (старое поведение W.235-248). */
+#ifndef WIFI_SDIO_50MHZ
+#define WIFI_SDIO_50MHZ 1
+#endif
+/* W.606: ТОЛЬКО компактная строка входящих data-кадров (rx etype/plen/fc/
+   swdec) в DHCP-цикле — без tx-дампов и снимков очередей. По умолчанию
+   выкл.; для диагностики #define WIFI_RX_DIAG 1 */
+#ifndef WIFI_RX_DIAG
+#define WIFI_RX_DIAG 1
+#endif
+#if (WIFI_TX_DIAG || WIFI_RX_DIAG)
 #define TXDIAG(...)   uart_print(__VA_ARGS__)
 #define TXDIAG_HEX(n) uart_print_hex((uint32_t)(n))
 #define TXDIAG_INT(n) uart_print_int((int)(n))
@@ -235,6 +250,18 @@ int h3_sdio_read_chip_id(uint16_t *manf_id, uint16_t *card_id);
    Возвращает 0 при успехе; не-0 — ошибка. */
 int h3_sdio_set_bus_width(int four_bit);
 
+/* W.625: перевод SDIO-шины на 50 МГц / 4-bit / HS (эталон Lakka). 0 при
+   успехе; не-0 — ошибка. Заглушка при WIFI_SDIO_50MHZ=0. */
+int h3_sdc_set_clk_50mhz(void);
+
+/* W.655 [пинг]: сохранить IP/маску/шлюз как рабочий адрес (из OFFER или ACK). */
+void h3_wifi_set_ip(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4]);
+
+/* W.655 [пинг]: постоянный опрос RX после join — обрабатывает ICMP echo
+   request (отвечает) и ARP (отвечает на наш IP). Возвращает число
+   обработанных кадров. */
+int h3_wifi_rx_poll(void);
+
 /* Прочитать 32-бит регистр WLAN-функции (function 1) чипа через CMD52.
    reg — ММIO-адрес регистра чипа (напр. REG_SYS_CFG=0xF0). Реальный SDIO-адрес
    = (8<<13) | (reg & 0x7FFF) (WLAN IOREG, device id 8). Кладёт значение в *val.
@@ -385,6 +412,9 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
 /* Прочитать наш MAC (REG_MACID 0x610-0x615). Публичный для сетевого слоя. */
 void h3_wifi_get_mac(uint8_t m[6]);
 
+/* W.603: BSSID текущей цели (AP). 0 = есть, -1 = цель не захвачена. */
+int h3_wifi_get_bssid(uint8_t b[6]);
+
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080
 #define FW_8188F_START       0x1000
@@ -407,12 +437,6 @@ extern uint32_t sdc_diag_pseq_base;
 extern uint32_t sdc_diag_pseq_off;
 extern uint32_t sdc_diag_pseq_cmd;
 extern uint32_t sdc_diag_pseq_val;
-
-/* Диагностика IDMA-передач. */
-extern uint32_t sdc_diag_idst;
-extern uint32_t sdc_diag_dmac;
-extern uint32_t sdc_diag_idma_used;
-extern uint32_t sdc_diag_pio_used;
 
 /* Значение REG_MCUFWDL при падении FreeToGo (-33). */
 extern uint32_t sdc_diag_fw_mcufwdl;

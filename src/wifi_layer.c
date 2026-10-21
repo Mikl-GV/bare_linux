@@ -2,6 +2,7 @@
 #include "uart.h"
 #include "sys.h"
 #include "h3_sdc.h"
+#include "wifi_net.h"
 #include "version.h"
 
 /* Отдельный слой WiFi (SDIO RTL8189FTV). Вызывается из пункта меню
@@ -54,35 +55,23 @@ int wifi_layer_start(void)
     WLOG(" pl_dat=0x");WLOG_HEX(*(volatile uint32_t *)0x01F02C10);
     WLOG("\r\n");
 
-    /* Ручной probe CMD5 (диагностика контроллера). */
-    {
-        volatile uint32_t *SDC = (volatile uint32_t *)0x01C10000;
-        SDC[0x38/4] = 0xFFFFFFFF;               /* очистить RISR */
-        SDC[0x1C/4] = 0x00E00000;               /* ARG: 3.0-3.6V */
-        SDC[0x18/4] = (1u<<31) | 5u | (1u<<6);  /* START|CMD5|RESP_RCV */
-        for (int w = 0; w < 1000000; w++)
-            if (SDC[0x38/4] & (1u<<2)) break;   /* CMD_DONE */
-        WLOG("  cmdr=0x"); WLOG_HEX(SDC[0x18/4]);
-        WLOG(" risr=0x");  WLOG_HEX(SDC[0x38/4]);
-        WLOG(" resp0=0x"); WLOG_HEX(SDC[0x20/4]);
-        uart_print("\r\n");
-    }
-
     {
         int rc = h3_sdio_init_chip();
-        uart_print("  sdio_init rc=");
-        uart_print_int(rc);
-        uart_print("\r\n");
+        if (rc != 0) {
+            uart_print("  sdio_init FAIL rc=");
+            uart_print_int(rc);
+            uart_print("\r\n");
+        }
         if (rc == 0) {
             wifi_active = 1;
             uint8_t ccid0 = 0, ccid1 = 0;
             h3_sdc_cmd52_read(0, 0x00, &ccid0);   /* CCCR/SDIO revision */
             h3_sdc_cmd52_read(0, 0x01, &ccid1);   /* SDIO function info */
-            uart_print("  ccid0=0x");
-            uart_print_hex(ccid0);
-            uart_print(" ccid1=0x");
-            uart_print_hex(ccid1);
-            uart_print("\r\n");
+            WLOG("  ccid0=0x");
+            WLOG_HEX(ccid0);
+            WLOG(" ccid1=0x");
+            WLOG_HEX(ccid1);
+            WLOG("\r\n");
 
             /* ID чипа из CIS: manf (0x024C Realtek) + card PID (0xF179 8189F). */
             {
@@ -102,9 +91,9 @@ int wifi_layer_start(void)
             /* Power-on чипа: CARDEMU -> ACTIVE. */
             {
                 int pon = h3_wifi_power_on_chip();
-                uart_print("  pwon rc=");
-                uart_print_int(pon);
                 if (pon != 0) {
+                    uart_print("  pwon FAIL rc=");
+                    uart_print_int(pon);
                     uart_print(" step=");
                     uart_print_int((int)sdc_diag_pseq_step);
                     uart_print(" base=");
@@ -113,8 +102,8 @@ int wifi_layer_start(void)
                     uart_print_hex((uint32_t)sdc_diag_pseq_off);
                     uart_print(" val=0x");
                     uart_print_hex((uint32_t)sdc_diag_pseq_val);
+                    uart_print("\r\n");
                 }
-                uart_print("\r\n");
             }
 
             /* Этап 3: включить I/O-функцию 1 (CCCR 0x02, бит IOEx=0x02). */
@@ -123,9 +112,9 @@ int wifi_layer_start(void)
                 h3_sdc_cmd52_read(0, 0x02, &ioen);
                 h3_sdc_cmd52_write(0, 0x02, (uint8_t)(ioen | 0x02));
                 h3_sdc_cmd52_read(0, 0x02, &ioen);
-                uart_print("  fn1 ioen=0x");
-                uart_print_hex(ioen);
-                uart_print("\r\n");
+                WLOG("  fn1 ioen=0x");
+                WLOG_HEX(ioen);
+                WLOG("\r\n");
             }
 
             /* Этап 4: загрузка прошивки чипа (NIC firmware). */
@@ -171,6 +160,11 @@ int wifi_layer_start(void)
                             mac[4] = (uint8_t)(t >> 8);
                             mac[5] = (uint8_t)(t);
                         }
+                        /* W.659 [эксперимент]: efuse отдаёт локально администрируемый
+                           MAC (02:...). Android-хотспот (A05s) может отбрасывать такой
+                           при DHCP (защита от клонирования): OFFER шлёт, ACK на
+                           REQUEST — нет. Сбрасываем локальный бит (02 -> 00). */
+                        mac[0] = 0x00;
                     }
                     uart_print(" mac=");
                     for (int k = 0; k < 6; k++) {
@@ -233,11 +227,8 @@ int wifi_layer_start(void)
                    выбору пользователя через wifi_layer_connect(index). */
                 uart_print("join: boot scan (no autoconnect)\r\n");
                 {
-                    int jrc = 0;
                     h3_wifi_rf_rx_test();
-                    uart_print("join: rc=");
-                    uart_print_int(jrc);
-                    uart_print(" ap_list=");
+                    uart_print("join: ap_list=");
                     uart_print_int(h3_wifi_scan_ap_count());
                     uart_print("\r\n");
                 }
@@ -258,15 +249,35 @@ int wifi_layer_start(void)
    (h3_wifi_scan_capture_target -> h3_wifi_join_ap БЕЗ повторного скана).
    Возвращает: 0 = ассоциация подтверждена; -1 = плохой индекс; иначе
    код от h3_wifi_join_ap (например -4 — AuthResp не пришла). */
+/* W.612 [анти-спам join]: не давать серию connect подряд. Флаг занятости
+   (join_in_progress) + кулдаун 3 с между вызовами. Это убирает поток
+   rc=-6 → rc=-4 → rc=-4 (W.606, MTS), от которого точка «охуевает». */
+static int join_in_progress = 0;
+static uint32_t last_join_ms = 0;
+#define JOIN_COOLDOWN_MS 3000
+
 int wifi_layer_connect(int index)
 {
     struct h3_wifi_ap ap;
     int rc;
+    uint32_t now = micros() / 1000;
 
     if (!wifi_started)
         return -2;                       /* слой не инициализирован */
     if (index < 0 || h3_wifi_scan_ap_get(index, &ap) != 0)
         return -1;                       /* нет такой сети */
+
+    /* W.612: занят — не начинать повторный join (защита от вложенного
+       вызова / быстрых кликов). */
+    if (join_in_progress) { uart_print("connect: busy\r\n"); return -10; }
+    /* W.612: кулдаун — минимум 3 с между попытками, и при успехе, и при
+       неудаче (AP должна «отдышаться»). */
+    if (last_join_ms && (now - last_join_ms) < JOIN_COOLDOWN_MS) {
+        uart_print("connect: cooldown (");
+        uart_print_int((int)(now - last_join_ms));
+        uart_print("ms)\r\n"); return -11;
+    }
+    join_in_progress = 1;
 
     uart_print("join: sel=");
     uart_print_int(index);
@@ -291,21 +302,27 @@ int wifi_layer_connect(int index)
     /* W.412: для WPA2-сети (rsn_len>0) зафиксировать PSK passphrase по SSID.
        PMK = PBKDF2-HMAC-SHA1(pass, ssid, 4096, 32) предвычисляется сразу в
        h3_wifi_set_passphrase (кэш, вне hot-path — чтобы не платить 5.5с на
-       первый msg1). Сети известны заранее: A05s (тестовая, пароль 8645449Qq),
-       MTS_GPON_9290e0 (B236f8g4). */
+       первый msg1). Ровно две известные WPA2-сети: A05s (8645449Qq),
+       MTS_GPON_9290e0 (B236f8g4). Остальные — без пароля.
+       Открытая A05s (rsn_len==0) идёт в else-ветку ниже и тоже без пароля —
+       решение принимается по RSN IE из скана, а не по названию. */
     if (ap.rsn_len > 0) {
         if (ap.ssid_len >= 4 &&
             ap.ssid[0]=='A' && ap.ssid[1]=='0' && ap.ssid[2]=='5' && ap.ssid[3]=='s') {
             h3_wifi_set_passphrase("8645449Qq", 9);
             uart_print("  passphrase: A05s\r\n");
-        } else if (ap.ssid_len >= 8 &&
+        } else if (ap.ssid_len >= 13 &&
                    ap.ssid[0]=='M' && ap.ssid[1]=='T' && ap.ssid[2]=='S' &&
-                   ap.ssid[3]=='_') {
+                   ap.ssid[3]=='_' && ap.ssid[4]=='G' && ap.ssid[5]=='P' &&
+                   ap.ssid[6]=='O' && ap.ssid[7]=='N' && ap.ssid[8]=='_' &&
+                   ap.ssid[9]=='9' && ap.ssid[10]=='2' && ap.ssid[11]=='9' &&
+                   ap.ssid[12]=='0' && ap.ssid[13]=='e' && ap.ssid[14]=='0') {
             /* W.485: B236f8g4 известен ТОЛЬКО для MTS_GPON_9290e0.
                Для d23898/b4d378 пароль другой — 4-way даст MIC-fail (AP
-               начнёт новый handshake с новым ANonce), это НЕ баг TX. */
+               начнёт новый handshake с новым ANonce), это НЕ баг TX.
+               Так как автопаролей ровно две, MTS_* не угадываем. */
             h3_wifi_set_passphrase("B236f8g4", 8);
-            uart_print("  passphrase: MTS guess B236f8g4 (верен только для 9290e0)\r\n");
+            uart_print("  passphrase: MTS_GPON_9290e0\r\n");
         } else {
             /* Незнакомый SSID: не угадывать пароль (ложный handshake). */
             h3_wifi_set_passphrase("", 0);
@@ -332,6 +349,8 @@ int wifi_layer_connect(int index)
     }
 
     rc = h3_wifi_join_ap();
+    join_in_progress = 0;
+    last_join_ms = micros() / 1000;   /* кулдаун стартует всегда (и при успехе) */
     uart_print("join: rc=");
     uart_print_int(rc);
     uart_print("\r\n");
@@ -354,4 +373,31 @@ int wifi_layer_rescan(void)
     uart_print_int(h3_wifi_scan_ap_count());
     uart_print(" ap)\r\n");
     return 0;
+}
+
+/* W.655 [пинг]: постоянный опрос сетевого RX в главном цикле. Если адрес
+   ещё не подтверждён ACK — принимает адрес из OFFER (fallback, один раз),
+   чтобы L3 поднялся и стали работать ARP/ICMP. Затем h3_wifi_rx_poll()
+   обрабатывает входящие кадры (ping). */
+int wifi_layer_poll(void)
+{
+    static int offer_fallback_done = 0;
+    if (!wifi_started) return 0;
+    {
+        uint8_t ip[4], mk[4], gw[4];
+        int ack = 0;
+        if (net_dhcp_get_ip(ip, mk, gw, &ack)) {
+            if (ack) {
+                h3_wifi_set_ip(ip, mk, gw);          /* финальный ACK-адрес */
+                offer_fallback_done = 1;
+            } else if (!offer_fallback_done) {
+                h3_wifi_set_ip(ip, mk, gw);          /* OFFER fallback, один раз */
+                offer_fallback_done = 1;
+                uart_print("  poll: IP accepted from OFFER (no ACK)\r\n");
+            }
+        } else {
+            return 0;                                /* адреса ещё нет */
+        }
+    }
+    return h3_wifi_rx_poll();
 }

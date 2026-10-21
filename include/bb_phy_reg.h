@@ -174,13 +174,18 @@ static const uint32_t bb_phy_reg[] = {
     0xD70, 0x1812362E,
     0xD74, 0x322C2220,
     0xD78, 0x000E3C24,
-    0xE00, 0x2D2D2D2D,
-    0xE04, 0x2D2D2D2D,
-    0xE08, 0x0390272D,
-    0xE10, 0x2D2D2D2D,
-    0xE14, 0x2D2D2D2D,
-    0xE18, 0x2D2D2D2D,
-    0xE1C, 0x2D2D2D2D,
+/* TXAGC: эталонный BB-образ halhwimg8188f_bb.c (0xE00-0xE1C) — скопирован
+        из эталона 1-в-1. Эти значения после init перезаписываются драйвером
+        в PHY_SetTxPowerLevel8188F (runtime, по каналу): 0xE08 byte1 (1M) = 0x2D,
+        OFDM 0x31, HT 0x2F. Мы пока шлём только 1M — отдельный runtime-шаг
+        прописан в h3_wifi_rf_rx_test (W.605). */
+     0xE00, 0x2D2D2D2D,   /* Rate18_06 (исходник BB) */
+     0xE04, 0x2D2D2D2D,   /* Rate54_24 */
+     0xE08, 0x0390272D,   /* CCK1_Mcs32 (эталонный BB образ) */
+     0xE10, 0x2D2D2D2D,   /* MCS03_MCS00 */
+     0xE14, 0x2D2D2D2D,   /* MCS07_MCS04 */
+     0xE18, 0x2D2D2D2D,   /* MCS11_MCS08 */
+     0xE1C, 0x2D2D2D2D,   /* MCS15_MCS12 */
     0xE28, 0x00000000,
     0xE30, 0x1000DC1F,
     0xE34, 0x10008C1F,

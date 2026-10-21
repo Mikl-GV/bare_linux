@@ -9,6 +9,7 @@
 #include "gic.h"
 #include "h3_sdc.h"
 #include "wifi_layer.h"
+#include "wifi_net.h"
 #include "version.h"
 
 /* ================= Состояние ================= */
@@ -54,6 +55,19 @@ static int main_sel = MITEM_SOUND; /* выбранный пункт главно
 static int tone_sel = TONE_440;    /* выбранная частота в подменю */
 static int testing = 0;            /* идёт ли тест звука */
 static int transfer_sel = 0;       /* выбранная сеть в подменю Transfer */
+static int transfer_top = 0;       /* первая видимая строка списка (скролл) */
+
+/* Число -> десятичная строка (в проекте нет snprintf). */
+static void num2str(int v, char *out)
+{
+    char tmp[12];
+    int i = 0, j = 0;
+    if (v < 0) { out[j++] = '-'; v = -v; }
+    if (v == 0) tmp[i++] = '0';
+    while (v > 0 && i < (int)sizeof(tmp)) { tmp[i++] = (char)('0' + v % 10); v /= 10; }
+    while (i > 0) out[j++] = tmp[--i];
+    out[j] = 0;
+}
 
 static uint32_t prev_buttons = 0;
 
@@ -161,21 +175,69 @@ static void draw_ui(void)
             fb_text(60, 148, "WiFi layer: running", 0x0000FF00, 0x000D1A33);
         else
             fb_text(60, 148, "WiFi layer: idle", 0x00888888, 0x000D1A33);
-        /* Список найденных сетей (из скана). */
+        /* Список найденных сетей (из скана) — окно с прокруткой. */
         fb_text(60, 180, "Networks:", 0x00A0C0D0, 0x000D1A33);
         int n = h3_wifi_scan_ap_count();
         if (n == 0) {
             fb_text(60, 204, "(scan not run yet — press A)", 0x00888888, 0x000D1A33);
         } else {
-            if (n > 8) n = 8;   /* помещается на экран */
+            const int VIS = 8;   /* строк помещается на экран */
+            if (transfer_sel < 0) transfer_sel = 0;
             if (transfer_sel >= n) transfer_sel = n - 1;
-            for (int i = 0; i < n; i++) {
+            /* Держать выбранную строку внутри окна. */
+            if (transfer_sel < transfer_top) transfer_top = transfer_sel;
+            if (transfer_sel >= transfer_top + VIS) transfer_top = transfer_sel - VIS + 1;
+            if (transfer_top < 0) transfer_top = 0;
+            int max_top = (n > VIS) ? (n - VIS) : 0;
+            if (transfer_top > max_top) transfer_top = max_top;
+
+            for (int i = 0; i < VIS && (transfer_top + i) < n; i++) {
+                int idx = transfer_top + i;
                 struct h3_wifi_ap ap;
-                if (h3_wifi_scan_ap_get(i, &ap) != 0) break;
-                uint32_t col = (i == transfer_sel) ? 0x0000FF00 : 0x00FFFFFF;
+                if (h3_wifi_scan_ap_get(idx, &ap) != 0) break;
+                uint32_t col = (idx == transfer_sel) ? 0x0000FF00 : 0x00FFFFFF;
                 /* Маркер выбора. */
-                fb_text(32, 204 + i * 22, (i == transfer_sel) ? ">" : " ", col, 0x000D1A33);
+                fb_text(32, 204 + i * 22, (idx == transfer_sel) ? ">" : " ", col, 0x000D1A33);
                 fb_text(48, 204 + i * 22, ap.ssid, col, 0x000D1A33);
+            }
+            /* Индикаторы скрытых строк сверху/снизу. */
+            if (transfer_top > 0)
+                fb_text(FB_W - 40, 204, "^", 0x00FFD700, 0x000D1A33);
+            if ((transfer_top + VIS) < n)
+                fb_text(FB_W - 40, 204 + (VIS - 1) * 22, "v", 0x00FFD700, 0x000D1A33);
+            /* Счётчик «выбран/всего». */
+            {
+                char num[8];
+                char cnt[20];
+                int j = 0;
+                num2str(transfer_sel + 1, num);
+                for (int k = 0; num[k]; k++) cnt[j++] = num[k];
+                cnt[j++] = '/';
+                num2str(n, num);
+                for (int k = 0; num[k]; k++) cnt[j++] = num[k];
+                cnt[j] = 0;
+                fb_text(60 + 9 * 8 + 12, 180, cnt, 0x00A0C0D0, 0x000D1A33);
+            }
+        }
+/* W.650: полученный адрес (OFFER или ACK) — вывести на экран. */
+        {
+            uint8_t ip[4], mk[4], gw[4];
+            int have_ack = 0;
+            if (net_dhcp_get_ip(ip, mk, gw, &have_ack)) {
+                char lab[24];
+                int j = 0;
+                lab[j++] = 'I'; lab[j++] = 'P'; lab[j++] = ':'; lab[j++] = ' ';
+                for (int s = 0; s < 4; s++) {
+                    char num[8];
+                    num2str(ip[s], num);
+                    for (int k = 0; num[k]; k++) lab[j++] = num[k];
+                    if (s < 3) lab[j++] = '.';
+                }
+                lab[j] = 0;
+                fb_text(60, 378, lab, 0x0000FF00, 0x000D1A33);
+                fb_text(60, 398,
+                        have_ack ? "DHCP ACK - online" : "DHCP OFFER - awaiting ACK",
+                        0x00A0C0D0, 0x000D1A33);
             }
         }
         if (wifi_layer_started() && n > 0)
@@ -248,14 +310,12 @@ static void handle_buttons(uint32_t btns)
         int n = h3_wifi_scan_ap_count();
         if (pressed & BTN_UP) {
             if (wifi_layer_started() && n > 0) {
-                if (transfer_sel <= 0) transfer_sel = n > 8 ? 7 : n - 1;
-                else transfer_sel--;
+                transfer_sel = (transfer_sel + n - 1) % n;
             }
             draw_ui();
         } else if (pressed & BTN_DOWN) {
             if (wifi_layer_started() && n > 0) {
-                int max = n > 8 ? 8 : n;
-                transfer_sel = (transfer_sel + 1) % max;
+                transfer_sel = (transfer_sel + 1) % n;
             }
             draw_ui();
         } else if (pressed & BTN_A) {
@@ -335,6 +395,8 @@ void kmain(void)
     draw_ui();
     for (;;) {
         led_heartbeat();         /* мигать PL10 — индикатор «я жив» */
+        /* W.655: постоянный сетевой poll (пинг/ARP), если WiFi работает. */
+        wifi_layer_poll();
         uint32_t btns = pcf8574_read();
         if (btns != prev_buttons) {
             handle_buttons(btns);

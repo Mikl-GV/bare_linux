@@ -1,6 +1,7 @@
 #include "wifi_net.h"
 #include "h3_sdc.h"
 #include "uart.h"
+#include "sys.h"
 
 static uint32_t dhcp_xid = 0x12345678;
 static const uint8_t bcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -9,6 +10,28 @@ static const uint8_t bcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static uint8_t dhcp_offer_ip[4];
 static uint8_t dhcp_server_id[4];
 static uint8_t dhcp_offer_seen;
+
+/* W.650: последний известный адрес (из OFFER/ACK) — для отображения на экране. */
+static uint8_t net_ip[4];
+static uint8_t net_mask[4];
+static uint8_t net_gw[4];
+static uint8_t net_have;      /* 1 = адрес виден (есть OFFER) */
+static uint8_t net_have_ack;  /* 1 = адрес подтверждён DHCP ACK */
+
+/* W.650: вернуть текущий адрес для UI. ip/mask/gw заполняются, если адрес
+   известен (OFFER получен); *have_ack=1 только после DHCP ACK.
+   Возвращает 1 при известном адресе. */
+int net_dhcp_get_ip(uint8_t ip[4], uint8_t mask[4], uint8_t gw[4], int *have_ack)
+{
+    if (!net_have) return 0;
+    for (int i = 0; i < 4; i++) {
+        ip[i] = net_ip[i];
+        mask[i] = net_mask[i];
+        gw[i] = net_gw[i];
+    }
+    if (have_ack) *have_ack = net_have_ack;
+    return 1;
+}
 
 static uint16_t csum(const uint8_t *p, uint16_t len)
 {
@@ -21,8 +44,11 @@ static uint16_t csum(const uint8_t *p, uint16_t len)
 }
 
 /* Собрать и отправить DHCP-пакет: msg_type 1=DISCOVER, 3=REQUEST.
-   Для REQUEST передаются requested IP (опция 50) и server id (опция 54). */
-static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv_id)
+   Для REQUEST передаются requested IP (опция 50) и server id (опция 54).
+   Для unicast REQUEST: dst_mac = BSSID AP, dst_ip = server (10.72.75.230),
+   flags=0 (ответ unicast). Для DISCOVER: broadcast на 255.255.255.255. */
+static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv_id,
+                     const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t bcast_flag)
 {
     uint8_t pkt[400];
     uint32_t p = 0;
@@ -38,7 +64,10 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv
     pkt[p++] = 0x11;                    /* UDP */
     pkt[p++] = 0x00; pkt[p++] = 0x00;   /* csum — ниже */
     pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0; pkt[p++] = 0;          /* src 0.0.0.0 */
-    pkt[p++] = 0xFF; pkt[p++] = 0xFF; pkt[p++] = 0xFF; pkt[p++] = 0xFF; /* dst 255.255.255.255 */
+    pkt[p++] = dst_ip ? dst_ip[0] : 255;    /* dst IP: broadcast или server id */
+    pkt[p++] = dst_ip ? dst_ip[1] : 255;
+    pkt[p++] = dst_ip ? dst_ip[2] : 255;
+    pkt[p++] = dst_ip ? dst_ip[3] : 255;
 
     /* UDP (8): 68 -> 67 */
     pkt[p++] = 0x00; pkt[p++] = 0x44;
@@ -53,8 +82,18 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv
     pkt[p++] = (uint8_t)(dhcp_xid >> 24); pkt[p++] = (uint8_t)(dhcp_xid >> 16);
     pkt[p++] = (uint8_t)(dhcp_xid >> 8);  pkt[p++] = (uint8_t)dhcp_xid;
     pkt[p++] = 0x00; pkt[p++] = 0x00;   /* secs */
-    pkt[p++] = 0x80; pkt[p++] = 0x00;   /* flags: broadcast reply */
+    pkt[p++] = (uint8_t)(bcast_flag >> 8); pkt[p++] = (uint8_t)(bcast_flag & 0xFF); /* flags */
     for (i = 0; i < 16; i++) pkt[p++] = 0;          /* ciaddr/yiaddr/siaddr/giaddr */
+    /* W.663: для REQUEST ставим ciaddr (BOOTP [40..43]) = предлагаемый IP и
+       src IP (IP-заголовок [12..15]) = тот же адрес — стиль dhclient RENEW.
+       Многие dnsmasq отвечают ACK именно на REQUEST с ciaddr, а на форму
+       с ciaddr=0 (SELECTING) могут молчать. */
+    if (msg_type == 3 && req_ip) {
+        pkt[12] = req_ip[0]; pkt[13] = req_ip[1];
+        pkt[14] = req_ip[2]; pkt[15] = req_ip[3];
+        pkt[40] = req_ip[0]; pkt[41] = req_ip[1];
+        pkt[42] = req_ip[2]; pkt[43] = req_ip[3];
+    }
     h3_wifi_get_mac(m);
     for (i = 0; i < 6; i++) pkt[p++] = m[i];        /* chaddr */
     for (i = 0; i < 10; i++) pkt[p++] = 0;
@@ -62,6 +101,11 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv
 
     pkt[p++] = 0x63; pkt[p++] = 0x82; pkt[p++] = 0x53; pkt[p++] = 0x63;  /* cookie */
     pkt[p++] = 53; pkt[p++] = 1; pkt[p++] = msg_type;
+    /* W.656: опция 61 (client-id) — dnsmasq (Android-хотспот) держит лизинг
+       по client-id; без него OFFER шлёт, а REQUEST молча игнорирует.
+       Формат: тип 1 (ethernet) + 6 байт MAC. */
+    pkt[p++] = 61; pkt[p++] = 7; pkt[p++] = 0x01;
+    for (i = 0; i < 6; i++) pkt[p++] = m[i];
     if (msg_type == 3 && req_ip && srv_id) {
         pkt[p++] = 50; pkt[p++] = 4;
         for (i = 0; i < 4; i++) pkt[p++] = req_ip[i];
@@ -97,8 +141,34 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip, const uint8_t *srv
     TXDIAG_HEX((uint32_t)((pkt[38] << 8) | pkt[39]));
     TXDIAG("\r\n");
 #endif
+    /* W.656: для REQUEST всегда печатаем критичное — длину и присутствие
+       опций client-id(61) / requested-ip(50) / server-id(54). */
+    if (msg_type == 3) {
+        int has_61 = 0, has_50 = 0, has_54 = 0;
+        /* DHCP-опции: IP(20) + UDP(8) + BOOTP фикс.(236) + cookie(4) = 268. */
+        uint32_t obase = 20 + 8 + 236 + 4;
+        for (uint32_t oi = obase; oi + 2 < (uint32_t)p; ) {
+            uint8_t c = pkt[oi];
+            if (c == 255) break;          /* end */
+            if (c == 0) { oi++; continue; }   /* pad */
+            uint8_t ol = pkt[oi + 1];
+            if (c == 61) has_61 = 1;
+            if (c == 50) has_50 = 1;
+            if (c == 54) has_54 = 1;
+            oi += 2 + ol;
+        }
+        uart_print("  net: REQUEST len=");
+        uart_print_int((int)p);
+        uart_print(" opt61=");
+        uart_print_int(has_61);
+        uart_print(" opt50=");
+        uart_print_int(has_50);
+        uart_print(" opt54=");
+        uart_print_int(has_54);
+        uart_print("\r\n");
+    }
 
-    return h3_wifi_tx_data(0x0800, bcast_mac, pkt, (uint16_t)p);
+    return h3_wifi_tx_data(0x0800, dst_mac, pkt, (uint16_t)p);
 }
 
 int net_dhcp_discover(struct net_state *st)
@@ -108,7 +178,7 @@ int net_dhcp_discover(struct net_state *st)
        пришедший затем ACK отбрасывался (`if (!dhcp_offer_seen) return`).
        Теперь флаг хранит факт «OFFER получен» до ACK/NAK. */
     (void)st;
-    return dhcp_send(1, 0, 0);
+    return dhcp_send(1, 0, 0, bcast_mac, 0, 0x8000);
 }
 
 /* W.592: 1 = OFFER получен (в стадии SELECTING), ACK ещё не пришёл.
@@ -119,6 +189,14 @@ int net_dhcp_offer_pending(void)
     return dhcp_offer_seen ? 1 : 0;
 }
 
+/* W.648: MAC точки доступа (BSSID) — для unicast REQUEST в SELECTING.
+   Устанавливается из h3_wifi_join_ap перед DHCP-циклом. */
+static uint8_t dhcp_srv_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+void net_dhcp_set_bssid(const uint8_t *bssid)
+{
+    for (int i = 0; i < 6; i++) dhcp_srv_mac[i] = bssid[i];
+}
+
 /* W.594 [корень]: сброс состояния DHCP на старте нового join. Раньше
    dhcp_offer_seen (static) не сбрасывался между join — после успешного
    OFFER во 2-й сессии флаг оставался =1, и третий join не отправлял
@@ -127,13 +205,23 @@ int net_dhcp_offer_pending(void)
 void net_dhcp_reset(void)
 {
     dhcp_offer_seen = 0;
+    net_have = 0;
+    net_have_ack = 0;
+    /* W.646: НОВЫЙ xid на каждый DHCP-цикл. Раньше xid был жёстко
+       0x12345678 во всех сессиях — Android-хотспот (dnsmasq) мог считать
+       транзакцию повтором уже обработанной и не отвечать ACK. */
+    dhcp_xid = ((uint32_t)micros() | 1u);
+    WLOG("  net: dhcp xid=0x");
+    WLOG_HEX(dhcp_xid);
+    WLOG("\r\n");
 }
 
-/* W.594: повторная отправка DHCP REQUEST (после OFFER, если ACK задержался).
-   Стандартное поведение DHCP-клиента: ретраить REQUEST. */
+/* W.663: DHCP REQUEST — broadcast L2, dst IP = сервер, flags=0x8000,
+   ciaddr = предлагаемый IP (см. dhcp_send). dhclient-стиль RENEW. */
 int net_dhcp_request(void)
 {
-    return dhcp_send(3, dhcp_offer_ip, dhcp_server_id);
+    return dhcp_send(3, dhcp_offer_ip, dhcp_server_id,
+                     bcast_mac, dhcp_server_id, 0x8000);
 }
 
 /* ICMP echo request -> echo reply. */
@@ -210,8 +298,10 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
     if ((uint16_t)(dh + 240) > len) return;
     if (pkt[dh] != 0x02) return;      /* op = BOOTREPLY */
 
-    /* W.594: краткая диагностика входящего DHCP-сообщения (порты, op,
-       msg_type из опции 53). Покажет, приходит ли ACK и как парсится. */
+    /* W.594→W.669: краткая диагностика входящего DHCP-сообщения (порты, op,
+       msg_type из опции 53). Печатаем БЕЗУСЛОВНО (не WLOG): без неё не видно,
+       приходит ли ACK/NAK после REQUEST — это и есть текущая неясность
+       (OFFER есть, ACK нет). Строка короткая и не в hot-path задержек. */
     {
         int di_u0 = (pkt[udp_off+0]<<8)|pkt[udp_off+1];
         int di_u1 = (pkt[udp_off+2]<<8)|pkt[udp_off+3];
@@ -266,13 +356,33 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
             return;
         for (k = 0; k < 4; k++) dhcp_offer_ip[k] = pkt[dh+16+k];
         for (k = 0; k < 4; k++) dhcp_server_id[k] = srv[k];
-        dhcp_offer_seen = 1;
+        /* W.650: показать адрес на экране сразу (по OFFER), ACK обновит флаг. */
+        for (k = 0; k < 4; k++) {
+            net_ip[k] = dhcp_offer_ip[k];
+            net_mask[k] = mask[k];
+            net_gw[k] = gw[k];
+        }
+        net_have = 1;
+        net_have_ack = 0;
         uart_print("  net: DHCP OFFER ip=");
         for (k = 0; k < 4; k++) { uart_print_int((int)dhcp_offer_ip[k]); if (k<3) uart_print("."); }
-        uart_print(" srv=");
+        uart_print("\r\n");
+        uart_print("  net:   server=");
         for (k = 0; k < 4; k++) { uart_print_int((int)dhcp_server_id[k]); if (k<3) uart_print("."); }
         uart_print("\r\n");
-        net_dhcp_request();
+        /* W.621: REQUEST — ТОЛЬКО на ПЕРВЫЙ OFFER (по эталону dhclient:
+           клиент в SELECTING отвечает REQUEST один раз и игнорирует
+           повторные OFFER; каждый повторный OFFER от сервера не должен
+           плодить новый REQUEST — это флуд с одним xid, от которого
+           сервер может игнорировать все REQUEST). */
+        if (!dhcp_offer_seen) {
+            dhcp_offer_seen = 1;
+            uart_print("  net: REQUEST sent\r\n");
+            int rrc = net_dhcp_request();
+            WLOG("  net: REQUEST rc=");
+            WLOG_INT(rrc);
+            WLOG("\r\n");
+        }
         return;
     }
 
@@ -287,21 +397,16 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
         st->have = 1;
         for (k = 0; k < 4; k++) st->ip[k] = dhcp_offer_ip[k];
         for (k = 0; k < 4; k++) { st->mask[k] = mask[k]; st->gw[k] = gw[k]; st->net[k] = 0; }
-        uart_print("  net: DHCP ACK ip=");
-        uart_print_int((int)st->ip[0]); uart_print(".");
-        uart_print_int((int)st->ip[1]); uart_print(".");
-        uart_print_int((int)st->ip[2]); uart_print(".");
-        uart_print_int((int)st->ip[3]);
-        uart_print(" mask=");
-        uart_print_int((int)st->mask[0]); uart_print(".");
-        uart_print_int((int)st->mask[1]); uart_print(".");
-        uart_print_int((int)st->mask[2]); uart_print(".");
-        uart_print_int((int)st->mask[3]);
-        uart_print(" gw=");
-        uart_print_int((int)st->gw[0]); uart_print(".");
-        uart_print_int((int)st->gw[1]); uart_print(".");
-        uart_print_int((int)st->gw[2]); uart_print(".");
-        uart_print_int((int)st->gw[3]);
+        net_have_ack = 1;   /* W.650: адрес подтверждён — на экране пометка ACK */
+        uart_print("  net: DHCP ACK\r\n");
+        uart_print("  net:   ip=");
+        for (k = 0; k < 4; k++) { uart_print_int((int)st->ip[k]); if (k<3) uart_print("."); }
+        uart_print("\r\n");
+        uart_print("  net:   mask=");
+        for (k = 0; k < 4; k++) { uart_print_int((int)st->mask[k]); if (k<3) uart_print("."); }
+        uart_print("\r\n");
+        uart_print("  net:   gw=");
+        for (k = 0; k < 4; k++) { uart_print_int((int)st->gw[k]); if (k<3) uart_print("."); }
         uart_print("\r\n");
     }
 }
