@@ -15,7 +15,8 @@ OBJDIR     := build
 
 SRC_C := main.c uart.c ports.c sys.c h3_mmu.c h3_dma.c i2s.c gic.c \
          h3_i2c_bb.c pcf8574.c display.c h3_de2.c h3_lcd.c h3_hdmi.c \
-         dw_hdmi.c h3_display.c wifi_layer.c secure.c font8x8.c h3_sdc.c wpa_crypto.c wifi_net.c
+         dw_hdmi.c h3_display.c wifi_layer.c secure.c font8x8.c h3_sdc.c wpa_crypto.c wifi_net.c \
+         h3_sdc0.c h3_smp.c fat.c retro_menu.c
 SRCS  := $(addprefix $(SRCDIR)/,$(SRC_C))
 ASM   := boot.s fw_blob.S
 OBJS  := $(OBJDIR)/boot.o $(OBJDIR)/fw_blob.o $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))

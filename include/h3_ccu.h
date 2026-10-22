@@ -42,6 +42,11 @@
 #define H3_CCU_GATE_MMC1     (1u << 9)
 #define H3_CCU_RST_MMC1      (1u << 9)
 
+/* SDC0 (слот SD-карты) — тактирование/сброс в CCU.
+   GATING0 bit8 = MMC0 gate, RST0 bit8 = SD/MMC0 reset. */
+#define H3_CCU_GATE_MMC0     (1u << 8)
+#define H3_CCU_RST_MMC0      (1u << 8)
+
 /* SDMMC1_CLK_REG (0x8C): bit31=SCLK_GATING, bit30=MMC1_MODE_SELECT(new),
    bits[25:24]=CLK_SRC_SEL (00=OSC24M, 01=PLL_PERIPH0), bits[22:20]=SAMPLE_PHASE,
    bits[17:16]=CLK_DIV_N, bits[10:8]=OUTPUT_PHASE, bits[3:0]=CLK_DIV_M. */
@@ -52,6 +57,17 @@
 #define H3_SDMMC1_CLK_SRC_PLLPERI0 (1u << 24)
 #define H3_SDMMC1_CLK_DIV_N(v)     ((v) << 16)
 #define H3_SDMMC1_CLK_DIV_M(v)     ((v) << 0)
+
+/* SDMMC0_CLK_REG (0x88) — слот SD-карты. Формат битов тот же, что у
+   SDMMC1_CLK (SCLK_GATE=31, MODE_SELECT=30, CLK_SRC_SEL[25:24],
+   DIV_N[17:16], DIV_M[3:0]). */
+#define H3_CCU_SDMMC0_CLK    (*(volatile uint32_t *)(H3_CCU_BASE + 0x088))
+#define H3_SDMMC0_SCLK_GATE  (1u << 31)
+#define H3_SDMMC0_MODE_NEW   (1u << 30)
+#define H3_SDMMC0_CLK_SRC_OSC24M   (0u << 24)
+#define H3_SDMMC0_CLK_SRC_PLLPERI0 (1u << 24)
+#define H3_SDMMC0_CLK_DIV_N(v)     ((v) << 16)
+#define H3_SDMMC0_CLK_DIV_M(v)     ((v) << 0)
 
 /* Port L always-on: APB0 gating (в R_PRCM). */
 #define H3_APB0_CLK_GATING   (*(volatile uint32_t *)(H3_R_PRCM_BASE + 0x28))

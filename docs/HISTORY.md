@@ -105,3 +105,32 @@
   штатный ARP/ICMP (ответ на request/echo) остаётся. Комментарии RCR/MSR
   приведены к финалу. README/NEXT/HISTORY/HARDWARE
   синхронизированы (статус: пинг работает).
+
+## Этап 8 — Репро-меню, SD (SDC0) + FAT32, SMP, W.779-W.78x
+
+- **SMP (все 4 ядра Cortex-A7)**: новый `h3_smp.c`/`h3_smp.h` — трамплин в
+  SRAM A1 (0x00000000), release через R_CPUCFG (0x01F01C00, RST_CTRL 0→3),
+  PSCI-фолбэк (smc, FDI 0x84000003) в non-secure; ядра CPU1..CPU3 уходят в
+  idle-цикл `wfi` (задел под эмуляторы). `h3_smp_boot()` вызывается первым
+  в kmain.
+- **Драйвер SDC0 (слот SD-карты)**: `h3_sdc0.c`/`h3_sdc0.h` — полный подъём
+  с нуля: CCU gate MMC0 (GATING0 bit8, без CCU reset — «убиваем зомби»
+  после U-Boot локально, GCTL_RESET+HWRST), SDMMC0_CLK (OSC24M, init-такт),
+  пины PC0..PC5 (function 2), CMD0/CMD8/CMD55+ACMD41(HCS)/CMD2/CMD3/CMD7/
+  ACMD6(4-bit)/CMD16/CMD58(SDSC/SDHC). Чтение/запись сектора PIO (1 блок).
+- **FAT32 (чтение)**: `fat.c`/`fat.h` — поиск целевого раздела из MBR
+  (типы 0x0B/0x0C/0x06, приоритет раздела с папкой `/roms`; системный
+  раздел с boot.scr пропускается), BPB, каталоги 8.3+LFN, цепочки
+  кластеров, `fat_read_file`. Запись — отдельным этапом (системный раздел
+  сейчас только чтение).
+- **Ретро-меню** (`retro_menu.c`/`retro_menu.h`): главный экран — список
+  систем по группам (Portable/Consoles/Arcade/Computers, из
+  `resources/emulation_h3_v2.xlsx` в `systems.h`, статусы `Потянет H3`);
+  выбор системы → браузер ромов из `/roms/<система>` на SD (8.3+LFN);
+  builtin-системы — диалог «Встроенный ром / Загрузить с SD»; запуск
+  эмулятора — заглушка (диспетчер по id в будущем). Служебные пункты
+  Settings/Help/About; в Settings — экраны **Transfer** (WiFi-скан/connect,
+  перенос из старого main.c) и **Sound test** (440/697/1209 Гц).
+- Старое текстовое меню main.c (Sound/Transfer/Settings) удалено —
+  ретро-меню стало основным экраном (kmain вызывает `retro_menu_run()`,
+  которое само крутит `wifi_layer_poll()`).

@@ -224,6 +224,38 @@ L1[0x400..0x402]=0xFFFFFFFF); mmu_mark_uncached() поддерживает об�
 (`0x2B[4:2]=0x1C`). Состояние: `h3_wifi_power_state()` — A0[1:0], 1=ACTIVE.
 Order: `CMD5/3/7 → pwon → fn1(CCCR 0x02) → fwdl`. [СТЕНД]
 
+### SDC0 — слот SD-карты (W.78x) [СТЕНД]
+
+Отдельный контроллер (0x01C0F000, регистры те же, что SDC1 — см. h3_sdc.h).
+Реализация — `h3_sdc0.c` (полный подъём с нуля, без наследования U-Boot):
+
+- **CCU**: gate MMC0 = GATING0 bit8; **модульный reset (RST0 bit8) НЕ трогаем**
+  после U-Boot (глобальный сброс модуля!) — «убиваем зомби» локально:
+  `SDC_GCTL=RESET` + `SDC_HWRST` (0→1 мс→1).
+- **Такт**: `SDMMC0_CLK` (0x88) = OSC24M, N=2, M=16 → init ~750/375 кГц
+  (как SDC1). Формат битов тот же, что SDMMC1_CLK (0x8C).
+- **Пины**: PC0..PC5 = function 2 (SDC0 CLK/CMD/D0-D3); PORTC cfg0:
+  `&=~0x00FFFFFF; |=0x00222222`. PC6/PC7 не трогаем.
+- **Инициализация карты**: CMD0 (SEND_INIT, 80 тактов) → CMD8 (0x1AA,
+  SDSC может не ответить — не фатально) → CMD55/ACMD41 (HCS=1, поллинг
+  busy до 1 с) → CMD2 (CID) → CMD3 (RCA) → CMD7 (select) → CMD9 (CSD,
+  размер) → CMD55/ACMD6 (4-bit, SDC_CTYPE=1) → CMD16 (blocklen 512) →
+  CMD58 (READ_OCR: CCS bit30 → SDSC/SDHC-адресация).
+- **Чтение**: CMD17, ждём CMD_DONE, выгребаем FIFO по `STATUS_FIFO_LEVEL`
+  (0x3C bit17..), затем DATA_DONE. Только 1 блок (512 Б) за команду
+  (многоблок — то же ограничение, что SDC1). Запись — CMD24 (заделка).
+
+### Таблица разделов / FAT32 (W.78x)
+
+- Карта: **MBR**; системный раздел (0, boot.scr на FAT) + целевой (1):
+  `roms/`, `cheats/` (вся таблица 0x0B/0x0C/0x06 сканируется из MBR).
+- FAT32-ридер (`fat.c`): ищет раздел, в корне которого есть папка `/roms`
+  (системный пропускается); BPB: sec/clu (13), reserved (14), fats (16),
+  fat_size (36), root_clu (44); data_start = part + reserved + fats*fat_size.
+- Чтение: кластер→сектор `data_start + (cl-2)*spc`; FAT-цепочка по
+  `part + reserved + cl*4`; каталоги 8.3 + LFN (фрагменты в обратном
+  порядке на диске). Только чтение (запись — отдельный этап).
+
 ### Загрузка прошивки (MCUFWDL)
 
 - `fw_nic.bin` (18802 б) встроена в бинарь через `src/fw_blob.S` (.incbin).

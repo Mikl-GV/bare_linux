@@ -71,15 +71,21 @@ BIN=h3_bare.bin
 | ГИК | `src/gic.c` | GIC distributor + CPU iface |
 | Защита | `src/secure.c` | SMTA + DMA_SEC_REG (non-secure) |
 | WiFi/SDIO | `src/h3_sdc.c` | SDC1, CMD52/53, RTL8189FTV: pwon/fwdl/RF/RX/TX/join/DHCP |
-| WiFi слой | `src/wifi_layer.c` | запуск/connect/rescan/poll из меню Transfer |
+| WiFi слой | `src/wifi_layer.c` | запуск/connect/rescan/poll из меню (Settings→Transfer) |
 | Сеть | `src/wifi_net.c` | DHCP/ARP/ICMP (L3-L4) |
 | Крипто | `src/wpa_crypto.c` | SHA-1/HMAC/PBKDF2/PRF/AES-KW unwrap |
 | Прошивка чипа | `src/fw_blob.S` | `.incbin "fw_nic.bin"` |
+| SD-карта | `src/h3_sdc0.c` | SDC0 (0x01C0F000): подъём с нуля, CMD0..CMD58, чтение сектора PIO |
+| FAT32 | `src/fat.c` | MBR→раздел с /roms, BPB, каталоги 8.3+LFN, чтение файлов |
+| SMP | `src/h3_smp.c` | подъём CPU1..3 (трамплин SRAM A1, R_CPUCFG/PSCI) |
+| Ретро-меню | `src/retro_menu.c` | список систем → браузер ромов /roms/<система> → запуск (заглушка); Settings/Help/About, Transfer, Sound |
+| Реестр систем | `include/systems.h` | таблица систем (id/имя/папка/группа/статус/builtin) из emulation_h3_v2.xlsx |
 
 ### Точка входа и порядок `kmain()`
 
 ```c
 secure_unlock();      // SMTA/DMA non-secure
+h3_smp_boot(0);       // поднять CPU1..3 (трамплин SRAM A1, R_CPUCFG/PSCI)
 gic_init();           // GIC dist+cpu, группы 0/1
 sys_timer_init();     // HSTMR
 gpio_init();          // APB0 gate порта L
@@ -88,8 +94,8 @@ set_led(1);           // PL10
 display_init();       // DE2/TCON1/HDMI 1024x600 (свой FB .fb_hdmi)
 i2cbb_init(PORTG,9, PORTG,8); pcf8574_init();   // кнопки
 i2s_init();           // I2S0 → MAX98357A
-// WiFi — по требованию из меню Transfer (wifi_layer_start), не при старте
-for (;;) { led_heartbeat(); wifi_layer_poll(); pcf8574_read() -> handle_buttons(); udelay(10000); }
+retro_menu_run();     // главное ретро-меню (внутри wifi_layer_poll + кнопки)
+// WiFi — по требованию из Settings→Transfer (wifi_layer_start), не при старте
 ```
 
 ### Память/линкер
