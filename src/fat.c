@@ -204,6 +204,9 @@ static int parse_dir_entry(const uint8_t *e, fat_entry_t *out, char *lfn, int *l
 
 static int read_dir(uint32_t cl, fat_entry_t *out, int max)
 {
+    /* FAT не инициализирована (нет карты / сбой fat_init) — не делим на 0
+       и не читаем неинициализированные g_*: просто пусто. */
+    if (g_sec_per_cluster == 0 || g_data_start == 0) return 0;
     int count = 0;
     char lfn[FAT_NAME_LEN] = {0};
     int lfn_len = 0;
@@ -508,6 +511,7 @@ int fat_init(void)
 
 int fat_list(const char *dir, fat_entry_t *out, int max)
 {
+    if (g_sec_per_cluster == 0) return -1;   /* FAT не инициализирована */
     fat_entry_t d;
     if (path_lookup(dir, &d) != 0) return -1;
     return read_dir(d.first_cluster, out, max);
@@ -515,6 +519,7 @@ int fat_list(const char *dir, fat_entry_t *out, int max)
 
 int fat_find(const char *dir, const char *name, fat_entry_t *out)
 {
+    if (g_sec_per_cluster == 0) return 0;   /* FAT не инициализирована */
     fat_entry_t d;
     if (path_lookup(dir, &d) != 0) return 0;
     fat_entry_t *dirs = g_scratch_dir;

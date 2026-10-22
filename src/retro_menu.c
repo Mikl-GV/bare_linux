@@ -339,9 +339,16 @@ static void render_settings_help(void)
         }
         fb_text(60, 210, "A=open  B=back", 0x00A0C0D0, 0x000D1A33);
     } else if (g_screen == RU_HELP) {
-        fb_text(60, 140, "A=select  B=back  START=exit", 0x00FFFFFF, 0x000D1A33);
-        fb_text(60, 170, "Choose system, then a ROM from SD", 0x00FFFFFF, 0x000D1A33);
-        fb_text(60, 200, "Built-in systems run without SD", 0x00FFFFFF, 0x000D1A33);
+        fb_text(60, 140, "SD structure (static, no card read):", 0x00FFFFFF, 0x000D1A33);
+        fb_text(60, 170, "/  (roms partition, SD)", 0x00A0C0D0, 0x000D1A33);
+        fb_text(80, 190, "ROMS/", 0x00FFFFFF, 0x000D1A33);
+        fb_text(100, 210, "sms/  snes/  pce/  ngp/  zxspectrum/", 0x00FFFFFF, 0x000D1A33);
+        fb_text(100, 230, "gameboy/  gba/  gamegear/  lynx/  wonderswan/", 0x00FFFFFF, 0x000D1A33);
+        fb_text(100, 250, "a2600/  a5200/  a7800/  nes/  megadrive/", 0x00FFFFFF, 0x000D1A33);
+        fb_text(100, 270, "segasys/  toaplan/  cps1/  cps2/  cave/", 0x00FFFFFF, 0x000D1A33);
+        fb_text(100, 290, "apple2/  msx/  cpc/  amiga/  atarist/  pcxt/", 0x00FFFFFF, 0x000D1A33);
+        fb_text(80, 330, "System partition (0): boot.scr, not touched.", 0x00666666, 0x000D1A33);
+        fb_text(80, 360, "Put ROM files into roms/<system>/. No card read here.", 0x00A0C0D0, 0x000D1A33);
     } else {
         fb_text(60, 140, "MultiTool H3 bare-metal", 0x00FFFFFF, 0x000D1A33);
         fb_text(60, 170, "FW " FW_VERSION_STR, 0x00FFFFFF, 0x000D1A33);
