@@ -135,7 +135,8 @@ static inline int32_t sin_t(uint32_t phase) { return (int32_t)sin_tab[(phase >> 
    Пара для 24.576 совпадает с проверенной на стенде (KNOWLEDGE.md, REGISTER-MAP.md),
    поэтому кодировка полей у H3 такая же: N = n-1 в bits[15:8], M = m-1 в bits[7:0],
    SDM enable = bit24. Делители BCLK(/8) и MCLK(/2) для обеих частот одинаковы:
-   BCLK = fs*64 (3.072 МГц / 2.8224 МГц), MCLK = BCLK/4. */
+   BCLK = fs*64 (3.072 МГц / 2.8224 МГц), MCLK = PLL_AUDIO/2 (12.288 МГц
+   / 11.2896 МГц). */
 static int pll_audio_program(unsigned fs)
 {
     uint32_t pat;

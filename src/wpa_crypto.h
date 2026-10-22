@@ -26,7 +26,7 @@ void wpa_pbkdf2_sha1(const uint8_t *pw, uint32_t pw_len,
                      uint32_t iter, uint8_t *dk, uint32_t dk_len);
 
 /* IEEE 802.11 PRF (T-PRF): label + data, bits/8 байт в *out.
-   Используется для PTK (64 байта) и GMK. */
+   Используется для PTK (KCK|KEK|TK = 48 байт) и GMK. */
 void wpa_prf(const uint8_t *key, uint32_t key_len,
              const char *label,
              const uint8_t *data, uint32_t data_len,

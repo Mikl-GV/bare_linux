@@ -4,13 +4,16 @@
 #include <stdint.h>
 
 /* SD/MMC хост-контроллер SDC0 (база 0x01C0F000) — слот SD-карты Orange Pi Lite.
- * PC0..PC6 = SDC0 CLK/CMD/D0-D3 (function 2).
+ * Пины PC0..PC5 = SDC0 CLK/CMD/D0-D3 (function 2); PC6 (CD) на OPi Lite
+ * не задействован и не конфигурируется.
  *
- * Полный подъём с нуля (без наследования от U-Boot): CCU gate+reset,
- * модульный такт SDMMC0_CLK (OSC24M на init), пины, сброс контроллера,
- * инициализация карты (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7/ACMD6/CMD16/CMD58),
- * чтение/запись секторов через FIFO (PIO, 1 блок за раз).
- */
+ * Двухфазный init (загружаемся и через FEL, и через SD+U-Boot):
+ *   - Фаза A: унаследовать уже поднятую U-Boot карту (если загрузка с SD) —
+ *     никаких сбросов/CMD0, только gate+CMD17 на проверку;
+ *   - Фаза B (если A не удалась, например после FEL): полный подъём с нуля —
+ *     CCU gate+reset, такт SDMMC0_CLK (OSC24M на init), пины, сброс
+ *     контроллера, init карты (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7/CMD9/ACMD6/
+ *     CMD16/CMD58), чтение/запись секторов через FIFO (PIO, 1 блок за раз). */
 
 /* Результат инициализации карты. */
 struct sdc0_info {

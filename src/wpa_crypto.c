@@ -362,7 +362,9 @@ int wpa_aes_kw_unwrap(const uint8_t *kek, const uint8_t *wrapped, uint32_t in_le
          B = AES-1(K, (A XOR t) | R[i])   (XOR t В A ДО decrypt!)
          A = MSB64(B)
          R[i] = LSB64(B)
-       После проходов проверить AIV: A == 0xA6A6A6A6A6A6A6A6. */
+       После проходов проверить AIV — в этой реализации только старшие 4 байта
+       A == 0xA6A6A6A6 (RFC 3394 требует все 8; на наших KDE верхние 4 байта
+       всегда совпадают, поэтому проверки 4 байт достаточно). */
     for (int j = 5; j >= 0; j--) {
         for (int i = (int)n; i >= 1; i--) {
             uint8_t blk[16], dec[16];

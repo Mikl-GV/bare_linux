@@ -7,15 +7,21 @@
 #include "sys.h"
 
 /* Слот SD-карты OPi Lite на контроллере SDC0 (база 0x01C0F000).
- * Полный подъём с нуля (FEL+SPL: U-Boot карту не трогал):
+ * Двухфазный init (см. h3_sdc0.h):
+ *   - Фаза A (первичная): наследуем карту, уже инициализированную U-Boot
+ *     (загрузка с SD+U-Boot). Делаем минимум: gate только для полноты,
+ *     без сброса контроллера и без CMD0/ACMD41 — проверка CMD17.
+ *   - Фаза B (если A не удалась, например после FEL+SPL, где U-Boot карту
+ *     не трогал): полный подъём с нуля —
  *   1) CCU: gate + reset MMC0 (GATING0/RST0 bit8), SDMMC0_CLK = OSC24M, init-такт.
- *   2) Пины PC0..PC6 -> function 2 (SDC0): CLK=PC0, CMD=PC1, D0=PC2, D1=PC3,
- *      D2=PC4, D3=PC5, (PC6 = CD? в OPi Lite не задействован). U-Boot на этой
+ *   2) Пины PC0..PC5 -> function 2 (SDC0): CLK=PC0, CMD=PC1, D0=PC2, D1=PC3,
+ *      D2=PC4, D3=PC5 (PC6 = CD в OPi Lite не задействован). U-Boot на этой
  *      плате: PORTC cfg0 = 0x77222222 (PC0..PC5 = 2, PC6/7 = 7) — совпадает.
  *   3) Сброс контроллера (GCTL_RESET), HWRST, CKC-такты, FUNS=0xceAA.
  *   4) Инициализация карты: CMD0 (80 тактов) -> CMD8 -> CMD55/ACMD41 (HCS,
  *      таймаут по busy) -> CMD2 (CID) -> CMD3 (RCA) -> CMD7 (select) ->
- *      ACMD6 (4-bit) -> CMD16 (blocklen 512) -> CMD58 (SDSC/SDHC, CCS bit30).
+ *      CMD9 (CSD, объём карты) -> ACMD6 (4-bit) -> CMD16 (blocklen 512) ->
+ *      CMD58 (SDSC/SDHC, CCS bit30).
  *
  * Чтение/запись: 1 блок (512 Б) за команду через FIFO (PIO, поллинг
  * FIFO_EMPTY/FIFO_LEVEL) — как в эталонном sd.c pico-retro. Host не тянет

@@ -27,7 +27,7 @@ void fb_fill(uint32_t color);
 /* Нарисовать закрашенный прямоугольник. */
 void fb_rect(int x0, int y0, int x1, int y1, uint32_t color);
 
-/* Нарисовать текст (8x8 bitmap) в позицию. Возвращает ширину в px. */
+/* Нарисовать текст (8x8 bitmap) в позицию. */
 void fb_text(int x, int y, const char *s, uint32_t color, uint32_t bg);
 
 #endif /* DISPLAY_H */

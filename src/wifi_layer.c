@@ -249,8 +249,9 @@ int wifi_layer_connect(int index)
     /* W.612: занят — не начинать повторный join (защита от вложенного
        вызова / быстрых кликов). */
     if (join_in_progress) { uart_print("connect: busy\r\n"); return -10; }
-    /* W.612: кулдаун — минимум 3 с между попытками, и при успехе, и при
-       неудаче (AP должна «отдышаться»). */
+    /* W.612: кулдаун — минимум 200 мс между попытками (JOIN_COOLDOWN_MS).
+       Защита только от дребезга кликов; живая Lakka переключается мгновенно
+       (см. пояснение W.612→W.690 выше). */
     if (last_join_ms && (now - last_join_ms) < JOIN_COOLDOWN_MS) {
         uart_print("connect: cooldown (");
         uart_print_int((int)(now - last_join_ms));

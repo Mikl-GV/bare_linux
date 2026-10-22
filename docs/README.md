@@ -8,7 +8,7 @@
 к WiFi-чипу RTL8189FTV** (ассоциация, WPA2 4-way handshake, полный DHCP,
 ответы на ping с ПК), **ретро-меню систем + чтение ромов со SD (FAT32)**.
 
-> Рабочее состояние (W.78x): **полная host-ассоциация + WPA2 4-way handshake
+> Рабочее состояние (W.821): **полная host-ассоциация + WPA2 4-way handshake
 > + полный DHCP-цикл DISCOVER→OFFER→REQUEST→ACK** (корни найдены — seq в
 > TX-дескрипторе, W.770; MSR=0x02 STA вместо 0x01 ADHOC, W.778) **+ пинг с ПК
 > работает (0% потерь, ~14 мс)**. Запущены **все 4 ядра Cortex-A7 (SMP)**.
@@ -35,7 +35,7 @@
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Ретро-меню систем (systems.h) + браузер ромов с SD + Settings/Help/About. DE2/TCON1/HDMI по u-boot, кнопки PCF8574, LED PL10. |
 | **WiFi RTL8189FTV (SDIO)** | ✅ | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров + полный DHCP (DISCOVER→OFFER→REQUEST→ACK, W.770) + **пинг с ПК (0% потерь, W.778)**. Экран Transfer (скан/connect) — внутри Settings. |
-| **SD-карта (SDC0) + FAT32** | ✅ | Полный подъём SDC0 с нуля (CMD0/8/ACMD41/2/3/7, 4-bit), чтение секторов PIO; FAT32-ридер (MBR→раздел с /roms, BPB, каталоги 8.3+LFN, цепочки кластеров). |
+| **SD-карта (SDC0) + FAT32** | ✅ | Двухфазный init (Фаза A: наследование U-Boot без CMD0; Фаза B: полный подъём CMD0/8/ACMD41/2/3/7/9, 4-bit), чтение секторов PIO; FAT32-ридер (MBR→раздел с /roms, BPB, каталоги 8.3+LFN, цепочки кластеров) + fat_mkdir (посев папок, не вызывается). |
 | **SMP (4 ядра Cortex-A7)** | ✅ | Подъём CPU1..CPU3 при старте (трамплин SRAM A1, R_CPUCFG / PSCI); ядра в idle-цикле (задел под эмуляторы). |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
@@ -121,12 +121,10 @@
 | NES / Famicom | `nes` | Console | READY | — |
 | SG-1000 | `sg1000` | Console | READY | — |
 | ColecoVision | `coleco` | Console | READY | — |
-| Vectrex | `GCE Vectrex` | Console | READY | — |
-| Atari 8-bit / XEGS | `atari8` | Console | READY | — |
+| Vectrex | `vectrex` | Console | READY | — |
 | Sega Master System | `sms` | Console | READY | — |
 | Mega Drive / Genesis | `megadrive` | Console | READY | — |
 | PC Engine / TGFX-16 | `pce` | Console | READY | — |
-| Commodore 64 | `c64` | Console | READY | — |
 | Super Nintendo | `snes` | Console | PLANNED | — |
 | Neo Geo | `neogeo` | Console | PLANNED | — |
 | 3DO | `3do` | Console | PLANNED | — |
@@ -141,11 +139,11 @@
 | Toaplan / Cave (shmup) | `toaplan` | Arcade | READY | — |
 | Capcom CPS1 | `cps1` | Arcade | READY | — |
 | Sega System 16 | `segasys` | Arcade | READY | — |
+| Capcom CPS2 | `cps2` | Arcade | PLANNED | — |
 | FB Neo (Arcade) | `fbneo` | Arcade | PLANNED | — |
-| Cave (68K) STGs | `cave` | Arcade | READY | — |
 | Taito F3 | `taito_f3` | Arcade | PLANNED | — |
 | Sega Model 1/2 | `model1` | Arcade | PLANNED | — |
-| Atari 8-bit (400/800) | `atari800` | Computer | READY | — |
+| Atari 8-bit (400/800/XL/XE) | `atari800` | Computer | READY | — |
 | Apple II / II+ / IIe | `apple2` | Computer | READY | — |
 | BBC Micro / Master | `bbcmicro` | Computer | READY | — |
 | Enterprise 64/128 | `enterprise` | Computer | READY | — |
@@ -164,11 +162,9 @@
 | BK-0010 / BK-0011M | `bk0010` | Computer | READY | ✅ builtin |
 | UKNC / Korvet | `uknc` | Computer | READY | — |
 | NEC PC-8801 | `pc88` | Computer | PLANNED | — |
-| NEC PC-9801 | `pc98` | Computer | PLANNED | — |
 | Apple IIGS | `iigs` | Computer | READY | — |
-| PC AT (286) | `pc286` | Computer | PLANNED | — |
-| PC 386SX / 486SX | `pc386` | Computer | PLANNED | — |
 | FM Towns | `fmtowns` | Computer | PLANNED | — |
+| Commodore 64 | `c64` | Computer | READY | — |
 | Osborne 1 / Kaypro | `osborne` | Laptop | READY | — |
 | Tandy Model 100 | `tandy100` | Laptop | PLANNED | — |
 | Toshiba T1100 | `t1100` | Laptop | READY | — |
@@ -208,7 +204,7 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ на 0
 - Сборка многопоточная при желании: `make -j8 bin`.
 - Версия прошивки (`FW vW.xxx`) авто-инкрементируется при сборке
   (`tools/scripts/bump_version.sh`), выводится по UART и на экран.
-- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~88 КБ).
+- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~113 КБ).
 
 ## Заливка
 

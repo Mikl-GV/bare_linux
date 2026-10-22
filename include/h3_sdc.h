@@ -277,8 +277,8 @@ int h3_sdc_write_wlan_reg32(uint32_t reg, uint32_t val);
 int h3_sdc_write_wlan_reg16(uint32_t reg, uint16_t val);
 int h3_sdc_write_wlan_reg8(uint32_t reg, uint8_t val);
 
-/* Чтение 8-бит регистра WLAN-функции (function 1): CMD52 для reg<0x100,
-   CMD53 byte-mode для >=0x100. */
+/* Чтение 8-бит регистра WLAN-функции (function 1): ВСЕГДА CMD52
+   (разделения по 0x100 нет, см. h3_sdc_read_wlan_reg8). */
 int h3_sdc_read_wlan_reg8(uint32_t reg, uint8_t *val);
 
 /* Специфичная для чипа последовательность включения (power-on) RTL8189FTV:

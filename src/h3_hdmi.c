@@ -286,7 +286,7 @@ int h3_hdmi_enable(const struct display_timing *edid, uint32_t bpp)
 
 int h3_hdmi_probe(void)
 {
-    /* PLL_VIDEO 297 МГц для внутреннего опроса (probe). */
+    /* PLL_VIDEO 288 МГц (24 МГц * 24 / 2) для внутреннего опроса (probe). */
     clock_set_pll_video_factors(2, 24);   /* 24МГц*24/2 = 288МГц */
 
     H3_CCU_HDMI_CLK = (H3_CCU_HDMI_CLK & ~H3_HDMI_CLK_PLL_MASK) | H3_HDMI_CLK_PLL_VIDEO;

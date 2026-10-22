@@ -1083,18 +1083,21 @@ static uint32_t rf_read(uint8_t off)
 
 /* ---- LCK: калибровка утечки гетеродина (phy_LCCalibrate_8188F, 1T1R path A) ----
  * Полная последовательность:
- *  0) BB/PLL: BB-конфиг (bb_phy_reg, 209), AGC-таблица (bb_agc_tab, 66),
+ *  0) BB/PLL: BB-конфиг (bb_phy_reg, 209), AGC-таблица (bb_agc_tab, 67),
  *     RF-таблица RadioA (rf_radioa, 136 пар С ПРОПУСКОМ записи 0x18 —
  *     таблица ставит 0xFC07, что ломает LCK-триггер), затем RF 0x18 = 0x401;
  *  1) REG_TXPAUSE(0x522) = 0xFF — блокировать TX-очереди (чип не передаёт);
  *  2) RF 0xB0 = 0xDFBF0 (LDO ON);
- *  3) RF 0x00 = 0 — перевести RF в LCK-режим (как в драйвере перед триггером);
+ *  3) RF 0x00 (RF_AC) СОХРАНЯЕМ и НЕ зануляем: эталон phy_LCCalibrate_8188F
+ *     для packet-TX (0xd03 & 0x70 == 0) RF_AC не трогает — только TXPAUSE +
+ *     0xB0 + 0x18; принудительное 0x33D95 после LCK не совпадает с живым
+ *     чипом и расстраивает аналоговый тракт;
  *  4) RF_CHNLBW (0x18) |= 0x08000 (бит 15 = LCK trigger);
- *  5) опрос: ждать сброса bit15 (LCK завершён), таймаут ~1 с (100 x 10 мс);
+ *  5) пауза 100 мс БЕЗ поллинга bit15 — у 8188F бит 15 может оставаться
+ *     взведённым после завершения (D7);
  *  6) RF 0xB0 = 0xDFFF0 (LDO OFF);
  *  7) восстановить канал: RF 0x18 = 0x401 (явно, с очисткой бит [15:8]);
- *  8) восстановить RF 0x00 = 0x33D95 (последняя запись RF-таблицы,
- *     ant-switch; НЕ 0x30000 — дефолт ломает тракт, заданный таблицей);
+ *  8) восстановить RF 0x00 из сохранённого rf_ac;
  *  9) REG_TXPAUSE = 0x00 — снять блокировку.
  * После LCK RF-таблица ОСТАЁТСЯ загруженной (чип не сбрасывается между
  * фазами), поэтому IQK и RX-тест НЕ перезагружают её повторно. */
@@ -1837,7 +1840,7 @@ WLOG("  iqk: pre e94=0x"); WLOG_HEX(d);
  *      физически не декодирует эфир; 0x577=3, 0x976=0 (2nd CCA);
  *  2) LLT (0x224 |= BIT16) + границы FIFO (0x116=0x3EFF, TX 0xF1);
  *  2c) BWOPMODE (0x603)=0x04, SIFS/RL/EDCA (из _InitEDCA/_InitAdaptiveCtrl);
- *  3) RCR=0x7000604E / RRSR=0xFFF / RXFLTMAP / MAR — приём mgmt+bcast;
+ *  3) RCR=0x7000604E / RRSR=0x000FFFF1 / RXFLTMAP / MAR — приём mgmt+bcast;
  *  4) REG_CR |= HCI_RXDMA(1)|RXDMA_EN(3)|MACTXEN(6)|MACRXEN(7);
  *  4d) RX-DMA: PBP=0x11, DRVINFO=4, AGG_PG_TH=0x010F, 0x290=0x0E;
  *  5) свип каналов 1→6→11 со слушанием 150 мс, диагностика
@@ -4883,9 +4886,9 @@ body[0]  = 0x02;                             /* RSN */
      REG_CAMCMD  = 0x0670, REG_CAMWRITE = 0x0674
      CAM_POLLINIG = BIT31, CAM_WRITE = BIT16, CAM_VALID = BIT15
      CAM_AES = 0x04, CAM_CONTENT_COUNT = 8
-   addr — номер записи CAM (pairwise: номер по MAC, group: 0/1..3).
-   mac[6] — адрес (pairwise — BSSID AP; для GTK-default — ВСЕ НУЛИ, см.
-     драйвер rtw_mlme_ext.c:14186-14189: cam_id<=3 -> addr=null_addr).
+   addr — номер записи CAM (pairwise: по MAC; group: GTK — слот 5, BSSID).
+   mac[6] — адрес: для pairwise — BSSID AP; для GTK — BSSID AP тоже (вызов
+     wpa_cam_write_key(5, join_target.bssid, gk, 1)), см. W.537.
    key[16] — 128-бит ключ (CCMP).
    is_group — 1 для GTK (default/group key): добавить BIT6 (флаг group key)
      в слово управления, как у драйвера ctrl = BIT15|BIT6|alg<<2|keyid
@@ -4921,7 +4924,7 @@ static void wpa_cam_write_key(uint8_t addr, const uint8_t *mac,
         h3_sdc_write_wlan_reg32(0x0670, CAM_POLLINIG | CAM_WRITE |
                                 ((uint32_t)CAM_CONTENT_COUNT * addr + (uint32_t)i));
         /* wait polling bit clears. W.484: 1000x10мс = до 10 с на слово при
-           залипании POLLINIG, что рвало тайминги 4-way. 100x1мс достаточно. */
+           залипании POLLINIG, что рвало тайминги 4-way. 20x1мс достаточно. */
         for (int p = 0; p < 20; p++) {
             uint32_t rd = 0;
             h3_sdc_read_wlan_reg32(0x0670, &rd);
@@ -6089,8 +6092,9 @@ uint32_t dp = fr + 24 + ((fcfc & 0x0080) ? 2 : 0)
                                                 uart_print_hex((uint32_t)scr_rb);
                                             }
                                             /* W.459 [диагностика]: дамп CAM после загрузки ключей.
-                                               seccfg 0x0680 = 0xC0 (CCMP enc/dec on) если ключи
-                                               реально активны; camcmd 0x0670 покажет занятость. */
+                                               seccfg 0x0680 = 0x010C (CCMP enc/dec on, scr16 выше)
+                                               если ключи реально активны; camcmd 0x0670 покажет
+                                               занятость. */
                                             {
                                                 uint8_t sec_cfg = 0, cam_cmd = 0;
                                                 h3_sdc_read_wlan_reg8(0x0680, &sec_cfg);

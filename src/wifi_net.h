@@ -25,7 +25,8 @@ void net_dhcp_reset(void);
 
 /* W.601/W.673: повторная отправка DHCP REQUEST (после OFFER, если ACK
    задержался) — ретраи как у dhclient. Идёт broadcast (L2+IP, 255.255.255.255)
-   с xid того же DISCOVER, опции 50/54/61, ciaddr=0 (SELECTING). */
+   с xid того же DISCOVER, опции 50/54, ciaddr=0 (SELECTING).
+   opt61 (client-id) намеренно НЕ шлётся (W.769) — оба сообщения консистентны. */
 int net_dhcp_request(void);
 
 /* W.722: забрать флаг «OFFER получен, нужен первый REQUEST». Парсер OFFER
