@@ -203,20 +203,53 @@ static void h3_sdc0_init_pins(void)
 
 int h3_sdc0_init(struct sdc0_info *info)
 {
-    /* 1) Такт шины: включаем gate MMC0. МОДУЛЬНЫЙ СБРОС В CCU (RST0 bit8)
-          НЕ делаем: при загрузке с SD карту уже инициализировал U-Boot,
-          а assert/deassert RST0 = глобальный для модуля сброс — он сбрасывает
-          контроллер вместе с состоянием карты и конфликтует с загрузчиком.
-          Вместо этого «убиваем зомби» после U-Boot локально: перезаписываем
-          регистры контроллера (GCTL_RESET + HWRST ниже) — это безопасно и
-          не трогает шину/карту глобально. */
+    /* ==== Фаза A: наследование U-Boot (загрузка с SD) ====
+       U-Boot уже инициализировал MMC0, GPIO, клок и карту (лог: 
+       "17.5 MiB/s" из boot.scr). НЕ делаем ни сброса контроллера, ни
+       CMD0/ACMD41 — только включаем gate (может быть снят) и проверяем
+       карту лёгким CMD17 (как эталон sd.c pico-retro: «U-Boot поднял»).
+       Если карта отвечает — сразу работаем. */
     H3_CCU_GATING0 |= H3_CCU_GATE_MMC0;
     __asm volatile("dsb" ::: "memory");
     udelay(10);
 
-    /* 2) Модульный такт MMC0: OSC24M, N=2, M=16 -> 750 кГц (как SDC1 init).
-          OLD mode (без MODE_NEW). Прямая перезапись регистра клока — так
-          U-Boot-значения (50 МГц/2-4 бита) заменяются на init-частоту. */
+    {
+        uint8_t probe[512];
+        SDC0_REG(SDC_BLKSZ) = 512;
+        SDC0_REG(SDC_BYCNT) = 512;
+        SDC0_REG(SDC_RISR) = 0xFFFFFFFFu;
+        SDC0_REG(SDC_ARG) = 0;
+        __asm volatile("dmb sy" ::: "memory");
+        SDC0_REG(SDC_CMDR) = (17u & SDC_CMDR_IDX_MASK) | SDC_CMDR_START
+                           | SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC
+                           | SDC_CMDR_DATA_TRANS | SDC_CMDR_WAIT_PRE;
+        __asm volatile("dmb sy" ::: "memory");
+        if (sdc0_wait_rint(SDC_RISR_CMD_DONE, 0xFFFFFFu) == 0
+            && sdc0_read_data(probe, 512) == 0) {
+            /* карта готова в конфигурации U-Boot (часто 4-bit/50МГц).
+               Определяем SDSC/SDHC честно — CMD58 (READ_OCR, R3): CCS bit30. */
+            g_sdhc = 1;
+            if (sdc0_cmd(58, 0, SDC_CMDR_RESP_RCV) == 0)
+                g_sdhc = (uint8_t)((SDC0_REG(SDC_RESP0) >> 30) & 1);
+            if (info) {
+                info->sdhc = g_sdhc;
+                info->wide4 = 1;   /* у U-Boot обычно 4-bit; читаем как есть */
+                info->total_sectors = 0;
+            }
+            uart_print("sd0: legacy (U-Boot) ok\r\n");
+            return 0;
+        }
+        uart_print("sd0: legacy probe fail, full init\r\n");
+    }
+
+    /* ==== Фаза B: полный подъём с нуля (FEL+SPL: U-Boot карту не трогал) ====
+       1) Такт шины: gate ММС0. МОДУЛЬНЫЙ СБРОС В CCU (RST0 bit8) НЕ делаем:
+          при загрузке с SD карту уже инициализировал U-Boot, а assert/deassert
+          RST0 = глобальный для модуля сброс — он сбрасывает контроллер вместе
+          с состоянием карты и конфликтует с загрузчиком.
+          Вместо этого «убиваем зомби» после U-Boot локально: перезаписываем
+          регистры контроллера (GCTL_RESET + HWRST ниже) — это безопасно и
+          не трогает шину/карту глобально. */
     H3_CCU_SDMMC0_CLK = H3_SDMMC0_SCLK_GATE
                       | H3_SDMMC0_CLK_SRC_OSC24M
                       | (2u << 16)   /* N=2 */

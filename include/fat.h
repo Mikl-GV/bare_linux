@@ -38,4 +38,9 @@ int fat_read_file(const fat_entry_t *f, uint32_t offset, uint8_t *buf, uint32_t 
 /* Разделяемый буфер каталога (меню/браузер/FAT не конфликтуют). */
 fat_entry_t *fat_scratch(void);
 
+/* Создать каталог name внутри parent_path ("" = корень, "roms" = /roms).
+   Нужно для посева отсутствующих папок систем на SD.
+   Возвращает 0 при успехе, -1 при ошибке. */
+int fat_mkdir(const char *parent_path, const char *name);
+
 #endif /* FAT_H */

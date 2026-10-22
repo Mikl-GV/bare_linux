@@ -99,6 +99,88 @@
 Цель — «эмулятор + сетевой доступ к ROM на SD».
 Подробности: `NEXT-QUESTIONS.md`, `HARDWARE.md`.
 
+## Системы и папки на SD
+
+Структура раздела с ромами — **как в корне проекта** (`roms/<система>/`; системный
+раздел с `boot.scr` не затрагивается). Папки систем созданы в корне проекта
+`roms/`; при загрузке меню проверяет наличие каждой папки на SD и ставит `[OK]`
+рядом с пунктом (папка не создаётся автоматически). Ромам — лежать в соответствующих
+папках. Таблица «система → папка» (папка = `dir` или `id`, по `include/systems.h`):
+
+| Система (пункт меню) | Папка в roms/ | Группа | Статус | Builtin |
+|---|---|---|---|---|
+| Game Boy / Color | `gameboy` | Portable | READY | — |
+| Game Boy Advance | `gba` | Portable | READY | — |
+| Sega Game Gear | `gamegear` | Portable | READY | — |
+| Atari Lynx | `lynx` | Portable | READY | — |
+| Neo Geo Pocket | `ngp` | Portable | READY | — |
+| WonderSwan | `wonderswan` | Portable | READY | — |
+| Atari 2600 | `a2600` | Console | READY | — |
+| Atari 5200 | `a5200` | Console | READY | — |
+| Atari 7800 | `a7800` | Console | READY | — |
+| NES / Famicom | `nes` | Console | READY | — |
+| SG-1000 | `sg1000` | Console | READY | — |
+| ColecoVision | `coleco` | Console | READY | — |
+| Vectrex | `GCE Vectrex` | Console | READY | — |
+| Atari 8-bit / XEGS | `atari8` | Console | READY | — |
+| Sega Master System | `sms` | Console | READY | — |
+| Mega Drive / Genesis | `megadrive` | Console | READY | — |
+| PC Engine / TGFX-16 | `pce` | Console | READY | — |
+| Commodore 64 | `c64` | Console | READY | — |
+| Super Nintendo | `snes` | Console | PLANNED | — |
+| Neo Geo | `neogeo` | Console | PLANNED | — |
+| 3DO | `3do` | Console | PLANNED | — |
+| PlayStation | `psx` | Console | PLANNED | — |
+| Saturn | `saturn` | Console | PLANNED | — |
+| N64 | `n64` | Console | PLANNED | — |
+| Space Invaders | `invaders` | Arcade | READY | — |
+| Pac-Man | `pacman` | Arcade | READY | — |
+| Galaxian / Galaga | `galaga` | Arcade | READY | — |
+| Donkey Kong | `dkong` | Arcade | READY | — |
+| Sega System 1/2 | `segasys1` | Arcade | READY | — |
+| Toaplan / Cave (shmup) | `toaplan` | Arcade | READY | — |
+| Capcom CPS1 | `cps1` | Arcade | READY | — |
+| Sega System 16 | `segasys` | Arcade | READY | — |
+| FB Neo (Arcade) | `fbneo` | Arcade | PLANNED | — |
+| Cave (68K) STGs | `cave` | Arcade | READY | — |
+| Taito F3 | `taito_f3` | Arcade | PLANNED | — |
+| Sega Model 1/2 | `model1` | Arcade | PLANNED | — |
+| Atari 8-bit (400/800) | `atari800` | Computer | READY | — |
+| Apple II / II+ / IIe | `apple2` | Computer | READY | — |
+| BBC Micro / Master | `bbcmicro` | Computer | READY | — |
+| Enterprise 64/128 | `enterprise` | Computer | READY | — |
+| ZX Spectrum | `zxspectrum` | Computer | READY | ✅ builtin |
+| MSX / MSX2 | `msx` | Computer | READY | ✅ builtin |
+| Amstrad CPC | `cpc` | Computer | READY | — |
+| Sinclair QL | `ql` | Computer | READY | — |
+| Amstrad PCW | `pcw` | Computer | READY | — |
+| Atari ST | `atarist` | Computer | READY | — |
+| Amiga 500/600 | `amiga` | Computer | READY | — |
+| Macintosh Plus | `macplus` | Computer | READY | — |
+| Sharp X68000 | `x68000` | Computer | READY | — |
+| Radio-86RK / Specialist | `radio86rk` | Computer | READY | — |
+| Agat | `agat` | Computer | READY | — |
+| PC XT / PCjr / Tandy | `pcxt` | Computer | READY | — |
+| BK-0010 / BK-0011M | `bk0010` | Computer | READY | ✅ builtin |
+| UKNC / Korvet | `uknc` | Computer | READY | — |
+| NEC PC-8801 | `pc88` | Computer | PLANNED | — |
+| NEC PC-9801 | `pc98` | Computer | PLANNED | — |
+| Apple IIGS | `iigs` | Computer | READY | — |
+| PC AT (286) | `pc286` | Computer | PLANNED | — |
+| PC 386SX / 486SX | `pc386` | Computer | PLANNED | — |
+| FM Towns | `fmtowns` | Computer | PLANNED | — |
+| Osborne 1 / Kaypro | `osborne` | Laptop | READY | — |
+| Tandy Model 100 | `tandy100` | Laptop | PLANNED | — |
+| Toshiba T1100 | `t1100` | Laptop | READY | — |
+| Electronica MS 1504 | `ms1504` | Laptop | READY | ✅ builtin |
+| HP 200LX / Poqet PC | `hp200lx` | Laptop | READY | — |
+| Atari Portfolio | `portfolio` | Laptop | PLANNED | — |
+| TI-83 calculators | `ti83` | Laptop | READY | — |
+
+Пункт меню становится **белым** только когда: папка есть на SD **и** эмулятор
+реализован (пока все эмуляторы не написаны — пункты серые). Описание системы
+(проц / ОЗУ / частота / год) выводится внизу экрана при выборе.
+
 ---
 
 ## Требования к окружению

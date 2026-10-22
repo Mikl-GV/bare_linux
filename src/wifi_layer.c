@@ -181,65 +181,26 @@ int wifi_layer_start(void)
                            (A05s/dnsmasq) молча дропает REQUEST от клиента с нулевым
                            OUI. Эталон живой Lakka работает с 02:81:38:27:88:cd. */
                     }
-                    uart_print(" mac=");
+                    uart_print("  efuse mac=");
                     for (int k = 0; k < 6; k++) {
                         print_u8_hex(mac[k]);
                         if (k < 5) uart_print(":");
                     }
                     uart_print("\r\n");
 
-                    /* Запись MAC в REG_MACID (0x610-0x615). */
+                    /* Запись MAC в REG_MACID (0x610-0x615) — результат кратко. */
                     {
                         int wk = h3_wifi_set_mac(mac);
                         uart_print("  mac_set=");
                         uart_print(wk == 0 ? "OK" : "FAIL");
                         uart_print("\r\n");
                     }
-
-                    /* Пауза, затем чтение REG_MACID обратно. */
-                    udelay(10000);
-                    {
-                        uint32_t re_lo = 0, re_hi = 0;
-                        uint32_t base = (8u << 13) | (0x610u & 0x7FFFu);
-                        int rrc = 0;
-                        if (h3_sdc_cmd53_read_bytes_noinc(1, base, 4, &re_lo) != 0) rrc = -1;
-                        if (h3_sdc_cmd53_read_bytes_noinc(1, base + 4, 2, &re_hi) != 0) rrc = -1;
-                        uart_print("  macid_re=");
-                        if (rrc == 0) {
-                            print_u8_hex((uint8_t)(re_lo & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_lo >> 8) & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_lo >> 16) & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_lo >> 24) & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)(re_hi & 0xFF));
-                            uart_print(":");
-                            print_u8_hex((uint8_t)((re_hi >> 8) & 0xFF));
-                        } else uart_print("FAIL");
-                        uart_print("\r\n");
-                    }
-                }
-
-                /* W.345: A0 (power state) сразу после fwdl+mac. Если упал
-                   с 3 (после pwon) до 0 — FW ушла в RESET на этапе fwdl/мак. */
-                {
-                    int a0ps = h3_wifi_power_state();
-                    uart_print("  a0_post_fw=0x");
-                    uart_print_hex((uint32_t)(a0ps & 0xFF));
-                    uart_print("\r\n");
                 }
 
                 /* RF-калибровка LCK. */
                 h3_wifi_rf_lck();
 
-                /* W.514: на старте — только скан-обзор, БЕЗ автоподключения
-                   к захардкоженному SSID. Раньше здесь задавалась цель "A05s"
-                   и до 3 сканов ждали именно её: если такой сети рядом нет,
-                   это давало 3 бессмысленных прохода (~секунды) и rc=-4.
-                   Список сетей заполняется сканом; подключение — только по
-                   выбору пользователя через wifi_layer_connect(index). */
+                /* На старте — скан-обзор БЕЗ автоподключения (W.514). */
                 uart_print("join: boot scan (no autoconnect)\r\n");
                 {
                     h3_wifi_rf_rx_test();
@@ -247,8 +208,6 @@ int wifi_layer_start(void)
                     uart_print_int(h3_wifi_scan_ap_count());
                     uart_print("\r\n");
                 }
-
-                uart_print("\r\n");
             }
         }
     }

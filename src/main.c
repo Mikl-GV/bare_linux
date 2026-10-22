@@ -32,13 +32,14 @@ void kmain(void)
 {
     /* Убрать преграды TrustZone (U-Boot может блокировать DMA/I2S/CCU регистры). */
     secure_unlock();
+    /* Таймер ДО SMP: h3_smp_boot/udelay работают через HSTMR (sys_timer_init). */
+    sys_timer_init();
     /* Поднять все 4 ядра Cortex-A7 сразу при старте: вторичные (CPU1..CPU3)
        уходят в idle-цикл (заглушка под будущие задачи). */
     h3_smp_boot(0);
     /* GIC: инициализировать distributor + CPU interface, включить обе группы
        (U-Boot закрывает GIC; без этого DMA/SPI прерывания не маршрутизируются). */
     gic_init();
-    sys_timer_init();
     gpio_init();   /* включить APB0 (порт L) — нужно для LED на PL10 */
     uart_init();
     uart_print("\r\n=== MultiTool H3 bare-metal ===\r\n");

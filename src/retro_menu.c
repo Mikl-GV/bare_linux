@@ -10,6 +10,7 @@
 #include "i2s.h"
 #include "uart.h"
 #include "sys.h"
+#include "ports.h"
 #include "version.h"
 
 /* Флаг «WiFi-слой активен» (пишет wifi_layer) — значок в шапке меню. */
@@ -74,6 +75,13 @@ static int g_transfer_top = 0;           /* скролл списка сетей
 static int g_settings_sel = 0;           /* 0=Transfer, 1=Sound test */
 static int g_sound_on = 0;
 static int g_sound_freq = 440;
+static int g_sd_ok = 0;              /* 0=SD не инициализирована, 1=ok, <0=ошибка */
+/* Наличие папки системы на SD (индекс системного idx). Заполняется в
+   sd_init_menu после посева. Нужно для цвета/доступности пункта. */
+static uint8_t g_sys_has_dir[NUM_SYSTEMS];
+/* Эмулятор системы реализован (0 = ещё нет). Пока все 0 — по мере
+   написания ядер поднимаем флаг; пункт белеет только при папке+эмуляторе. */
+static uint8_t g_sys_emu[NUM_SYSTEMS];
 static uint32_t g_prev = 0;
 
 static int sys_max_rows(void)
@@ -127,10 +135,18 @@ static void render_systems(void)
         fb_text(FB_W - 8 * 9 - 12, 12, "WIFI ON", 0x0000FF00, 0x00336699);
     else
         fb_text(FB_W - 8 * 10 - 12, 12, "WIFI OFF", 0x00888888, 0x00336699);
+    /* Статус SD-карты: справа под WIFI. */
+    if (g_sd_ok == 1)
+        fb_text(FB_W - 8 * 7 - 12, 30, "SD OK", 0x0000FF00, 0x00336699);
+    else if (g_sd_ok < 0)
+        fb_text(FB_W - 8 * 9 - 12, 30, "SD FAIL", 0x00FF4444, 0x00336699);
+    else
+        fb_text(FB_W - 8 * 10 - 12, 30, "SD ...", 0x00888888, 0x00336699);
 
     int maxp = sys_max_rows();
     if (g_sel >= g_row_count) g_sel = g_row_count - 1;
     if (g_sel < 0) g_sel = 0;
+    /* Двусторонний скролл: курсор всегда в видимой области. */
     if (g_scroll > g_sel) g_scroll = g_sel;
     if (g_sel >= g_scroll + maxp) g_scroll = g_sel - maxp + 1;
     if (g_scroll < 0) g_scroll = 0;
@@ -141,12 +157,16 @@ static void render_systems(void)
         if (g_rows[r].type == RT_GROUP) {
             text_clipped(60, y, (g_rows[r].idx == GROUP_CONSOLE) ? "Consoles" :
                          (g_rows[r].idx == GROUP_ARCADE) ? "Arcade" :
-                         (g_rows[r].idx == GROUP_COMPUTER) ? "Computers" : "Portable",
+                         (g_rows[r].idx == GROUP_COMPUTER) ? "Computers" :
+                         (g_rows[r].idx == GROUP_LAPTOP) ? "Laptops / PDAs" : "Portable",
                          0x0044CCFF, 0x000D1A33);
             y += ROW_H;
         } else if (g_rows[r].type == RT_SYS) {
             int i = g_rows[r].idx;
-            uint32_t clr = (systems[i].status == STATUS_READY)
+            /* Белый только если папка системы есть на SD И эмулятор реализован.
+               Иначе — серый (пункт не готов к запуску). */
+            int playable = g_sys_has_dir[i] && g_sys_emu[i];
+            uint32_t clr = playable
                          ? (sel ? 0x00FFFF00 : 0x00FFFFFF)
                          : (sel ? 0x00888800 : 0x00666666);
             if (sel) fill_row(y, 0x00202020);
@@ -157,6 +177,10 @@ static void render_systems(void)
             for (int k = 0; k < n; k++) buf[k] = nm[k];
             int m = n;
             if (systems[i].builtin) { buf[m++] = ' '; buf[m++] = '['; buf[m++] = 'B'; buf[m++] = ']'; }
+            /* [OK] — папка системы есть на SD (как в pico-retro). */
+            if (g_sys_has_dir[i]) {
+                buf[m++] = ' '; buf[m++] = '['; buf[m++] = 'O'; buf[m++] = 'K'; buf[m++] = ']';
+            }
             buf[m] = 0;
             fb_text(70, y, buf, clr, sel ? 0x00202020 : 0x000D1A33);
             y += ROW_H;
@@ -169,6 +193,16 @@ static void render_systems(void)
             fb_text(70, y, label, clr, sel ? 0x00181818 : 0x000D1A33);
             y += ROW_H;
         }
+    }
+    /* Описание выбранной системы — строка ПОД подсказкой (не налазит). */
+    {
+        int si = -1;
+        if (g_sel >= 0 && g_sel < g_row_count && g_rows[g_sel].type == RT_SYS)
+            si = g_rows[g_sel].idx;
+        if (si >= 0 && systems[si].desc)
+            text_clipped(60, SYSTEMS_BOT + 34, systems[si].desc, 0x0088CCBB, 0x000D1A33);
+        else
+            fb_text(60, SYSTEMS_BOT + 34, " ", 0x0088CCBB, 0x000D1A33);
     }
     fb_text(60, SYSTEMS_BOT + 8, "A=select  B=back  START=exit", 0x00A0C0D0, 0x000D1A33);
     fb_text(FB_W - 8 * 11 - 8, FB_H - 8 - 4, "FW v" FW_VERSION_STR, 0x00505070, 0x000D1A33);
@@ -220,18 +254,27 @@ static void render_browser(void)
     if (g_browser_sel < 0) g_browser_sel = 0;
 
     if (n <= 0) {
-        fb_text(60, 140, "Folder is empty", 0x00FFAA00, 0x000D1A33);
-        fb_text(60, 168, "Put ROM files here (B=back):", 0x00FFFFFF, 0x000D1A33);
+        /* Без карты — явная подсказка; иначе папка пуста. */
+        if (g_sd_ok != 1) {
+            fb_text(60, 140, "No SD card!", 0x00FF4444, 0x000D1A33);
+            fb_text(60, 168, "Insert SD card to load ROMs (B=back)", 0x00FFFFFF, 0x000D1A33);
+        } else {
+            fb_text(60, 140, "Folder is empty", 0x00FFAA00, 0x000D1A33);
+            fb_text(60, 168, "Put ROM files here (B=back):", 0x00FFFFFF, 0x000D1A33);
+        }
         char path[FAT_NAME_LEN + 16];
         int pl = 0;
-        const char *pfx = "/roms/";
+        const char *pfx = "";
         while (*pfx && pl < (int)sizeof(path) - 1) path[pl++] = *pfx++;
         for (const char *s = system_rom_dir(g_sys); *s && pl < (int)sizeof(path) - 1; s++) path[pl++] = *s;
         path[pl] = 0;
         text_clipped(60, 196, path, 0x00666666, 0x000D1A33);
     } else {
         int scroll = 0;
+        /* Двусторонний скролл: курсор всегда в видимой области. */
         if (g_browser_sel >= maxp) scroll = g_browser_sel - maxp + 1;
+        if (g_browser_sel < scroll) scroll = g_browser_sel;
+        if (scroll < 0) scroll = 0;
         int y = 90;
         for (int i = scroll; i < n && i < scroll + maxp; i++) {
             int sel = (i == g_browser_sel);
@@ -274,7 +317,7 @@ static void render_placeholder(void)
     fb_rect(0, 0, FB_W - 1, 64, 0x00336699);
     text_clipped(8, 24, systems[g_sys].name, 0x00FFFFFF, 0x00336699);
     fb_text(60, 150, "Emulator not implemented yet", 0x00FFAA00, 0x000D1A33);
-    fb_text(60, 190, "(заглушка, B=back)", 0x00FFFFFF, 0x000D1A33);
+    fb_text(60, 190, "(stub, B=back)", 0x00FFFFFF, 0x000D1A33);
     fb_clean();
 }
 
@@ -413,24 +456,93 @@ static uint32_t wait_btn(void)
     return pressed;
 }
 
+/* Индикатор жизни процессора: мигание PL10 каждые ~500 мс.
+   Вызывается и из udelay (sys.c) — поэтому не static. */
+static uint32_t g_led_last = 0;
+static int g_led_state = 1;
+void led_heartbeat(void)
+{
+    uint32_t now = micros();
+    if ((uint32_t)(now - g_led_last) >= 500000) {
+        g_led_last = now;
+        g_led_state = !g_led_state;
+        set_led(g_led_state);
+    }
+}
+
+/* Включить слот SD: PA15 = EN_SD, активный уровень 1.
+   Держим 1 пока идёт работа с картой. */
+static void sd_enable(void)
+{
+    set_pin_mode(PORTA, 15, 1);   /* output */
+    set_pin_data(PORTA, 15, 1);   /* EN_SD = 1 */
+    __asm volatile("dsb" ::: "memory");
+    udelay(5000);                 /* пауза на оживление карты/питания */
+}
+
+/* Инициализация SD при входе в меню: SDC0 + FAT32. */
+static void sd_init_menu(void)
+{
+    struct sdc0_info info;
+    uart_print("sd0: init...\r\n");
+    if (h3_sdc0_init(&info) != 0) {
+        uart_print("sd0: FAIL\r\n");
+        g_sd_ok = -1;
+        return;
+    }
+    uart_print("fat: init...\r\n");
+    if (fat_init() != 0) {
+        uart_print("fat: FAIL\r\n");
+        g_sd_ok = -2;   /* карта есть, но разметка/ФС не поднялась */
+        return;
+    }
+    g_sd_ok = 1;
+
+    /* Только ОТМЕЧАЕМ наличие папок систем на SD (без создания!):
+       g_sys_has_dir нужен для цвета/доступности. Папки на SD создаёт
+       сам пользователь (структура как в корне проекта). */
+    {
+        fat_entry_t probe;
+        for (int i = 0; i < NUM_SYSTEMS; i++) {
+            const char *d = system_rom_dir(i);
+            g_sys_has_dir[i] = 0;
+            if (!d || !*d) continue;
+            if (fat_find("", d, &probe)) g_sys_has_dir[i] = 1;
+        }
+    }
+    uart_print("sd: ready\r\n");
+}
+
 void retro_menu_run(void)
 {
     build_rows();
     g_sel = 0;
+    /* Старт на ПЕРВОМ активном пункте (первая строка — заголовок группы). */
+    while (g_sel < g_row_count && g_rows[g_sel].type == RT_GROUP) g_sel++;
+    if (g_sel >= g_row_count) g_sel = 0;
     g_scroll = 0;
     g_screen = RU_SYSTEMS;
     g_placeholder_sel = 0;
     g_prev = 0;
+    g_sd_ok = 0;
+    int dirty = 1;   /* рисовать только при изменении — иначе мерцание */
+    sd_enable();     /* PA15=1: включить слот SD (EN_SD активный уровень 1) */
+    sd_init_menu();  /* SDC0 + FAT32 перед браузером ромов */
+    set_led(1);
 
     for (;;) {
-        if (g_screen == RU_SYSTEMS) render_systems();
-        else if (g_screen == RU_BROWSER) render_browser();
-        else if (g_screen == RU_BUILTIN) render_builtin();
-        else if (g_screen == RU_PLACEHOLDER) render_placeholder();
-        else if (g_screen == RU_TRANSFER) render_transfer();
-        else if (g_screen == RU_SOUND) render_sound();
-        else render_settings_help();
+        if (dirty) {
+            if (g_screen == RU_SYSTEMS) render_systems();
+            else if (g_screen == RU_BROWSER) render_browser();
+            else if (g_screen == RU_BUILTIN) render_builtin();
+            else if (g_screen == RU_PLACEHOLDER) render_placeholder();
+            else if (g_screen == RU_TRANSFER) render_transfer();
+            else if (g_screen == RU_SOUND) render_sound();
+            else render_settings_help();
+            dirty = 0;
+        }
 
+        led_heartbeat();   /* мигание PL10 — индикатор жизни процессора */
         uint32_t p = wait_btn();
         if (p == 0) {
             wifi_layer_poll();
@@ -438,9 +550,17 @@ void retro_menu_run(void)
             continue;
         }
         if (g_screen == RU_SYSTEMS) {
-            if (p & BTN_UP)   { g_sel = (g_sel + g_row_count - 1) % g_row_count; }
-            else if (p & BTN_DOWN) { g_sel = (g_sel + 1) % g_row_count; }
-            else if (p & BTN_A) {
+            if (p & BTN_UP) {
+                int next = g_sel;
+                do { next = (next + g_row_count - 1) % g_row_count; } while (g_rows[next].type == RT_GROUP);
+                g_sel = next;
+                dirty = 1;
+            } else if (p & BTN_DOWN) {
+                int next = g_sel;
+                do { next = (next + 1) % g_row_count; } while (g_rows[next].type == RT_GROUP);
+                g_sel = next;
+                dirty = 1;
+            } else if (p & BTN_A) {
                 int r = g_sel;
                 if (g_rows[r].type == RT_SYS) {
                     g_sys = g_rows[r].idx;
@@ -458,12 +578,13 @@ void retro_menu_run(void)
                 } else if (g_rows[r].type == RT_ABOUT) {
                     g_screen = RU_ABOUT;
                 }
+                dirty = 1;
             } else if (p & BTN_START) {
                 return;                 /* выход из меню */
             }
         } else if (g_screen == RU_BUILTIN) {
-            if (p & BTN_UP)   { g_placeholder_sel = 0; }
-            else if (p & BTN_DOWN) { g_placeholder_sel = 1; }
+            if (p & BTN_UP)   { g_placeholder_sel = 0; dirty = 1; }
+            else if (p & BTN_DOWN) { g_placeholder_sel = 1; dirty = 1; }
             else if (p & BTN_A) {
                 if (g_placeholder_sel == 1) {
                     load_browser();
@@ -471,42 +592,48 @@ void retro_menu_run(void)
                 } else {
                     g_screen = RU_PLACEHOLDER;
                 }
+                dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;
+                dirty = 1;
             }
         } else if (g_screen == RU_BROWSER) {
             if (p & BTN_UP) {
                 if (g_browser_n > 1)
                     g_browser_sel = (g_browser_sel == 0) ? g_browser_n - 1 : g_browser_sel - 1;
+                dirty = 1;
             } else if (p & BTN_DOWN) {
                 if (g_browser_n > 1)
                     g_browser_sel = (g_browser_sel >= g_browser_n - 1) ? 0 : g_browser_sel + 1;
+                dirty = 1;
             } else if (p & BTN_A) {
                 g_screen = RU_PLACEHOLDER;
+                dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;
+                dirty = 1;
             }
         } else if (g_screen == RU_SETTINGS) {
-            /* 0 = Transfer, 1 = Sound test; здесь же обработка. */
-            if (p & BTN_DOWN) { g_settings_sel = 1; }
-            else if (p & BTN_UP) { g_settings_sel = 0; }
+            /* 0 = Transfer, 1 = Sound test */
+            if (p & BTN_DOWN) { g_settings_sel = 1; dirty = 1; }
+            else if (p & BTN_UP) { g_settings_sel = 0; dirty = 1; }
             else if (p & BTN_A) {
-                if (g_settings_sel == 0) {
-                    g_screen = RU_TRANSFER;
-                } else {
-                    g_screen = RU_SOUND;
-                }
+                g_screen = (g_settings_sel == 0) ? RU_TRANSFER : RU_SOUND;
+                dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;
+                dirty = 1;
             }
         } else if (g_screen == RU_TRANSFER) {
             int n = h3_wifi_scan_ap_count();
             if (p & BTN_UP) {
                 if (wifi_layer_started() && n > 0)
                     g_transfer_sel = (g_transfer_sel + n - 1) % n;
+                dirty = 1;
             } else if (p & BTN_DOWN) {
                 if (wifi_layer_started() && n > 0)
                     g_transfer_sel = (g_transfer_sel + 1) % n;
+                dirty = 1;
             } else if (p & BTN_A) {
                 if (!wifi_layer_started()) {
                     wifi_layer_start();
@@ -519,23 +646,27 @@ void retro_menu_run(void)
                 } else {
                     wifi_layer_rescan();
                 }
+                dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SETTINGS;
+                dirty = 1;
             }
         } else if (g_screen == RU_SOUND) {
-            /* Тест звука: A=play/stop, B=back (из старого main.c). */
             if (p & BTN_A) {
                 if (g_sound_on) { i2s_stop(); g_sound_on = 0; }
                 else { i2s_play_freq(g_sound_freq); g_sound_on = 1; }
+                dirty = 1;
             } else if (p & BTN_B) {
                 i2s_stop();
                 g_sound_on = 0;
                 g_screen = RU_SETTINGS;
+                dirty = 1;
             }
         } else {
             /* RU_PLACEHOLDER / HELP / ABOUT */
             if (p & BTN_B) {
                 g_screen = (g_screen == RU_PLACEHOLDER) ? RU_BROWSER : RU_SYSTEMS;
+                dirty = 1;
             }
         }
     }

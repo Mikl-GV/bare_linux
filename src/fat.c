@@ -19,13 +19,6 @@ static void fat_memcpy(uint8_t *d, const uint8_t *s, uint32_t n)
     while (n--) *d++ = *s++;
 }
 
-static int fat_strncmp(const char *a, const char *b, uint32_t n)
-{
-    while (n > 0 && *a && *a == *b) { a++; b++; n--; }
-    if (n == 0) return 0;
-    return (int)(unsigned char)*a - (int)(unsigned char)*b;
-}
-
 static void fat_strncpy(char *d, const char *s, uint32_t n)
 {
     while (n > 0 && *s) { *d++ = *s++; n--; }
@@ -247,30 +240,52 @@ fat_entry_t *fat_scratch(void)
     return g_scratch_dir;
 }
 
-/* Поиск каталога по пути вида "/roms" или "/roms/<система>". */
+/* Копировать запись каталога в out (без memcpy — проект без libc). */
+static void entry_copy(fat_entry_t *out, const fat_entry_t *src)
+{
+    out->first_cluster = src->first_cluster;
+    out->size = src->size;
+    fat_strncpy(out->name, src->name, FAT_NAME_LEN - 1);
+    out->name[FAT_NAME_LEN - 1] = 0;
+}
+
+/* Поиск каталога по пути. ""/"/" = корень раздела; "/roms/x" — папка x ВНУТРИ
+   /roms (структура как в корне проекта: /roms/nes, /roms/sms и т.д.). */
 static int path_lookup(const char *path, fat_entry_t *out)
 {
-    if (path[0] != '/') return -1;
-    const char *p = path + 1;
-    if (!*p) { out->first_cluster = g_root_cluster; out->size = 0; return 0; }
-    if (fat_strncmp(p, "roms", 4) == 0) p += 4;
-    if (*p == '/') p++;
-    if (!*p) { out->first_cluster = g_root_cluster; out->size = 0; return 0; }
-    /* одна подпапка (система) */
-    char name[FAT_NAME_LEN];
+    if (path[0] == '/' ) path++;
+    if (!*path) { out->first_cluster = g_root_cluster; out->size = 0; out->name[0] = 0; return 0; }
+    /* Первый компонент. */
+    char part[FAT_NAME_LEN];
     int ni = 0;
-    while (*p && *p != '/' && ni < FAT_NAME_LEN - 1) name[ni++] = *p++;
-    name[ni] = 0;
+    while (*path && *path != '/' && ni < FAT_NAME_LEN - 1) part[ni++] = *path++;
+    part[ni] = 0;
     fat_entry_t *dirs = g_scratch_dir;
     int n = read_dir(g_root_cluster, dirs, FAT_MAX_ENTRIES);
     for (int i = 0; i < n; i++) {
-        if (dirs[i].size == 0 && name_eq(dirs[i].name, name)) {
-            out->first_cluster = dirs[i].first_cluster;
-            out->size = dirs[i].size;
-            fat_strncpy(out->name, dirs[i].name, FAT_NAME_LEN - 1);
-            out->name[FAT_NAME_LEN - 1] = 0;
+        if (dirs[i].size != 0) continue;
+        if (!name_eq(dirs[i].name, part)) continue;
+        /* Если компонентов больше — второй уровень внутри папки. */
+        if (!*path) {   /* это и был каталог (первый уровень) */
+            entry_copy(out, &dirs[i]);
             return 0;
         }
+        if (*path != '/') return -1;
+        path++;
+        /* Второй компонент (система внутри /roms). */
+        char sub[FAT_NAME_LEN];
+        int si = 0;
+        while (*path && *path != '/' && si < FAT_NAME_LEN - 1) sub[si++] = *path++;
+        sub[si] = 0;
+        fat_entry_t *subs = g_scratch_dir;
+        int m = read_dir(dirs[i].first_cluster, subs, FAT_MAX_ENTRIES);
+        for (int k = 0; k < m; k++) {
+            if (subs[k].size == 0 && name_eq(subs[k].name, sub)) {
+                entry_copy(out, &subs[k]);
+                return 0;
+            }
+        }
+        return -1;
     }
     return -1;
 }
@@ -289,6 +304,140 @@ static int part_has_roms(uint32_t lba)
     int n = read_dir(rc, dirs, FAT_MAX_ENTRIES);
     for (int i = 0; i < n; i++)
         if (dirs[i].size == 0 && name_eq(dirs[i].name, "roms")) return 1;
+    return 0;
+}
+
+/* ================= Запись (посев папок) =================
+   Минимальная запись для создания КАТАЛОГОВ (посев отсутствующих папок
+   систем на SD по образцу fat_mkdir pico-retro). Запись файлов не
+   реализована (только чтение ромов). */
+
+/* 8.3 имя из строки (верхний регистр). */
+static void make_short_name(const char *name, uint8_t *out83)
+{
+    for (int i = 0; i < 11; i++) out83[i] = ' ';
+    int n = 0, total = 0;
+    while (name[total]) total++;
+    int keep = (total > 8) ? 6 : total;
+    for (int i = 0; name[i] && n < keep; i++) {
+        char c = name[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        out83[n++] = (uint8_t)c;
+    }
+    if (total > 8) { out83[6] = '~'; out83[7] = '1'; }
+}
+
+/* Свободный кластер по FAT. */
+static uint32_t find_free_cluster(void)
+{
+    for (uint32_t cl = 2; cl < 2 + g_total_clusters; cl++) {
+        uint32_t fat_off = cl * 4;
+        uint32_t sec = g_part_lba + g_reserved + (fat_off / 512);
+        if (h3_sdc0_read_sector(sec, g_sector) < 0) return 0;
+        uint32_t v = le32(g_sector + (fat_off % 512)) & 0x0FFFFFFFu;
+        if (v == 0) return cl;
+    }
+    return 0;
+}
+
+/* Записать значение в FAT (обе копии). */
+static int fat_set_cluster(uint32_t cl, uint32_t val)
+{
+    uint32_t fat_off = cl * 4;
+    uint32_t sec = g_part_lba + g_reserved + (fat_off / 512);
+    uint32_t off = fat_off % 512;
+    for (uint32_t copy = 0; copy < g_num_fats; copy++) {
+        uint32_t s = sec + copy * g_fat_size;
+        if (h3_sdc0_read_sector(s, g_sector) < 0) return -1;
+        uint32_t v = le32(g_sector + off) & 0xF0000000u;
+        v |= (val & 0x0FFFFFFFu);
+        g_sector[off]   = (uint8_t)(v & 0xFF);
+        g_sector[off+1] = (uint8_t)((v >> 8) & 0xFF);
+        g_sector[off+2] = (uint8_t)((v >> 16) & 0xFF);
+        g_sector[off+3] = (uint8_t)((v >> 24) & 0xFF);
+        if (h3_sdc0_write_sector(s, g_sector) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Пустая запись каталога (32 байта) в e. */
+static void make_dir_entry(uint8_t *e, const char *name, uint32_t cluster, int is_dot)
+{
+    for (int i = 0; i < 32; i++) e[i] = 0;
+    if (is_dot) {
+        make_short_name(is_dot == 1 ? "." : "..", e);
+    } else {
+        make_short_name(name, e);
+    }
+    e[11] = 0x10;   /* directory attr */
+    e[20] = (uint8_t)((cluster >> 16) & 0xFF);
+    e[21] = (uint8_t)((cluster >> 24) & 0xFF);
+    e[26] = (uint8_t)(cluster & 0xFF);
+    e[27] = (uint8_t)((cluster >> 8) & 0xFF);
+}
+
+/* Свободная запись в каталоге (пустая или удалённая). */
+static int find_free_entry(uint32_t cl, uint32_t *sec_out, int *off_out)
+{
+    uint32_t guard = 0;
+    uint32_t clim = chain_guard_limit();
+    while (cl && cl < 0x0FFFFFF8u && guard++ < clim) {
+        uint32_t base = cluster_to_sector(cl);
+        for (uint32_t s = 0; s < g_sec_per_cluster; s++) {
+            if (h3_sdc0_read_sector(base + s, g_sector) < 0) return -1;
+            for (int i = 0; i < 512; i += 32) {
+                uint8_t first = g_sector[i];
+                if (first == 0x00 || first == 0xE5) {
+                    *sec_out = base + s;
+                    *off_out = i;
+                    return 0;
+                }
+            }
+        }
+        cl = fat_next_cluster(cl);
+    }
+    return -1;
+}
+
+/* Создать каталог name в родителе parent_path (например "" или "roms").
+   Возвращает 0 при успехе, -1 при ошибке. */
+int fat_mkdir(const char *parent_path, const char *name)
+{
+    fat_entry_t parent;
+    if (path_lookup(parent_path, &parent) != 0) return -1;
+
+    uint32_t new_cl = find_free_cluster();
+    if (new_cl == 0) return -1;
+
+    /* Инициализировать кластер: "." и "..", остальные секторы — нули. */
+    uint32_t new_sec = cluster_to_sector(new_cl);
+    uint8_t zero[512];
+    for (int i = 0; i < 512; i++) zero[i] = 0;
+    make_dir_entry(zero, ".", new_cl, 1);
+    make_dir_entry(zero + 32, "..", parent.first_cluster, 2);
+    if (h3_sdc0_write_sector(new_sec, zero) < 0) return -1;
+    for (uint32_t s = 1; s < g_sec_per_cluster; s++) {
+        uint8_t empty[512];
+        for (int i = 0; i < 512; i++) empty[i] = 0;
+        if (h3_sdc0_write_sector(new_sec + s, empty) < 0) return -1;
+    }
+
+    /* В FAT: новый кластер = конец цепочки. */
+    if (fat_set_cluster(new_cl, 0x0FFFFFFFu) < 0) return -1;
+
+    /* Запись в родительском каталоге. */
+    uint32_t dummy_sec;
+    int off;
+    if (find_free_entry(parent.first_cluster, &dummy_sec, &off) < 0) return -1;
+    if (h3_sdc0_read_sector(dummy_sec, g_sector) < 0) return -1;
+    make_dir_entry(g_sector + off, name, new_cl, 0);
+    if (h3_sdc0_write_sector(dummy_sec, g_sector) < 0) return -1;
+
+    uart_print("fat: mkdir ");
+    uart_print(parent_path[0] ? parent_path : "/");
+    uart_print("/");
+    uart_print(name);
+    uart_print("\r\n");
     return 0;
 }
 

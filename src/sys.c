@@ -3,6 +3,11 @@
 #include "h3_ccu.h"
 #include "uart.h"
 
+/* Мигание LED (индикатор жизни процессора) — вызывается из udelay, чтобы
+   работать во ВСЕХ слоях (меню, WiFi join, звук, SD), а не только в меню.
+   Реализация в retro_menu.c/ports.c; здесь extern без включения ports.h. */
+extern void led_heartbeat(void);
+
 /* High-Speed Timer (HSTMR) на 0x01C60000, 64-bit счётчик вниз.
    Реально работает на ~96.8 МГц (берём 97). Читаем ТОЛЬКО CURNT_LO - по
    результатам стенда CURNT_HI на этой плате нестабилен. */
@@ -59,10 +64,16 @@ void udelay(uint32_t us)
        из-за целочисленного деления — uart_flush() вызывался на каждой
        итерации цикла задержки. */
     uint32_t flush_gap = HSTMR_MHZ * 50u / 1000000u;
+    uint32_t next_led  = HSTMR_CURNT_LO;
+    uint32_t led_gap   = HSTMR_MHZ * 250000u / 1000000u;   /* ~250 мс */
     while ((uint32_t)(cur - HSTMR_CURNT_LO) < ticks) {
         if ((uint32_t)(next_flush - HSTMR_CURNT_LO) >= flush_gap) {
             next_flush = HSTMR_CURNT_LO;
             uart_flush();
+        }
+        if ((uint32_t)(next_led - HSTMR_CURNT_LO) >= led_gap) {
+            next_led = HSTMR_CURNT_LO;
+            led_heartbeat();   /* мигание PL10 в любом слое */
         }
     }
     uart_flush();
