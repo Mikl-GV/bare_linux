@@ -4256,12 +4256,9 @@ static uint16_t g_qos_seq = 0;
 static uint32_t g_rx_dec_fail = 0;
 static uint32_t g_rx_dec_ok = 0;
 
-/* W.771 [чистка]: лимиты первичной RX-диагностики вынесены из static-локальных
-   в file-static, чтобы сбрасываться на каждой новой IP-сессии (h3_wifi_set_ip).
-   Раньше dbg_n/arp_n жили внутри h3_wifi_rx_poll и после 40 кадров (или 8 ARP)
-   молчали до перезагрузки — повторные сессии оставались без диагностики. */
-static int g_poll_dbg_n = 0;
-static int g_poll_arp_n = 0;
+/* Лимит первичного RX-дампа DHCP-парсера (join) — чтобы лог не тонул в
+   первых кадрах, пока идёт рукопожатие. В h3_wifi_rx_poll лимит не нужен:
+   там обрабатываются только штатные ARP/ICMP-запросы. */
 static int g_join_dbg_cnt = 0;   /* лимит первых RX-кадров в DHCP-парсере (join) */
 
 /* Прочитать наш MAC (REG_MACID 0x610-0x615), как в auth/assoc. Публичный,
@@ -4304,13 +4301,12 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
        OFFER работала и без этого блока, поэтому убираем как лишний и
        потенциально вредный. */
 
-    /* W.743 [LPS, корень «REQUEST не уходит в эфир»]: перед special-пакетом
-       (DHCP 0x0800 и EAPOL 0x888E) выводим FW из power-save через RPWM
+    /* W.743 [LPS, предусмотрительность]: перед special-пакетом (DHCP 0x0800 и
+       EAPOL 0x888E) выводим FW из power-save через RPWM
        (rtw_lps_ctrl_wk_cmd(LPS_CTRL_SPECIAL_PACKET) -> LPS_Leave ->
-       rtw_set_rpwm(S4)). Признак сна: первый кадр после 4-way уходит
-       (DISCOVER -> OFFER), а следующие пишутся в FIFO (txpost empty=0xFE,
-       loq_free=230 — страницы возвращаются), но в эфир НЕ уходят
-       (REQUEST #1..4 молчат). */
+       rtw_set_rpwm(S4)) — как драйвер для special-пакетов. Не было корнем
+       «REQUEST не уходит» (настоящий корень — seq в TX-дескрипторе, W.770),
+       но оставлено как шаг эталона: страховка от сна FW перед DHCP/EAPOL. */
     if (ethertype == 0x0800 || ethertype == 0x888E)
         h3_wifi_lps_leave();
 
@@ -5064,7 +5060,7 @@ int h3_wifi_join_ap(void)
            Assoc сразу в DHCP-цикл ниже (повторный DISCOVER/ожидание OFFER).
            Если 4-way уже был (secure=1) — DISCOVER уйдёт зашифрованным и OFFER
            расшифруется; если ещё нет — EAPOL-Start внизу запустит msg1. */
-        if (same_bssid && (msr & 0x01) && join_target.secure) {
+        if (same_bssid && (msr & 0x03) && join_target.secure) {
             uart_print("  join: already assoc+secure to same BSSID, skip auth->reDHCP\r\n");
             skip_auth = 1;
         }
@@ -5094,7 +5090,7 @@ int h3_wifi_join_ap(void)
                 int old_valid = 0;
                 for (int k = 0; k < 6; k++) old[k] = cur[k];
                 for (int k = 0; k < 6; k++) if (old[k] != 0xFF && old[k] != 0x00) old_valid = 1;
-                if ((msr & 0x01) && old_valid) {
+                if ((msr & 0x03) && old_valid) {
                     h3_wifi_tx_deauth(old, 3);        /* к СТАРОМУ BSSID */
                     udelay(10000);   /* W.690: было 100 мс — не нужно, фикс seq/CAM */
                     WLOG("  join: deauth old (switch net)\r\n");
@@ -5104,7 +5100,7 @@ int h3_wifi_join_ap(void)
                 h3_sdc_write_wlan_reg8(0x0102, 0x00);          /* MSR = NOLINK */
                 for (int k = 0; k < 6; k++) h3_sdc_write_wlan_reg8(0x0618 + k, 0x00);
                 WLOG("  join: msr=0 bssid=0 (switch net)\r\n");
-            } else if (msr & 0x01) {
+            } else if (msr & 0x03) {
                 /* тот же BSSID, уже associated — deauth к целевому (W.472). */
                 h3_wifi_tx_deauth(join_target.bssid, 3);
                 udelay(10000);   /* W.690: было 100 мс — не нужно, фикс seq/CAM */
@@ -5428,8 +5424,18 @@ int h3_wifi_join_ap(void)
 
     /* Шаг 5: перевести в STA-режим и записать BSSID AP (ассоциация состоялась). */
     {
-        /* MSR (0x0102) = 0x01 (STA mode) — до этого был NETTYPE_AP (0x02). */
-        h3_sdc_write_wlan_reg8(0x0102, 0x01);
+        /* MSR (0x0102) = 0x02 (_HW_STATE_STATION_, rtw_mlme_ext.h:59).
+           ВАЖНО (W.778, корень «ПК не может пинговать»): эталонные значения
+           (rtw_mlme_ext.h:57-60):
+             _HW_STATE_NOLINK_ = 0x00, _HW_STATE_ADHOC_ = 0x01,
+             _HW_STATE_STATION_ = 0x02, _HW_STATE_AP_ = 0x03.
+           Раньше писали 0x01 — это AD-HOC режим! При MSR=ADHOC чип неверно
+           классифицирует кадры: unicast от AP (ToDS/FromDS) принимал, а
+           broadcast-ARP от других клиентов (и все data с DA не-наш-MAC)
+           отфильтровывал — пинг с ПК не шёл, хотя плата↔шлюз работала.
+           Ставим 0x02 (STA/инфраструктура) — как драйвер в
+           rtw_mlme_ext_disconnect и после assoc. */
+        h3_sdc_write_wlan_reg8(0x0102, 0x02);
         /* W.760 [проверка BSSID]: REG_BSSID (0x618..0x61D) пишем НЕ побайтно,
            а 32+16 бит (как драйвер rtw_write32/rtw_write16 через CMD53
            byte-mode). Причина: для родственного REG_MACID (0x610) в проекте
@@ -5462,7 +5468,7 @@ int h3_wifi_join_ap(void)
             rb[5] = (uint8_t)((h >> 8) & 0xFF);
         }
         h3_sdc_read_wlan_reg8(0x0102, &msr);
-        int ok = (msr == 0x01);
+        int ok = (msr == 0x02);   /* W.778: STA (_HW_STATE_STATION_) = 0x02, не 0x01 */
         for (int k = 0; k < 6; k++)
             if (rb[k] != join_target.bssid[k]) ok = 0;
         uart_print("  join: bssid wr=");
@@ -6185,13 +6191,12 @@ uint32_t dp = fr + 24 + ((fcfc & 0x0080) ? 2 : 0)
         }
     }
 
-    /* W.763 [A/B-повтор, согласовано со сторонним разбором]: финальный RCR —
-       эталонный connected-набор 0x700060CE (CBSSID_DATA|CBSSID_BCN|
-       APP_PHYST_RXFF). Прежний переход на AAP (0x7000200F) был вызван
-       В.756/758, когда ARP не ловился при CBSSID — при ПОВРЕЖДЁННОЙ записи
-       BSSID. Теперь BSSID корректен (32+16, readback OK), поэтому с CBSSID
-       ARP должен приниматься, как у эталона Lakka, а fail=93 (чужие кадры
-       без PTK при AAP) — исчезнет. Если ARP снова пропадёт — вернём AAP. */
+/* W.763 [A/B-повтор, согласовано со сторонним разбором]: финальный RCR —
+   эталонный connected-набор 0x700060CE (CBSSID_DATA|CBSSID_BCN|
+   APP_PHYST_RXFF). W.777 откат: добавление ADF|AAP не дало broadcast
+   (bc=0 в логе W.776) и, возможно, ухудшило приём multicast — возврат
+   к эталонному набору. Broadcast-приём заработал после W.778 (MSR=0x02,
+   STA), а не за счёт RCR — набор остаётся эталонным. */
     h3_sdc_write_wlan_reg32(0x0608, 0x700060CEu);
     h3_sdc_write_wlan_reg16(0x06A0, 0xFFFF);   /* mgmt */
     h3_sdc_write_wlan_reg16(0x06A2, 0x0400);   /* ps-poll (эталон) */
@@ -6333,10 +6338,6 @@ void h3_wifi_set_ip(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw
         join_target.gw[k] = gw[k];
     }
     join_target.have_ip = 1;
-    /* W.771 [чистка]: новая IP-сессия — сбросить лимиты первичной RX-
-       диагностики, чтобы каждая сессия начиналась со свежего лога. */
-    g_poll_dbg_n = 0;
-    g_poll_arp_n = 0;
 }
 
 /* W.655 [пинг]: постоянный опрос RX-очереди после join. Для каждого
@@ -6394,51 +6395,10 @@ int h3_wifi_rx_poll(void)
                 if (fcfc & 0x4000) dp += 8;              /* CCMP header перед LLC */
                 if (dp + 8 <= acc) {
                     uint16_t etype = (uint16_t)((rxbuf[dp+6] << 8) | rxbuf[dp+7]);
-                    /* W.752 [диагностика L3]: ping/ARP не проходят — нужно
-                       видеть, доходят ли кадры к нашему MAC (unicast) и есть ли
-                       ARP-запрос. Печатаем первые 12 data-кадров (etype/uni/
-                       dec) и первые 8 ARP; не hot-path при отсутствии трафика. */
-                    {
-                        if (g_poll_dbg_n < 40) {
-                            uint8_t mac[6];
-                            h3_wifi_get_mac(mac);
-                            int uni = 1;
-                            for (int k = 0; k < 6; k++)
-                                if (rxbuf[fr + 4 + k] != mac[k]) { uni = 0; break; }
-                            uart_print("  poll: data plen=");
-                            uart_print_int((int)plen);
-                            uart_print(" etype=0x");
-                            uart_print_hex((uint32_t)etype);
-                            uart_print(" dec=");
-                            uart_print_int(decrypted);
-                            uart_print(" uni=");
-                            uart_print_int(uni);
-                            /* W.756: addr1 (dst MAC) — видно, кому адресован кадр. */
-                            uart_print(" a1=");
-                            for (int k = 0; k < 6; k++) {
-                                uart_print_hex((uint32_t)rxbuf[fr + 4 + k]);
-                                if (k < 5) uart_print(":");
-                            }
-                            uart_print("\r\n");
-                            g_poll_dbg_n++;
-                        }
-                    }
                     if (etype == 0x0800 && decrypted) {
                         net_handle_ipv4(&rxbuf[dp+8], (uint16_t)plen, sa, &st);
                         handled++;
                     } else if (etype == 0x0806 && decrypted) {
-                        if (g_poll_arp_n < 8) {
-                            g_poll_arp_n++;
-                            /* ARP: [6..7]=op, [14..17]=SPA, [24..27]=TPA. */
-                            uart_print("  poll: ARP op=");
-                            uart_print_int((rxbuf[dp+8+7]));
-                            uart_print(" tpa=");
-                            for (int k = 0; k < 4; k++) {
-                                uart_print_int((int)rxbuf[dp+8+24+k]);
-                                if (k < 3) uart_print(".");
-                            }
-                            uart_print("\r\n");
-                        }
                         net_handle_arp(&rxbuf[dp+8], (uint16_t)plen, sa, &st);
                         handled++;
                     }
@@ -6449,5 +6409,6 @@ int h3_wifi_rx_poll(void)
         off = (off + 7u) & ~7u;
     }
     }   /* W.758: конец drain-цикла (до 8 пакетов за вызов) */
+
     return handled;
 }

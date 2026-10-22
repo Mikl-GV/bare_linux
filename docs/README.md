@@ -5,18 +5,20 @@
 
 Цель проекта — поднять на голем железе всю периферию платы и её модули:
 работают **звук I2S0 → MAX98357A**, **HDMI-меню**, **SDIO-доступ
-к WiFi-чипу RTL8189FTV** (ассоциация, WPA2 4-way handshake, DHCP-обмен).
-В планах — превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
+к WiFi-чипу RTL8189FTV** (ассоциация, WPA2 4-way handshake, полный DHCP,
+ответы на ping с ПК).
 
-> Рабочее состояние (W.770): **полная host-ассоциация + WPA2 4-way handshake
-> + полный DHCP-цикл DISCOVER→OFFER→REQUEST→ACK** (корень найден — seq в
-> TX-дескрипторе, W.770). К любой сети из скана проходит ассоциация
+> Рабочее состояние (W.778): **полная host-ассоциация + WPA2 4-way handshake
+> + полный DHCP-цикл DISCOVER→OFFER→REQUEST→ACK** (корни найдены — seq в
+> TX-дескрипторе, W.770; MSR=0x02 STA вместо 0x01 ADHOC, W.778) **+ пинг с ПК
+> работает (0% потерь, ~14 мс)**. К любой сети из скана проходит ассоциация
 > (AuthResp=0 → AssocReq → AssocResp=0 → MSR=STA, rc=0): к открытым и WPA2-сетям
 > (A05s, MTS_GPON_9290e0). Криптоядро host-supplicant
 > (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap — проверено на хосте).
 > OFFER и ACK принимаются и распознаются (`net: DHCP OFFER/ACK ip=...`),
 > REQUEST уходит broadcast с опциями 50/54 (36-байт, без client-id).
-> IP сохраняется в global join_target; ARP/ICMP-ответы работают.
+> IP сохраняется в global join_target; ARP- и ICMP-ответы работают
+> (ping с ПК: ARP request→reply, ICMP echo→reply).
 > Шина SDIO — 50 МГц / 4-bit / HS (W.641), host не тянет многоблочный SDIO read
 > (только 1 блок/CMD53). Повторные сканы (rescan) работают (W.664).
 
@@ -28,7 +30,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | ✅ | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров + полный DHCP (DISCOVER→OFFER→REQUEST→ACK, W.770). |
+| **WiFi RTL8189FTV (SDIO)** | ✅ | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров + полный DHCP (DISCOVER→OFFER→REQUEST→ACK, W.770) + **пинг с ПК (0% потерь, W.778)**. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -85,9 +87,9 @@
   причине, зависящей от power-state. Ассоциация идёт host-кадрами
   Auth/Assoc через RX-путь.
 
-Ближайший шаг: **пинг с ПК** (критерий связности — ICMP-ответ реализован),
-затем WebDAV/HTTP-сервер для доступа к SD из проводника Windows. Цель —
-«эмулятор + сетевой доступ к ROM на SD».
+Ближайший шаг: **WebDAV/HTTP-сервер для доступа к SD из проводника Windows**
+(связность с ПК уже подтверждена: ping с ПК — 0% потерь, W.778).
+Цель — «эмулятор + сетевой доступ к ROM на SD».
 Подробности: `NEXT-QUESTIONS.md`, `HARDWARE.md`.
 
 ---

@@ -11,12 +11,12 @@ static uint8_t dhcp_offer_ip[4];
 static uint8_t dhcp_server_id[4];
 static uint8_t dhcp_offer_seen;
 
-/* W.722 [корень «OFFER есть, ACK нет»]: первый REQUEST нельзя отправлять
-   из парсера OFFER — он вызывается ВНУТРИ чтения RX-FIFO (SDIO), и запись
-   в TX-очередь в этот момент теряет кадр: DISCOVER уходит из главного цикла
-   и доходит (OFFER приходит), а REQUEST из RX-контекста не доходит — ACK
-   нет, AP нас «не видит», пинг не идёт. Теперь парсер только поднимает
-   флаг, а отправку делает главный цикл join. */
+/* W.722 [гипотеза пересмотрена в W.770]: первый REQUEST отправляется из
+   главного цикла join, а не из парсера OFFER (парсер вызывается внутри
+   чтения RX-FIFO и не должен писать в TX-очередь — это делает главный цикл).
+   Собственно корнем «OFFER есть, ACK нет» оказался seq в TX-дескрипторе
+   (W.770), но вынос REQUEST из RX-контекста оставлен как правильная
+   архитектура: TX-записи делаются только из главного контекста. */
 static int dhcp_request_pending;
 
 /* W.650: последний известный адрес (из OFFER/ACK) — для отображения на экране. */
@@ -388,7 +388,7 @@ void net_handle_ipv4(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
     if (ihl < 20 || ihl > len) return;
     proto = pkt[9];
 
-    if (proto == 1) {                 /* ICMP */
+    if (proto == 1) {                 /* ICMP echo-request — отвечаем */
         net_icmp_reply(pkt, len, ihl, src_mac, st);
         return;
     }
@@ -561,22 +561,7 @@ void net_handle_arp(const uint8_t *pkt, uint16_t len, const uint8_t *src_mac,
     if (pkt[1] != 0x01 || pkt[2] != 0x08 || pkt[3] != 0x00) return;  /* eth/IPv4 */
     if (pkt[4] != 6 || pkt[5] != 4) return;                          /* MAC/IP */
 
-    /* W.755 [диагностика L2]: входящий ARP-REPLY печатаем всегда — это ответ
-       на наш ARP-probe к шлюзу (проверка связности без участия ПК). */
-    if (pkt[6] == 0x00 && pkt[7] == 0x02) {
-        uart_print("  net: ARP REPLY from ");
-        for (k = 0; k < 6; k++) {
-            uart_print_hex((uint32_t)pkt[8 + k]);
-            if (k < 5) uart_print(":");
-        }
-        uart_print(" ip=");
-        for (k = 0; k < 4; k++) {
-            uart_print_int((int)pkt[14 + k]);
-            if (k < 3) uart_print(".");
-        }
-        uart_print("\r\n");
-        return;
-    }
+    if (pkt[6] == 0x00 && pkt[7] == 0x02) return;                    /* reply — не отвечаем */
     if (!st->have) return;
     if (pkt[6] != 0x00 || pkt[7] != 0x01) return;                    /* request */
     for (k = 0; k < 4; k++) if (pkt[24+k] != st->ip[k]) return;      /* tpa != наш IP */

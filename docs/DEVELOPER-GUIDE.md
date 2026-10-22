@@ -157,7 +157,11 @@ seq данных в TX-дескрипторе).
 2. Загрузка с SD после U-Boot: не забыть, что U-Boot гасит GIC/такты (см. HARDWARE §6).
 3. `data-probe rc=0` после 50 МГц — шина жива; иначе fallback 1-bit (W.641 rollback).
 4. Скан: `rxlen>0` на каналах, `BCN plen=... ssid=...` — приём работает.
-5. Join: auth/assoc rc=0, MSR=STA; WPA2: msg1→msg4 + `cam keys loaded` (seccfg=0x10C).
+5. Join: auth/assoc rc=0, MSR=STA (**0x0102 == 0x02** — при 0x01/ADHOC чип
+   режет broadcast и FromDS от других STA, пинг с ПК не идёт, W.778);
+   WPA2: msg1→msg4 + `cam keys loaded` (seccfg=0x10C).
+6. Пинг с ПК: в логе платы `msr=0x00000002 OK`, `net: ARP reply`,
+   `ICMP reply from <ПК>` — приём broadcast/unicast жив.
 
 ## 9. Эмуляторы (перспектива)
 

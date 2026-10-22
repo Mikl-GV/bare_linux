@@ -397,9 +397,8 @@ int wifi_layer_rescan(void)
 }
 
 /* W.655 [пинг]: постоянный опрос сетевого RX в главном цикле. Если адрес
-   ещё не подтверждён ACK — принимает адрес из OFFER (fallback, один раз),
-   чтобы L3 поднялся и стали работать ARP/ICMP. Затем h3_wifi_rx_poll()
-   обрабатывает входящие кадры (ping). */
+   получен по ACK (или по OFFER-фолбэку) — поднимает L3 и обрабатывает
+   входящие кадры (ARP/ICMP) через h3_wifi_rx_poll(). */
 int wifi_layer_poll(void)
 {
     if (!wifi_started) return 0;
@@ -450,13 +449,6 @@ int wifi_layer_poll(void)
                 offer_fallback_done = 1;
                 uart_print("  poll: IP accepted from OFFER (no ACK)\r\n");
             }
-            /* W.763 [по стороннему разбору]: probe на шлюз убран. probe на
-               server/gw IP (10.66.97.230) со стороны AP выглядит как
-               «клиент занял адрес сервера» (конфликт с DHCP-сервером) и
-               может блокировать выдачу ACK. DAD за нас делает сама AP —
-               видно в логе: poll: ARP op=1 tpa=<наш IP> -> net: ARP reply.
-               Проверка приёма на L2 сохраняется этими ARP-ответами. */
-            (void)0;
         } else {
             return 0;                                /* адреса ещё нет */
         }

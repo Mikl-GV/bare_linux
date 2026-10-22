@@ -27,8 +27,8 @@ int wifi_layer_connect(int index);
 int wifi_layer_rescan(void);
 
 /* W.655 [пинг]: постоянный опрос сетевого RX в главном цикле. Принимает
-   адрес (OFFER fallback или ACK) и обрабатывает входящие ARP/ICMP
-   (отвечает на ping). Возвращает число обработанных кадров. */
+   адрес (по DHCP ACK, при его отсутствии — по OFFER-фолбэку) и обрабатывает
+   входящие ARP/ICMP (отвечает на ping). Возвращает число обработанных кадров. */
 int wifi_layer_poll(void);
 
 #endif /* WIFI_LAYER_H */
