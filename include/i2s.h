@@ -42,12 +42,6 @@ int  i2s_write(const int16_t *pcm, unsigned frames);
 unsigned i2s_space(void);
 unsigned i2s_buffered(void);
 
-/* Проиграно кадров с момента i2s_start() — для A/V-синхронизации. */
-uint64_t i2s_position(void);
-
-/* Недогрузки: i2s_write() при пустом кольце (данные кончились раньше записи). */
-unsigned i2s_underruns(void);
-
 /* Заглушить усилитель (PA10). */
 void i2s_mute(int mute);
 

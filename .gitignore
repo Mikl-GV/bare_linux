@@ -50,3 +50,7 @@ docs/GITHUB-TOKEN.md
 # Локальные UART-каптуры
 uart_capture.txt
 
+# Сетевые захваты (pcapng/сниффер) — сырые данные, не в репо
+*.pcapng
+*.pcap
+

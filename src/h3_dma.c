@@ -308,5 +308,3 @@ void h3_dma_audio_stop(void)
     DMA_IRQ_STAT_REG(n) |= mask;
     __asm volatile("dmb sy" ::: "memory");
 }
-
-int h3_dma_audio_chan(void) { return g_ch; }

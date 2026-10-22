@@ -209,14 +209,6 @@ unsigned i2s_space(void)
     return RING_FRAMES - i2s_buffered();
 }
 
-uint64_t i2s_position(void)
-{
-    if (g_ready && g_run) poll_played();
-    return g_played;
-}
-
-unsigned i2s_underruns(void) { return g_underruns; }
-
 int i2s_set_rate(unsigned fs)
 {
     if (fs != 48000u && fs != 44100u) return -1;

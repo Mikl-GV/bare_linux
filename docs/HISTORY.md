@@ -52,3 +52,28 @@
   выключенном флаге; фикс повторного скана (rx_seq, W.664); комментарии
   приведены к коду (boot.s, частота SDIO, место вызова set_clk_50mhz).
 - Точка восстановления: **restore-2026-10-21** (заменяет все старые теги).
+
+## Этап 6 — DHCP ACK найден, W.670-W.771
+
+- **Корень «OFFER есть, ACK никогда» (W.770, подтверждён pcap на канале 1):
+  Sequence Control для QoS-data писался только в 802.11-заголовок, а чип
+  RTL8189FTV при HWSEQ_EN=0 берёт seq из TX-дескриптора
+  (SET_TX_DESC_SEQ_8188F: pTxDesc+36, биты 12..23 = байты 37/38). Байты
+  37/38 оставались 0 → все data-кадры уходили с seq=0 → AP отбрасывала
+  REQUEST как дубликат (SA, TID0, seq), OFFER был, ACK — никогда.**
+  Фикс: `buf[37]=(seq&0xF)<<4`, `buf[38]=seq>>4`, `g_qos_seq++` (сброс в join).
+  Результат W.770: **DHCP ACK получен** (ip=10.66.97.32, msg=5, bc=1, dec=1).
+- RCR приведён к эталону 0x700060CE (W.763, A/B после фикса BSSID) —
+  `rx dec fail` 93→0, дескрипторы читаются верно.
+- Полнота инициализации чипа по эталону (W.765-768): _InitBurstPktLen_8188FS
+  (0x4C7/0x60C/0x4CA/0x512), rtl8188f_InitBeaconParameters (0x540/0x510/0x559),
+  _InitPABias (eFuse 0x1FA). Диагностика этих блоков выведена в постоянный лог.
+- DHCP-чистка: opt61 убрана из REQUEST (W.766, консистентный client-id,
+  длина 299→290).
+- Аудит 2026-10-22: удалён мёртвый код (net_arp_probe, net_dhcp_set_bssid,
+  h3_wifi_target_is_set/captured, h3_wifi_get_bssid, sdc_diag_pseq_cmd,
+  i2s_position/underruns, h3_dma_audio_chan); TXDIAG camx → печать RA+CAM;
+  комментарий WIFI_TX_DIAG приведён к коду.
+- Чистка RX-диагностики (W.771): static-лимиты dbg_n/arp_n/dbg_cnt вынесены
+  в file-static и сбрасываются на новую IP-сессию/join.
+- Точка восстановления: **restore-2026-10-22**.

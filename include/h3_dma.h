@@ -28,9 +28,6 @@ int  h3_dma_audio_init(uint32_t buf_phys, uint32_t buf_bytes, int periods);
 void h3_dma_audio_start(void);
 void h3_dma_audio_stop(void);
 
-/* Номер фактически используемого канала после init, или -1. */
-int  h3_dma_audio_chan(void);
-
 /* Текущее смещение чтения внутри кольца в байтах (0..buf_bytes-1).
  * Читает CUR_SRC канала (0x10, RO — HARDWARE-REF.md:51); если значение вне
  * диапазона буфера (канал остановлен/не инициализирован) — возвращает

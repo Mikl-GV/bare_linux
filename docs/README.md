@@ -8,14 +8,15 @@
 к WiFi-чипу RTL8189FTV** (ассоциация, WPA2 4-way handshake, DHCP-обмен).
 В планах — превратить плату в эмулятор ретроконсолей с сетевым доступом к ROM на SD.
 
-> Рабочее состояние (W.669): **полная host-ассоциация + WPA2 4-way handshake
-> + DHCP-обмен** (DISCOVER→OFFER→REQUEST→(ACK в работе)). К любой сети из скана
-> проходит ассоциация (AuthResp=0 → AssocReq → AssocResp=0 → MSR=STA, rc=0):
-> к открытым и WPA2-сетям (A05s, MTS_GPON_9290e0). Криптоядро host-supplicant
+> Рабочее состояние (W.770): **полная host-ассоциация + WPA2 4-way handshake
+> + полный DHCP-цикл DISCOVER→OFFER→REQUEST→ACK** (корень найден — seq в
+> TX-дескрипторе, W.770). К любой сети из скана проходит ассоциация
+> (AuthResp=0 → AssocReq → AssocResp=0 → MSR=STA, rc=0): к открытым и WPA2-сетям
+> (A05s, MTS_GPON_9290e0). Криптоядро host-supplicant
 > (SHA-1/HMAC-SHA1/PBKDF2-PRF/MIC, AES-128, RFC3394 unwrap — проверено на хосте).
-> OFFER принимается и распознаётся (`net: DHCP OFFER ip=...`), REQUEST отправлен
-> с опциями 50/54/61 и ciaddr, но ACK пока не приходит (в работе). IP сохраняется
-> в global join_target; ARP/ICMP-ответы работают (fallback по OFFER).
+> OFFER и ACK принимаются и распознаются (`net: DHCP OFFER/ACK ip=...`),
+> REQUEST уходит broadcast с опциями 50/54 (36-байт, без client-id).
+> IP сохраняется в global join_target; ARP/ICMP-ответы работают.
 > Шина SDIO — 50 МГц / 4-bit / HS (W.641), host не тянет многоблочный SDIO read
 > (только 1 блок/CMD53). Повторные сканы (rescan) работают (W.664).
 
@@ -27,7 +28,7 @@
 |---|---|---|
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Полный подъём DE2/TCON1/HDMI по u-boot (без U-Boot FB), кнопки PCF8574, LED PL10. |
-| **WiFi RTL8189FTV (SDIO)** | 🚧 | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров (DHCP через HIQ) + DHCP OFFER/REQUEST. DHCP ACK — в работе. |
+| **WiFi RTL8189FTV (SDIO)** | ✅ | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров + полный DHCP (DISCOVER→OFFER→REQUEST→ACK, W.770). |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -51,16 +52,15 @@
    вызов из пункта меню Transfer. Полная ассоциация (rc=0, MSR=STA)
    к открытым и WPA2-сетям; при смене BSSID шлётся deauth и выполняется
    drain RX FIFO перед новым auth (фикс flaky rc=-4).
-8. **DHCP (W.395-W.669)**: после assoc отправляется DHCP DISCOVER
+8. **DHCP (W.395-W.770)**: после assoc отправляется DHCP DISCOVER
    (IP proto=UDP, broadcast); приём data-кадров после assoc (ARP/IPv6)
    подтверждён. При WPA2 — пересылается после handshake (зашифрованный CCMP).
-   OFFER принимается (`net: DHCP OFFER ip=...`), REQUEST (uni/broadcast, опции
-   50/54/61, ciaddr=предлагаемый IP) отправлен + ретраи +3с/+6с; получение
-   **ACK — в работе** (W.669). IP сохраняется в global join_target (W.595).
-   Длина кадра с 8-байтным CCMP IV = 320 Б (3 страницы) — такие кадры идут
-   через **HIQ** (W.584), 2-стр — через LOQ. OFFER принимается и распознаётся
-   (`net: DHCP OFFER ip=...`, фикс портов W.590), REQUEST отправлен; получение
-   **DHCP ACK — в работе**. IP сохраняется в global join_target (W.595).
+   OFFER принимается (`net: DHCP OFFER ip=...`), REQUEST (broadcast, опции
+   50/54, без client-id) отправлен + ретраи +3с/+6с; **ACK принимается
+   (W.770 — корень: seq в TX-дескрипторе)**. IP сохраняется в global
+   join_target (W.595). Длина кадра с 8-байтным CCMP IV ≈ 320 Б (3 страницы)
+   — данные идут через LOQ (W.705); приём OFFER/ACK распознаётся
+   (`net: dhcp 67->68 op=2 msg=2/5`, фикс портов W.590).
 9. **WPA2 (W.412-W.597)**: криптоядро host-supplicant готово; против WPA2-AP
    проходит полный 4-way handshake: EAPOL msg1 → msg2 (принят AP, nonce min/max
    фикс) → msg3 (GTK unwrap через RFC3394) → msg4 (key_info 0x030A, secure bit)
@@ -85,10 +85,9 @@
   причине, зависящей от power-state. Ассоциация идёт host-кадрами
   Auth/Assoc через RX-путь.
 
-Ближайший шаг: добиться **DHCP ACK после REQUEST** (после `cam keys
-loaded` DISCOVER пересылается зашифрованным CCMP, OFFER принимается, REQUEST
-уходит; ждём ACK → IP), затем пинг с ПК и WebDAV-сервер. Цель — «эмулятор +
-сетевой доступ к ROM на SD».
+Ближайший шаг: **пинг с ПК** (критерий связности — ICMP-ответ реализован),
+затем WebDAV/HTTP-сервер для доступа к SD из проводника Windows. Цель —
+«эмулятор + сетевой доступ к ROM на SD».
 Подробности: `NEXT-QUESTIONS.md`, `HARDWARE.md`.
 
 ---

@@ -61,6 +61,13 @@ int wifi_layer_start(void)
             uart_print("  sdio_init FAIL rc=");
             uart_print_int(rc);
             uart_print("\r\n");
+            /* W.739 [аудит]: при сбое инициализации контроллера слой НЕ
+               помечаем запущенным. Раньше wifi_started ставился безусловно
+               ниже — UI «Transfer» показывал «running» и вызывал
+               h3_wifi_tx_probe_req/join на неинициализированный чип.
+               Выход сразу, чтобы wifi_layer_started()==0. */
+            uart_print("wifi FAIL\r\n");
+            return rc;
         }
         if (rc == 0) {
             wifi_active = 1;
@@ -154,17 +161,25 @@ int wifi_layer_start(void)
                         for (int k = 0; k < 6; k++)
                             if (mac[k] == 0xFF || mac[k] == 0x00) { valid = 0; break; }
                         if (!valid) {
+                            /* eFuse пуст/биттая: генерируем ЛОКАЛЬНО-АДМИНИСТРИРУЕМЫЙ
+                               MAC (02:...), как это делает эталонная Lakka в драйвере
+                               8189fs (02:81:38:...). Первый октет 0x02 = unicast +
+                               locally administered — валиден для DHCP. */
+                            /* W.712 [проверка MAC-гипотезы — ОТКЛОНЕНА в W.713]: вендорский MAC
+                               00:E0:4C не изменил поведение (OFFER так же
+                               приходил только на A05s, ACK не появился).
+                               Дело не в MAC — вернулись к своему
+                               локально-администрируемому 02:11:22:xx. */
                             uint32_t t = micros();
-                            mac[0] = 0x02; mac[1] = 0x00; mac[2] = 0x00;
+                            mac[0] = 0x02; mac[1] = 0x11; mac[2] = 0x22;
                             mac[3] = (uint8_t)(t >> 16);
                             mac[4] = (uint8_t)(t >> 8);
                             mac[5] = (uint8_t)(t);
                         }
-                        /* W.659 [эксперимент]: efuse отдаёт локально администрируемый
-                           MAC (02:...). Android-хотспот (A05s) может отбрасывать такой
-                           при DHCP (защита от клонирования): OFFER шлёт, ACK на
-                           REQUEST — нет. Сбрасываем локальный бит (02 -> 00). */
-                        mac[0] = 0x00;
+                        /* W.672: УБРАНО принудительное mac[0]=0x00 (эксперимент W.659).
+                           Он давал MAC 00:00:00:xx — невалидный OUI, DHCP-сервер
+                           (A05s/dnsmasq) молча дропает REQUEST от клиента с нулевым
+                           OUI. Эталон живой Lakka работает с 02:81:38:27:88:cd. */
                     }
                     uart_print(" mac=");
                     for (int k = 0; k < 6; k++) {
@@ -249,12 +264,17 @@ int wifi_layer_start(void)
    (h3_wifi_scan_capture_target -> h3_wifi_join_ap БЕЗ повторного скана).
    Возвращает: 0 = ассоциация подтверждена; -1 = плохой индекс; иначе
    код от h3_wifi_join_ap (например -4 — AuthResp не пришла). */
-/* W.612 [анти-спам join]: не давать серию connect подряд. Флаг занятости
-   (join_in_progress) + кулдаун 3 с между вызовами. Это убирает поток
-   rc=-6 → rc=-4 → rc=-4 (W.606, MTS), от которого точка «охуевает». */
+/* W.612→W.690 [корень]: кулдаун 3 с был ИСКУССТВЕННЫМ ТОРМОЗОМ переходов
+   между сетями (живая Lakka переключается мгновенно). Причина W.606
+   (flood rc=-6/-4/-4) была не в скорости join, а в грязном состоянии
+   (seq=0, MSR/CAM не сброшены — исправлено W.687/W.689). После фиксов
+   кулдаун не нужен; оставляем 200 мс — только против дребезга двойного
+   клика, не против быстрых переходов. */
 static int join_in_progress = 0;
 static uint32_t last_join_ms = 0;
-#define JOIN_COOLDOWN_MS 3000
+/* W.707: флаг «IP уже принят» — сбрасывается при каждом connect (см. ниже). */
+static int offer_fallback_done = 0;
+#define JOIN_COOLDOWN_MS 200
 
 int wifi_layer_connect(int index)
 {
@@ -278,6 +298,7 @@ int wifi_layer_connect(int index)
         uart_print("ms)\r\n"); return -11;
     }
     join_in_progress = 1;
+    offer_fallback_done = 0;   /* W.707: новый join — IP новой сети принимаем заново */
 
     uart_print("join: sel=");
     uart_print_int(index);
@@ -381,8 +402,42 @@ int wifi_layer_rescan(void)
    обрабатывает входящие кадры (ping). */
 int wifi_layer_poll(void)
 {
-    static int offer_fallback_done = 0;
     if (!wifi_started) return 0;
+
+    /* W.743: фоновые ретраи DHCP. Пока ACK не пришёл, REQUEST ретраится
+       с backoff (2/4/8/16 с). Если ACK нет и после серии попыток — сервер,
+       вероятно, потерял состояние (или наш REQUEST не дошёл): начинаем
+       НОВЫЙ цикл DHCP (net_dhcp_reset + DISCOVER с новым xid), а не долбим
+       REQUEST вечно. Иначе в логе бесконечные строки REQUEST каждые ~12 с. */
+    if (net_dhcp_offer_pending()) {
+        static uint32_t last_req_ms = 0;
+        static int req_retries = 0;
+        uint8_t ip[4], mk[4], gw[4];
+        int ack = 0;
+        int have = net_dhcp_get_ip(ip, mk, gw, &ack);
+        if (have && !ack) {
+            uint32_t now = micros() / 1000;
+            uint32_t gap = 2000u << (req_retries < 3 ? req_retries : 3);
+            if (last_req_ms == 0 || (uint32_t)(now - last_req_ms) >= gap) {
+                if (req_retries < 4) {
+                    net_dhcp_request();
+                    req_retries++;
+                } else {
+                    /* Серия REQUEST без ACK исчерпана — перезапуск DHCP. */
+                    uart_print("  poll: DHCP restart (no ACK, rediscover)\r\n");
+                    net_dhcp_reset();          /* новый xid + чистое состояние */
+                    net_dhcp_discover(0);      /* st не используется */
+                    req_retries = 0;
+                }
+                last_req_ms = now;
+            }
+        } else {
+            /* ACK получен (или адреса нет) — сбросить счётчик ретраев. */
+            last_req_ms = 0;
+            req_retries = 0;
+        }
+    }
+
     {
         uint8_t ip[4], mk[4], gw[4];
         int ack = 0;
@@ -395,6 +450,13 @@ int wifi_layer_poll(void)
                 offer_fallback_done = 1;
                 uart_print("  poll: IP accepted from OFFER (no ACK)\r\n");
             }
+            /* W.763 [по стороннему разбору]: probe на шлюз убран. probe на
+               server/gw IP (10.66.97.230) со стороны AP выглядит как
+               «клиент занял адрес сервера» (конфликт с DHCP-сервером) и
+               может блокировать выдачу ACK. DAD за нас делает сама AP —
+               видно в логе: poll: ARP op=1 tpa=<наш IP> -> net: ARP reply.
+               Проверка приёма на L2 сохраняется этими ARP-ответами. */
+            (void)0;
         } else {
             return 0;                                /* адреса ещё нет */
         }

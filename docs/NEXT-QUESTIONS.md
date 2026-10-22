@@ -1,41 +1,57 @@
 # NEXT-QUESTIONS.md — текущее состояние и ближайшие шаги
 
-> Замена `NEXT-CHAT-PROMPT.md` (личный промпт удалён). Ревизия: 2026-10-21 (W.669).
+> Замена `NEXT-CHAT-PROMPT.md` (личный промпт удалён). Ревизия: 2026-10-22 (W.770).
 
-## 1. Актуальный статус (W.669)
+## 1. Актуальный статус (W.770)
 
 - **WiFi-слой полностью работает**: SDIO 50 МГц/4-bit/HS, пwon/fwdl/MAC/LCK/IQK,
   скан 13 каналов (повторные rescan работают, W.664), host-ассоциация, WPA2
-  4-way handshake (msg1→msg4, PTK/GTK в CAM), DHCP DISCOVER→OFFER→REQUEST.
-- **Открыто**: DHCP ACK на A05s не приходит (OFFER есть, REQUEST с опциями 50/54/61
-  и ciaddr уходит, сервер молчит). ARP/ICMP работают (fallback IP из OFFER).
+  4-way handshake (msg1→msg4, PTK/GTK в CAM), DHCP полный цикл.
+- **DHCP ACK получен (W.770)** — см. §2. После join работает ARP/ICMP
+  (fallback IP из OFFER устранён: теперь IP только из ACK/OFFER через
+  `net_dhcp_get_ip`).
 - Цель этапа: WebDAV-сервер в прошивке → доступ к файлам на SD из проводника Windows.
 
-## 2. DHCP ACK — диагностика и гипотезы (W.658-W.669)
+## 2. DHCP ACK — корень найден и устранён (W.770)
 
-Симптом (лог W.668): `net: DHCP OFFER ip=10.66.97.228` → `REQUEST sent` →
-`REQUEST len=299 opt61=1 opt50=1 opt54=1` → retry #1/#2 → `WPA2 pending (eapol=2),
-no DHCP/IP` → `poll: IP accepted from OFFER (no ACK)`.
+**Симптом (до W.770):** `OFFER есть, ACK никогда`. REQUEST уходил, сервер молчал,
+через серию ретраев прошивка падала на `poll: DHCP restart (no ACK, rediscover)`.
 
-Сделано (W.650-W.669):
-- `dhcp_xid` новый на каждую сессию; `dhcp_offer_seen` не сбрасывается в DISCOVER,
-  сброс на старте join; REQUEST только на первый OFFER; опции 61 (client-id),
-  50 (requested-ip), 54 (server-id); ciaddr=предложенный IP + src IP (стиль RENEW);
-  REQUEST broadcast L2 → dst_ip=server; ретраи +3с/+6с; диагностика входящих DHCP
-  (net: dhcp ports→op→msg) теперь **безусловная** (W.669) — станет видно, приходит
-  ли ACK/NAK.
+**Причина (по pcap на канале 1, расшифровка с паролем A05s):**
+Sequence Control для QoS-data писался только в 802.11-заголовок
+(`f[22..23] = g_qos_seq`), а чип RTL8189FTV при `HWSEQ_EN=0` берёт seq
+**из TX-дескриптора** — `SET_TX_DESC_SEQ_8188F(pTxDesc+36, 12, 12)` = байты
+37/38 мало-эндиан (`buf[37]=seq[3:0]<<4`, `buf[38]=seq[11:4]`). Байты 37/38
+оставались нулевыми → **все data-кадры уходили с seq=0**. Точка отбрасывала
+2-й и последующие REQUEST как дубликаты (SA, TID0, seq), поэтому DISCOVER
+проходил (первый кадр цикла), а REQUEST — нет.
 
-Гипотезы (очередность проверки):
-1. ACK приходит, но отбрасывается на xid/parse — видно по новой диагностике `net: dhcp`.
-2. REQUEST не выгружается из TX FIFO — проверка `txpost empty/fq` (W.669).
-3. Сервер не отвечает на REQUEST с ciaddr (dnsmasq A05s) — вариант: вернуть
-   SELECTING-форму (ciaddr=0), убрать опцию 61, unicast на server.
-4. Порядок: OFFER→REQUEST должен держать тот же xid, а опции 50/54 обязаны
-   совпадать с OFFER (проверить в логе).
+**Фикс (W.770):** для `qos_data` пишем seq в дескриптор
+(`buf[37]`, `buf[38]`), `g_qos_seq` инкрементируется на каждый кадр,
+сбрасывается при новом join. Ретраи повторяют тот же кадр → тот же seq
+(корректная 802.11-семантика).
+
+**Результат W.770 (лог):**
+```
+join: dhcp REQUEST req0 t=71        (seq=1 в дескрипторе)
+join: dhcp REQUEST retry #1 t=570   (seq=2)
+net: dhcp 67->68 op=2 msg=5         ← DHCP ACK
+net: DHCP ACK ip=10.66.97.32  mask=255.255.255.0  gw=10.66.97.230  dns=10.66.97.230
+join: post-offer rx bc=1 uni=0 mc=5
+join: rx dec ok=7 fail=0
+join: DHCP OK ip=10.66.97.32
+```
+
+Что осталось проверить по DHCP (вторично):
+- Другие точки/хотспоты (MTS_GPON, iPhone) — `/proc/net/rtl8189fs` не доступен,
+  просто прогон подключения.
+- Второй join в той же сессии — повторный DHCP должен давать ACK (проверено
+  на A05s: да, но желательно на стенде ещё раз после чистки).
 
 ## 3. После DHCP ACK
 
-1. Пинг с ПК (критерий связности).
+1. **Пинг с ПК** (критерий связности) — ICMP echo-ответ реализован
+   (`net_icmp_reply` в wifi_net.c), принимается через `h3_wifi_rx_poll`.
 2. WebDAV/HTTP-сервер на SD-карте (доступ из проводника Windows как сетевое
    расположение). SMB отклонён (тяжёлый для bare-metal).
 3. Параллельно: слой эмуляторов ретроконсолей (не зависит от сети).
@@ -45,7 +61,8 @@ no DHCP/IP` → `poll: IP accepted from OFFER (no ACK)`.
 - Host SDIO не тянет многоблочный read CMD53 (1 блок за раз).
 - RX0_REQ_LEN (0x1C) = накопленный объём, не один кадр.
 - C2H-ABSENT на scan/NOLINK — ассоциация host-кадрами, не H2C.
-- DHCP ACK на A05s — в работе (см. §2).
+- ODM/динамика (DIG, rate-адаптация) не реализованы — для DHCP/ARP не нужны,
+  для потокового WebDAV может потребоваться фикс-rate или простая адаптация.
 - `g_test_plain` (W.586) — тестовый флаг «слать без шифрования», по умолч. 0.
 
 ## 5. Развитие (идеи, требуют решений владельца)
@@ -53,5 +70,4 @@ no DHCP/IP` → `poll: IP accepted from OFFER (no ACK)`.
 - Подключение прерываний (GIC IRQ) для SDIO RX вместо поллинга в главном цикле —
   для потоковых данных WebDAV. Отдельный шаг после стабилизации DHCP.
 - PIO gate (GATING0 bit0) в gpio_init для чистого FEL — проверить на стенде.
-- Проверка CAM slot 5 на других WPA2-AP (MTS_GPON).
 - Прошивка чипа с SD-карты вместо встраивания (для компактности образа).

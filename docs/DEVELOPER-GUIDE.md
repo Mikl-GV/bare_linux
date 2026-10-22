@@ -122,7 +122,8 @@ for (;;) { led_heartbeat(); wifi_layer_poll(); pcf8574_read() -> handle_buttons(
 Затем `wifi_layer_connect(idx)` → `h3_wifi_join_ap()` (auth/assoc/WPA2/DHCP).
 
 После join `wifi_layer_poll()` (в главном цикле) принимает ARP/ICMP и отвечает —
-пинг с ПК работает (fallback IP из OFFER, если ACK не пришёл).
+пинг с ПК работает. Полный DHCP-цикл завершается ACK (корень найден W.770:
+seq данных в TX-дескрипторе).
 
 Все регистры чипа и протокол — в `HARDWARE.md §7-8`. Состояние WiFi-этапа и
 открытые вопросы — в README.md и `NEXT-QUESTIONS.md`.

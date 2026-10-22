@@ -30,9 +30,8 @@
 
 /* W.557/W.557 [итог]: диагностика TX/RX hot-path своё отработала
    (W.550-W.556: дескриптор/очереди/скорость подтверждены). UART-вывод
-   в hot path стоил тактов и мог сбивать приём/передачу — ПО УМОЛЧАНИЮ
-   ВЫКЛЮЧЕН. Для отладки раскомментируй:
-   #define WIFI_TX_DIAG 1 */
+   в hot path стоил тактов и мог сбивать приём/передачу — выключен.
+   Для отладки задай в командной строке: -DWIFI_TX_DIAG=1 */
 #ifndef WIFI_TX_DIAG
 #define WIFI_TX_DIAG 0
 #endif
@@ -50,7 +49,7 @@
    swdec) в DHCP-цикле — без tx-дампов и снимков очередей. По умолчанию
    выкл.; для диагностики #define WIFI_RX_DIAG 1 */
 #ifndef WIFI_RX_DIAG
-#define WIFI_RX_DIAG 1
+#define WIFI_RX_DIAG 0
 #endif
 #if (WIFI_TX_DIAG || WIFI_RX_DIAG)
 #define TXDIAG(...)   uart_print(__VA_ARGS__)
@@ -305,6 +304,10 @@ int h3_wifi_power_state(void);
    Перед записью кадра нужно дождаться >= 1 страницы (rtl8189fs_xmit.c:95-121). */
 int h3_wifi_tx_free_pages_hiq(void);
 
+/* Свободные страницы очереди LOW (LOQ, data/BE) в TX FIFO (SDIO-local 0x20,
+   чётные байты: [4]=LOQ, 16-бит LE). -1 при ошибке доступа. */
+int h3_wifi_tx_free_pages_loq(void);
+
 /* Записать MAC в REG_MACID (0x610..0x615): сначала инкрементный путь (как
    драйвер, sdio_writel), при несовпадении чтения — откат на запись без
    инкремента. Возвращает 0 при подтверждённой записи, -1 иначе. */
@@ -337,13 +340,9 @@ int h3_wifi_tx_probe_req(uint8_t channel);
 
 /* Целевая сеть: SSID + (заполняется из RX-скана) BSSID и канал. */
 void h3_wifi_set_target(const char *ssid, uint8_t ssid_len);
-/* Занять целевая сеть? */
-int h3_wifi_target_is_set(void);
 /* Внутренний: захват BSSID/channel целевой сети из принятого beacon
    (вызывается из парсера RX-скана при совпадении SSID). */
 void h3_wifi_scan_capture_target(const uint8_t *bssid, uint8_t channel);
-/* Вернуть захваченные BSSID/channel целевой сети (после скана). */
-int h3_wifi_target_captured(uint8_t bssid[6], uint8_t *channel);
 
 /* Передать Authentication (opensystem) к целевому BSSID на канале.
    Кадр: frame_ctl=0xB0, addr1/3=BSSID, addr2=наш MAC, alg=0, seq, status=0. */
@@ -412,9 +411,6 @@ int h3_wifi_tx_data(uint16_t ethertype, const uint8_t *dst_mac,
 /* Прочитать наш MAC (REG_MACID 0x610-0x615). Публичный для сетевого слоя. */
 void h3_wifi_get_mac(uint8_t m[6]);
 
-/* W.603: BSSID текущей цели (AP). 0 = есть, -1 = цель не захвачена. */
-int h3_wifi_get_bssid(uint8_t b[6]);
-
 /* Регистры чипа (hal8188freg.h). */
 #define REG_MCUFWDL_OFF      0x0080
 #define FW_8188F_START       0x1000
@@ -435,7 +431,6 @@ extern int      sdc_diag_fail_blk;   /* номер блока, на которо
 extern uint32_t sdc_diag_pseq_step;
 extern uint32_t sdc_diag_pseq_base;
 extern uint32_t sdc_diag_pseq_off;
-extern uint32_t sdc_diag_pseq_cmd;
 extern uint32_t sdc_diag_pseq_val;
 
 /* Значение REG_MCUFWDL при падении FreeToGo (-33). */
