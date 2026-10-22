@@ -147,17 +147,39 @@ static int sdc0_write_block(uint32_t addr, const uint8_t *buf)
     return 0;
 }
 
+/* Индикатор «идёт опрос SD»: PA15 (LED_EN_SD, активный уровень 1) горит
+   ТОЛЬКО во время операций с картой (init/read/write), между ними — гаснет.
+   PA15 = output (config1, function 1) — настраиваем при каждом включении
+   (дёшево: одна запись MMIO), чтобы не зависеть от порядка вызовов. */
+#define SD0_LED_ON()  do { \
+        set_pin_mode(PORTA, 15, 1); \
+        set_pin_data(PORTA, 15, 1); \
+        __asm volatile("dmb sy" ::: "memory"); \
+    } while (0)
+#define SD0_LED_OFF() do { \
+        set_pin_data(PORTA, 15, 0); \
+        __asm volatile("dmb sy" ::: "memory"); \
+    } while (0)
+
 /* Обёртки с учётом SDSC/SDHC-адресации. */
 int h3_sdc0_read_sector(uint32_t lba, void *buf)
 {
+    int rc;
+    SD0_LED_ON();
     uint32_t addr = g_sdhc ? lba : (lba << 9);
-    return sdc0_read_block(addr, (uint8_t *)buf);
+    rc = sdc0_read_block(addr, (uint8_t *)buf);
+    SD0_LED_OFF();
+    return rc;
 }
 
 int h3_sdc0_write_sector(uint32_t lba, const void *buf)
 {
+    int rc;
+    SD0_LED_ON();
     uint32_t addr = g_sdhc ? lba : (lba << 9);
-    return sdc0_write_block(addr, (const uint8_t *)buf);
+    rc = sdc0_write_block(addr, (const uint8_t *)buf);
+    SD0_LED_OFF();
+    return rc;
 }
 
 /* Чтение CSD: размер карты (в 512-байтных секторах) из C_SIZE/C_SIZE_MULT
@@ -203,6 +225,7 @@ static void h3_sdc0_init_pins(void)
 
 int h3_sdc0_init(struct sdc0_info *info)
 {
+    SD0_LED_ON();   /* индикатор «идёт опрос SD» */
     /* ==== Фаза A: наследование U-Boot (загрузка с SD) ====
        U-Boot уже инициализировал MMC0, GPIO, клок и карту (лог: 
        "17.5 MiB/s" из boot.scr). НЕ делаем ни сброса контроллера, ни
@@ -237,6 +260,7 @@ int h3_sdc0_init(struct sdc0_info *info)
                 info->total_sectors = 0;
             }
             uart_print("sd0: legacy (U-Boot) ok\r\n");
+            SD0_LED_OFF();
             return 0;
         }
         uart_print("sd0: legacy probe fail, full init\r\n");
@@ -285,6 +309,7 @@ int h3_sdc0_init(struct sdc0_info *info)
     /* 5) Инициализация карты. */
     if (sdc0_cmd(0, 0, SDC_CMDR_SEND_INIT) != 0) {        /* CMD0: 80 тактов, GO_IDLE */
         uart_print("sd0: CMD0 fail\r\n");
+        SD0_LED_OFF();
         return -1;
     }
     if (sdc0_cmd(8, 0x000001AA, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC) != 0) {
@@ -294,27 +319,27 @@ int h3_sdc0_init(struct sdc0_info *info)
     uint32_t busy_wait = 0;
     while (busy_wait < 1000000u) {
         if (sdc0_cmd(55, g_rca << 16, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC) != 0)
-            { uart_print("sd0: CMD55 fail\r\n"); return -1; }
+            { uart_print("sd0: CMD55 fail\r\n"); SD0_LED_OFF(); return -1; }
         uint32_t ocr_arg = 0x40FF8000u;   /* HCS + 3.2-3.4V */
         if (sdc0_cmd(41, ocr_arg, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC) != 0)
-            { uart_print("sd0: CMD41 fail\r\n"); return -1; }
+            { uart_print("sd0: CMD41 fail\r\n"); SD0_LED_OFF(); return -1; }
         uint32_t ocr = SDC0_REG(SDC_RESP0);
         if (ocr & (1u << 31)) break;      /* busy bit set — карта готова */
         udelay(1000);
         busy_wait += 1000;
     }
-    if (busy_wait >= 1000000u) { uart_print("sd0: ACMD41 timeout\r\n"); return -1; }
+    if (busy_wait >= 1000000u) { uart_print("sd0: ACMD41 timeout\r\n"); SD0_LED_OFF(); return -1; }
 
     /* CMD2 (CID), CMD3 (RCA) — ответы, RCA сохраняем. */
     if (sdc0_cmd(2, 0, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC | SDC_CMDR_LONG_RESP) != 0)
-        { uart_print("sd0: CMD2 fail\r\n"); return -1; }
+        { uart_print("sd0: CMD2 fail\r\n"); SD0_LED_OFF(); return -1; }
     if (sdc0_cmd(3, 0, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC) != 0)
-        { uart_print("sd0: CMD3 fail\r\n"); return -1; }
+        { uart_print("sd0: CMD3 fail\r\n"); SD0_LED_OFF(); return -1; }
     g_rca = (SDC0_REG(SDC_RESP0) >> 16) & 0xFFFF;
 
     /* CMD7 (select card). */
     if (sdc0_cmd(7, g_rca << 16, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC) != 0)
-        { uart_print("sd0: CMD7 fail\r\n"); return -1; }
+        { uart_print("sd0: CMD7 fail\r\n"); SD0_LED_OFF(); return -1; }
 
     /* CSD (CMD9) — размер карты. */
     uint32_t csd[4];
@@ -331,7 +356,7 @@ int h3_sdc0_init(struct sdc0_info *info)
         }
     }
     if (sdc0_cmd(16, 512, SDC_CMDR_RESP_RCV | SDC_CMDR_CHK_CRC) != 0)
-        { uart_print("sd0: CMD16 fail\r\n"); return -1; }
+        { uart_print("sd0: CMD16 fail\r\n"); SD0_LED_OFF(); return -1; }
 
     /* CMD58 (READ_OCR): CCS bit30 — SDSC (0) / SDHC (1). */
     if (sdc0_cmd(58, 0, SDC_CMDR_RESP_RCV) == 0) {
@@ -353,5 +378,6 @@ int h3_sdc0_init(struct sdc0_info *info)
         info->sdhc = g_sdhc;
         info->wide4 = g_wide4;
     }
+    SD0_LED_OFF();
     return 0;
 }

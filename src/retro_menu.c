@@ -211,6 +211,13 @@ static void render_systems(void)
 
 static void load_browser(void)
 {
+    g_browser_n = 0;
+    g_browser_sel = 0;
+    /* Без карты не читаем FAT: каждый h3_sdc0_read_sector без карты упирается
+       в таймаут SD-контроллера (~1,7 с), fat_list делает их десятки — вход
+       в меню ромов «зависал». Сразу возвращаем пустой список — рендер
+       покажет «No SD card!». */
+    if (g_sd_ok != 1) return;
     const char *dir = system_rom_dir(g_sys);
     char path[FAT_NAME_LEN + 16];
     int pl = 0;
@@ -455,12 +462,38 @@ static void render_transfer(void)
     fb_clean();
 }
 
+/* Автоповтор кнопок: первое нажатие возвращается сразу; при удержании
+   дольше 1 с — повтор каждые 0,3 с (для навигации без частых нажатий). */
+#define AR_HOLD_MS   1000u
+#define AR_REPEAT_MS 300u
+static uint32_t g_hold_start_ms = 0;    /* когда зажали (0 = не удерживаем) */
+static uint32_t g_repeat_at_ms  = 0;    /* когда следующий повтор */
+
 static uint32_t wait_btn(void)
 {
     uint32_t btns = pcf8574_read();
     uint32_t pressed = btns & ~g_prev;
     g_prev = btns;
-    return pressed;
+    uint32_t now = micros() / 1000;
+
+    if (pressed) {
+        /* зажали новую кнопку — обычное событие + начали отсчёт удержания */
+        g_hold_start_ms = now;
+        g_repeat_at_ms  = now + AR_HOLD_MS;
+        return pressed;
+    }
+    if (btns == 0) {
+        g_hold_start_ms = 0;   /* отпустили всё */
+        g_repeat_at_ms  = 0;
+        return 0;
+    }
+    /* удерживаем одну из кнопок: после 1 с повтор каждые 0,3 с */
+    if (g_hold_start_ms && (uint32_t)(now - g_hold_start_ms) >= AR_HOLD_MS
+        && (uint32_t)(now - g_repeat_at_ms) >= AR_REPEAT_MS) {
+        g_repeat_at_ms = now;
+        return btns;   /* повтор той же кнопки */
+    }
+    return 0;
 }
 
 /* Индикатор жизни процессора: мигание PL10 каждые ~500 мс.
@@ -479,15 +512,9 @@ void led_heartbeat(void)
 
 /* Включить слот SD: PA15 = EN_SD, активный уровень 1.
    Держим 1 пока идёт работа с картой. */
-static void sd_enable(void)
-{
-    set_pin_mode(PORTA, 15, 1);   /* output */
-    set_pin_data(PORTA, 15, 1);   /* EN_SD = 1 */
-    __asm volatile("dsb" ::: "memory");
-    udelay(5000);                 /* пауза на оживление карты/питания */
-}
-
-/* Инициализация SD при входе в меню: SDC0 + FAT32. */
+/* Инициализация SD при входе в меню: SDC0 + FAT32.
+   PA15 (LED_EN_SD) здесь НЕ включается постоянно — он горит только на время
+   операций с картой (токены SD0_LED_ON/OFF в h3_sdc0.c). */
 static void sd_init_menu(void)
 {
     struct sdc0_info info;
@@ -506,15 +533,15 @@ static void sd_init_menu(void)
     g_sd_ok = 1;
 
     /* Только ОТМЕЧАЕМ наличие папок систем на SD (без создания!):
-       g_sys_has_dir нужен для цвета/доступности. Папки на SD создаёт
-       сам пользователь (структура как в корне проекта). */
+       g_sys_has_dir нужен для [OK]/цвета. Папки систем лежат в roms/<система>
+       (структура как в корне проекта) — ищем ВНУТРИ /roms, не в корне. */
     {
         fat_entry_t probe;
         for (int i = 0; i < NUM_SYSTEMS; i++) {
             const char *d = system_rom_dir(i);
             g_sys_has_dir[i] = 0;
             if (!d || !*d) continue;
-            if (fat_find("", d, &probe)) g_sys_has_dir[i] = 1;
+            if (fat_find("roms", d, &probe)) g_sys_has_dir[i] = 1;
         }
     }
     uart_print("sd: ready\r\n");
@@ -533,8 +560,8 @@ void retro_menu_run(void)
     g_prev = 0;
     g_sd_ok = 0;
     int dirty = 1;   /* рисовать только при изменении — иначе мерцание */
-    sd_enable();     /* PA15=1: включить слот SD (EN_SD активный уровень 1) */
-    sd_init_menu();  /* SDC0 + FAT32 перед браузером ромов */
+    sd_init_menu();  /* SDC0 + FAT32 перед браузером ромов; PA15 загорается
+                        только на время опроса карты (токены в h3_sdc0.c) */
     set_led(1);
 
     for (;;) {
@@ -643,17 +670,19 @@ void retro_menu_run(void)
                 dirty = 1;
             } else if (p & BTN_A) {
                 if (!wifi_layer_started()) {
-                    wifi_layer_start();
+                    wifi_layer_start();   /* запуск WiFi = скан сетей (синхронно) */
+                    dirty = 1;            /* список обновился — перерисовать экран */
                 } else if (n > 0) {
                     wifi_layer_connect(g_transfer_sel);
                 }
             } else if (p & BTN_START) {
                 if (!wifi_layer_started()) {
-                    wifi_layer_start();
+                    wifi_layer_start();   /* запуск WiFi = скан сетей (синхронно) */
+                    dirty = 1;
                 } else {
-                    wifi_layer_rescan();
+                    wifi_layer_rescan();  /* повторный скан: обновить список */
+                    dirty = 1;            /* перерисовать с новыми сетями */
                 }
-                dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SETTINGS;
                 dirty = 1;
