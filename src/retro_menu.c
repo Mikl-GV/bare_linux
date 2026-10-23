@@ -510,8 +510,8 @@ void led_heartbeat(void)
     }
 }
 
-/* Включить слот SD: PA15 = EN_SD, активный уровень 1.
-   Держим 1 пока идёт работа с картой. */
+/* Включить слот SD: PA15 = EN_SD/LED_EN_SD, АКТИВНЫЙ УРОВЕНЬ 0.
+   LED светится при логическом 0 (используется карта); гаснет при 1. */
 /* Инициализация SD при входе в меню: SDC0 + FAT32.
    PA15 (LED_EN_SD) здесь НЕ включается постоянно — он горит только на время
    операций с картой (токены SD0_LED_ON/OFF в h3_sdc0.c). */
@@ -547,6 +547,21 @@ static void sd_init_menu(void)
     uart_print("sd: ready\r\n");
 }
 
+/* IP-статус для перерисовки Transfer: 0 = адреса нет, иначе
+   bit28=ACK, биты 0..23 = ip[0..3]. Сравниваем каждую итерацию — при смене
+   (IP пришёл/сменился по DHCP) ставим dirty БЕЗ нажатия кнопки. */
+static uint32_t transfer_ip_state(void)
+{
+    uint8_t ip[4], mk[4], gw[4];
+    int ack = 0;
+    uint32_t st = 0;
+    if (net_dhcp_get_ip(ip, mk, gw, &ack))
+        st = ((uint32_t)(ack ? 1 : 0) << 28)
+           | ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16)
+           | ((uint32_t)ip[2] << 8)  | (uint32_t)ip[3];
+    return st;
+}
+
 void retro_menu_run(void)
 {
     build_rows();
@@ -559,12 +574,19 @@ void retro_menu_run(void)
     g_placeholder_sel = 0;
     g_prev = 0;
     g_sd_ok = 0;
+    uint32_t g_transfer_ip_st = 0;   /* последний считанный IP-статус Transfer */
     int dirty = 1;   /* рисовать только при изменении — иначе мерцание */
     sd_init_menu();  /* SDC0 + FAT32 перед браузером ромов; PA15 загорается
                         только на время опроса карты (токены в h3_sdc0.c) */
     set_led(1);
 
     for (;;) {
+        /* IP мог прийти асинхронно (DHCP в wifi_layer_poll) — перерисуем
+           экран Transfer без нажатия кнопки. */
+        if (g_screen == RU_TRANSFER) {
+            uint32_t st = transfer_ip_state();
+            if (st != g_transfer_ip_st) { g_transfer_ip_st = st; dirty = 1; }
+        }
         if (dirty) {
             if (g_screen == RU_SYSTEMS) render_systems();
             else if (g_screen == RU_BROWSER) render_browser();

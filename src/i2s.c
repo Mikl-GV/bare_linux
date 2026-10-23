@@ -312,6 +312,13 @@ int i2s_init(void)
     for (uint32_t a = (uint32_t)(uintptr_t)_coherent_start;
          a < (uint32_t)(uintptr_t)_coherent_end; a += 0x4000u)
         mmu_mark_uncached(a);
+    /* Почта CPU0<->CPU1 тоже uncached (разделяемая между ядрами, без общего
+       кэша). Секция .mailbox — выровнена на 1 МБ в linker.ld. */
+    extern unsigned char _mailbox_start[];
+    extern unsigned char _mailbox_end[];
+    for (uint32_t a = (uint32_t)(uintptr_t)_mailbox_start;
+         a < (uint32_t)(uintptr_t)_mailbox_end; a += 0x4000u)
+        mmu_mark_uncached(a);
     /* Почистить D-cache для секций, где лежат буфер и LLI. */
     {
         uint32_t b = (uint32_t)(uintptr_t)_dma_buf_start & ~0x1Fu;

@@ -153,17 +153,18 @@ static int sdc0_write_block(uint32_t addr, const uint8_t *buf)
     return 0;
 }
 
-/* Индикатор «идёт опрос SD»: PA15 (LED_EN_SD, активный уровень 1) горит
-   ТОЛЬКО во время операций с картой (init/read/write), между ними — гаснет.
+/* Индикатор «идёт опрос SD»: PA15 (LED_EN_SD) — АКТИВНЫЙ УРОВЕНЬ 0.
+   LED светится при логическом 0 на PA15: 0 = карта используется программой,
+   1 = не используется (горит постоянно вне операций, если не гасить).
    PA15 = output (config1, function 1) — настраиваем при каждом включении
    (дёшево: одна запись MMIO), чтобы не зависеть от порядка вызовов. */
 #define SD0_LED_ON()  do { \
         set_pin_mode(PORTA, 15, 1); \
-        set_pin_data(PORTA, 15, 1); \
+        set_pin_data(PORTA, 15, 0); \
         __asm volatile("dmb sy" ::: "memory"); \
     } while (0)
 #define SD0_LED_OFF() do { \
-        set_pin_data(PORTA, 15, 0); \
+        set_pin_data(PORTA, 15, 1); \
         __asm volatile("dmb sy" ::: "memory"); \
     } while (0)
 

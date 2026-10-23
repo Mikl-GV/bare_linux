@@ -5474,17 +5474,7 @@ int h3_wifi_join_ap(void)
         int ok = (msr == 0x02);   /* W.778: STA (_HW_STATE_STATION_) = 0x02, не 0x01 */
         for (int k = 0; k < 6; k++)
             if (rb[k] != join_target.bssid[k]) ok = 0;
-        uart_print("  join: bssid wr=");
-        for (int k = 0; k < 6; k++) {
-            uart_print_hex((uint32_t)join_target.bssid[k]);
-            if (k < 5) uart_print(":");
-        }
-        uart_print(" rd=");
-        for (int k = 0; k < 6; k++) {
-            uart_print_hex((uint32_t)rb[k]);
-            if (k < 5) uart_print(":");
-        }
-        uart_print(" msr=0x");
+        uart_print("  join: msr=0x");
         uart_print_hex((uint32_t)msr);
         uart_print(ok ? " OK\r\n" : " MISMATCH\r\n");
         if (!ok) return -7;

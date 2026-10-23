@@ -225,33 +225,6 @@ pkt[p++] = 0x63; pkt[p++] = 0x82; pkt[p++] = 0x53; pkt[p++] = 0x63;  /* cookie *
         uart_print(" opt54=");
         uart_print_int(has_54);
         uart_print("\r\n");
-        /* W.734 [проверка п.1]: chaddr в BOOTP. При нулевом/неверном chaddr
-           dnsmasq молча дропает запрос — сверяем с REG_MACID. Печатается одна
-           короткая строка на REQUEST (не hot path при первом обмене). */
-        uart_print("  net: chaddr=");
-        for (int ci = 0; ci < 6; ci++) {
-            /* chaddr в BOOTP: IP(20)+UDP(8)+28 байт фикс. полей = pkt[56..61]. */
-            uart_print_hex((uint32_t)pkt[56 + ci]);
-            if (ci < 5) uart_print(":");
-        }
-        uart_print("\r\n");
-        /* W.747 [побайтовое сравнение с эталоном Windows]: один hex-дамп
-           первого REQUEST за сессию (не hot-path). Нужен, чтобы сверить наш
-           кадр с pcap рабочего клиента той же сети (эталон: IP len=0x165,
-           flags=0x0000, опции 53,61,50,54,12,81,60,55). */
-        {
-            static int hex_once = 0;
-            if (!hex_once) {
-                hex_once = 1;
-                uart_print("  net: REQHEX ");
-                static const char hx[] = "0123456789ABCDEF";
-                for (uint32_t q = 0; q < (uint32_t)p; q++) {
-                    uart_putc(hx[(pkt[q] >> 4) & 0xF]);
-                    uart_putc(hx[pkt[q] & 0xF]);
-                }
-                uart_print("\r\n");
-            }
-        }
     }
 
     return h3_wifi_tx_data(0x0800, dst_mac, pkt, (uint16_t)p);

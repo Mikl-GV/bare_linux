@@ -57,6 +57,16 @@ SECTIONS
     _coherent_end = .;
   } > RAM
 
+  /* Почта CPU0<->CPU1: разделяемая uncached-область (см. mailbox.h/c). */
+  .mailbox (NOLOAD) : {
+    . = ALIGN(0x100000);
+    _mailbox_start = .;
+    *(.mailbox)
+    *(.mailbox.*)
+    . = ALIGN(0x80);
+    _mailbox_end = .;
+  } > RAM
+
   /* DMA-буфер звука: 64 КБ, пары [L<<16|R<<16]. uncached, своя 1MB секция. */
   .dma_buf (NOLOAD) : {
     . = ALIGN(0x100000);
