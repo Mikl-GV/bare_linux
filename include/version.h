@@ -11,8 +11,8 @@
  * Точка старта новой нумерации — WU.1.000 (первый работающий Lynx).
  */
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 6
+#define FW_VERSION_MINOR 13
 
-#define FW_VERSION_STR  "WU.1.006"
+#define FW_VERSION_STR  "WU.1.013"
 
 #endif /* VERSION_H */

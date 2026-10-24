@@ -573,6 +573,22 @@ static uint32_t g_repeat_at_ms  = 0;    /* когда следующий пов�
 static uint32_t wait_btn(void)
 {
     uint32_t btns = pcf8574_read();
+
+    /* Sega-джойстик (драйвер 1 к 1): опрашиваем и подмешиваем к кнопкам.
+       Маппинг: крестовина -> стрелки, A/B -> A/B, Mode -> Select,
+       Start -> Start. X/Y/Z/C в меню пока не мапим (по решению владельца). */
+    uint16_t pad = sega_pad_scan();
+    if (pad) {
+        if (pad & 0x01) btns |= BTN_UP;
+        if (pad & 0x02) btns |= BTN_DOWN;
+        if (pad & 0x04) btns |= BTN_LEFT;
+        if (pad & 0x08) btns |= BTN_RIGHT;
+        if (pad & 0x10) btns |= BTN_A;
+        if (pad & 0x20) btns |= BTN_B;
+        if (pad & 0x80) btns |= BTN_START;
+        if (pad & 0x800) btns |= BTN_SELECT;   /* Mode */
+    }
+
     uint32_t pressed = btns & ~g_prev;
     g_prev = btns;
     uint32_t now = micros() / 1000;

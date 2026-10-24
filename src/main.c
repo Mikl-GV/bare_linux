@@ -67,6 +67,10 @@ void kmain(void)
     uart_print("i2c init...\r\n");
     i2cbb_init(PORTG, 9, PORTG, 8);
     pcf8574_init();
+    /* Sega-джойстик (PCF8574@0x20, та же шина PG8/PG9): драйвер 1 к 1 из
+       pico-retro-new-gen, инициализация обязательна (без неё скан не стартует). */
+    extern int sega_pad_init(void);
+    sega_pad_init();
     uart_print("i2c ok\r\n");
 
     /* Звук */
