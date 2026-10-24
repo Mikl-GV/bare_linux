@@ -600,7 +600,8 @@ int fat_write_file(const char *dir, const char *name,
     if (!dir || !name || !data) return -1;
     fat_entry_t d;
     if (path_lookup(dir, &d) != 0) return -1;
-    if (!(d.size == 0 && d.name[0])) return -1;
+    /* Это каталог (size==0). Имя не требуется: корень ("") — тоже каталог. */
+    if (d.size != 0) return -1;
 
     /* Существующий файл: удалить (освобождает цепочку и помечает запись). */
     fat_entry_t *dirs = g_scratch_dir;
@@ -653,7 +654,8 @@ static int fat_delete_impl(const char *dir, const char *name)
     if (!dir || !name) return -1;
     fat_entry_t d;
     if (path_lookup(dir, &d) != 0) return -1;
-    if (!(d.size == 0 && d.name[0])) return -1;
+    /* Это каталог (size==0). Имя не требуется: корень ("") — тоже каталог. */
+    if (d.size != 0) return -1;
 
     /* Найти запись и её физический адрес (сектор/смещение). */
     uint32_t cl = d.first_cluster;
