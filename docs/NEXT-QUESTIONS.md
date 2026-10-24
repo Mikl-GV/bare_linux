@@ -21,7 +21,9 @@
   config-дескриптору (MSD 8/6/0x50 → `usb_ohci_msd_start`, HID boot 3/1/1 →
   `usb_kbd_init_on`), порт не важен. Флешка: BOT recovery, INQUIRY,
   READ CAPACITY (TUR ×3), READ(10)/WRITE(10), MBR и FAT32 (`part lba=131072
-  sec/clu=16 root_clu=2`, `sd: ready`). Клавиатура: interrupt-IN, отчёты
+  sec/clu=16 root_clu=2`, `sd: ready`). Запись/удаление — `fat_write_file`/
+  `fat_delete`; самопроверка — Settings → Storage test (W.931,
+  `fat: selftest write rc=0`). Клавиатура: interrupt-IN, отчёты
   клавиш, автоповтор/отпускание (W.896).
 - **Цель этапа**: подтверждено на борту — флешка (FAT32 с USB) и клавиатура;
   дальше — первый эмулятор и запись файлов на флешку из меню.

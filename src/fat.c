@@ -700,6 +700,36 @@ int fat_delete(const char *dir, const char *name)
     return fat_delete_impl(dir, name);
 }
 
+/* Самопроверка записи на активном источнике (SD или USB): создать файл в
+ * корне, прочитать его обратно, сверить байты, удалить. Возвращает 0 при
+ * успехе, иначе номер упавшего шага: -1 запись, -2 поиск, -3 чтение,
+ * -4 сверка, -5 удаление. */
+#define FAT_SELFTEST_NAME "WTEST.TXT"
+#define FAT_SELFTEST_LEN  512u
+
+int fat_selftest_write(void)
+{
+    uint8_t wbuf[FAT_SELFTEST_LEN];
+    uint8_t rbuf[FAT_SELFTEST_LEN];
+    fat_entry_t f;
+
+    for (uint32_t i = 0; i < FAT_SELFTEST_LEN; i++)
+        wbuf[i] = (uint8_t)(i * 7u + 3u);
+
+    /* Стереть остаток от прошлого прогона (мог остаться после сбоя). */
+    fat_delete("", FAT_SELFTEST_NAME);
+
+    if (fat_write_file("", FAT_SELFTEST_NAME, wbuf, FAT_SELFTEST_LEN) != 0)
+        return -1;
+    if (fat_find("", FAT_SELFTEST_NAME, &f) != 1) return -2;
+    if (fat_read_file(&f, 0, rbuf, FAT_SELFTEST_LEN) != (int)FAT_SELFTEST_LEN)
+        return -3;
+    for (uint32_t i = 0; i < FAT_SELFTEST_LEN; i++)
+        if (rbuf[i] != wbuf[i]) return -4;
+    if (fat_delete("", FAT_SELFTEST_NAME) != 0) return -5;
+    return 0;
+}
+
 int fat_init(void)
 {
     /* Собрать FAT32-разделы из MBR (типы 0x0B/0x0C; FAT16 не поддерживаем). */

@@ -241,6 +241,13 @@ seq данных в TX-дескрипторе).
   при сбое — `msd: op=… CBW/DATA-IN/CSW fail` (шаг), `ohci-bulk: TIMEOUT …`
   (edhead/edtail/cmdst) или `ohci-bulk: fail … cc/h`. Шумные строки — под
   `USB_VERBOSE_LOG`/`MSD_VERBOSE_LOG` (в рабочей сборке 0).
+- **Запись/удаление**: `fat_write_file` (существующий файл удаляется,
+  затем новая цепочка; имя — 8.3), `fat_delete` (0xE5 на 8.3-запись и
+  LFN-фрагменты, освобождение цепочки), `fat_mkdir`; кэш FAT-сектора
+  инвалидируется в `fat_set_cluster`. Самопроверка — `fat_selftest_write()`
+  (WTEST.TXT в корне: write→find→read→compare→delete) из
+  Settings → Storage test; коды rc: -1 запись, -2 поиск, -3 чтение,
+  -4 сверка, -5 удаление, вывод в UART `fat: selftest write rc=N`.
 - **Интеграция**: `sd_init_menu` при отсутствии SD переключает FAT на
   USB-блок (если накопитель активен) — иначе SD всегда в приоритете.
 

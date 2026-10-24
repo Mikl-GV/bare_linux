@@ -75,7 +75,9 @@ static int g_browser_n = 0;
 static int g_placeholder_sel = 0;        /* 0=встроенный, 1=с SD */
 static int g_transfer_sel = 0;           /* выбранная сеть в Transfer */
 static int g_transfer_top = 0;           /* скролл списка сетей */
-static int g_settings_sel = 0;           /* 0=Transfer, 1=Sound test */
+static int g_settings_sel = 0;           /* 0=Transfer, 1=Sound test, 2=Storage test */
+#define STORE_TEST_NOT_RUN (-100)
+static int g_store_test_rc = STORE_TEST_NOT_RUN;  /* результат Storage test */
 static int g_sound_on = 0;
 static int g_sound_freq = 440;
 static int g_sd_ok = 0;              /* 0=SD не инициализирована, 1=ok, <0=ошибка */
@@ -338,16 +340,27 @@ static void render_settings_help(void)
     fb_text(8, 24, g_screen == RU_SETTINGS ? "Settings" : g_screen == RU_HELP ? "Help" : "About",
             0x00FFFFFF, 0x00336699);
     if (g_screen == RU_SETTINGS) {
+        static const char *items[3] = {
+            "Transfer (WiFi to SD)",
+            "Sound test",
+            "Storage test (write/delete)"
+        };
         int y = 140;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 3; i++) {
             int sel = (i == g_settings_sel);
             uint32_t clr = sel ? 0x00FFFF00 : 0x00FFFFFF;
             if (sel) fill_row(y, 0x00181818);
-            fb_text(70, y, i == 0 ? "Transfer (WiFi to SD)" : "Sound test",
-                    clr, sel ? 0x00181818 : 0x000D1A33);
+            fb_text(70, y, items[i], clr, sel ? 0x00181818 : 0x000D1A33);
             y += ROW_H;
         }
-        fb_text(60, 210, "A=open  B=back", 0x00A0C0D0, 0x000D1A33);
+        if (g_store_test_rc != STORE_TEST_NOT_RUN) {
+            if (g_store_test_rc == 0) {
+                fb_text(70, y + 8, "Storage: OK (write/read/delete)", 0x0000FF00, 0x000D1A33);
+            } else {
+                fb_text(70, y + 8, "Storage: FAIL (see UART log)", 0x00FF4040, 0x000D1A33);
+            }
+        }
+        fb_text(60, 250, "A=open/run  B=back", 0x00A0C0D0, 0x000D1A33);
     } else if (g_screen == RU_HELP) {
         fb_text(60, 140, "SD structure (static, no card read):", 0x00FFFFFF, 0x000D1A33);
         fb_text(60, 170, "/  (roms partition, SD)", 0x00A0C0D0, 0x000D1A33);
@@ -729,11 +742,22 @@ void retro_menu_run(void)
                 dirty = 1;
             }
         } else if (g_screen == RU_SETTINGS) {
-            /* 0 = Transfer, 1 = Sound test */
-            if (p & BTN_DOWN) { g_settings_sel = 1; dirty = 1; }
-            else if (p & BTN_UP) { g_settings_sel = 0; dirty = 1; }
+            /* 0 = Transfer, 1 = Sound test, 2 = Storage test */
+            if (p & BTN_DOWN) { g_settings_sel = (g_settings_sel + 1) % 3; dirty = 1; }
+            else if (p & BTN_UP) { g_settings_sel = (g_settings_sel + 2) % 3; dirty = 1; }
             else if (p & BTN_A) {
-                g_screen = (g_settings_sel == 0) ? RU_TRANSFER : RU_SOUND;
+                if (g_settings_sel == 0) {
+                    g_screen = RU_TRANSFER;
+                } else if (g_settings_sel == 1) {
+                    g_screen = RU_SOUND;
+                } else {
+                    /* Запись/чтение/удаление WTEST.TXT на активном источнике
+                       (SD, иначе USB-флешка): проверка fat_write_file/fat_delete. */
+                    g_store_test_rc = fat_selftest_write();
+                    uart_print("fat: selftest write rc=");
+                    uart_print_int(g_store_test_rc);
+                    uart_print("\r\n");
+                }
                 dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;
