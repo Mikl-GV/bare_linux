@@ -230,3 +230,64 @@ extern "C" int sprintf(char *buf, const char *fmt, ...)
     *out = 0;
     return (int)(out - buf);
 }
+
+/* printf для sega_pad.c (драйвер 1 к 1): sprintf в буфер -> uart_print. */
+extern "C" {
+#include "uart.h"
+#include <stdarg.h>
+}
+
+/* Минимальный vsnprintf: только %s/%d/%u/%x (+ ширина цифрами). */
+static int lut_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
+{
+    size_t o = 0;
+    for (const char *p = fmt; *p; ) {
+        if (*p != '%') { if (o + 1 < size) buf[o++] = *p++; else p++; continue; }
+        p++;
+        int width = 0;
+        while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; }
+        char c = *p++;
+        char tmp[24];
+        const char *s = tmp;
+        int n = 0;
+        switch (c) {
+        case 'x': case 'X': {
+            unsigned v = va_arg(ap, unsigned);
+            char t[16]; n = 0;
+            do { t[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; } while (v && n < 15);
+            while (n < width) t[n++] = '0';
+            for (int i = 0; i < n; i++) tmp[i] = t[n - 1 - i];
+            tmp[n] = 0;
+            break;
+        }
+        case 'd': case 'u': {
+            unsigned v = va_arg(ap, unsigned);
+            char t[16]; n = 0;
+            do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v && n < 15);
+            while (n < width) t[n++] = '0';
+            for (int i = 0; i < n; i++) tmp[i] = t[n - 1 - i];
+            tmp[n] = 0;
+            break;
+        }
+        case 's': s = va_arg(ap, const char *); break;
+        case '%': s = "%"; n = 1; tmp[0] = '%'; tmp[1] = 0; break;
+        default:  tmp[0] = '%'; tmp[1] = c; tmp[2] = 0; n = 2; break;
+        }
+        for (int i = 0; s && s[i]; i++)
+            if (o + 1 < size) buf[o++] = s[i];
+        (void)n;
+    }
+    if (size) buf[o < size ? o : size - 1] = 0;
+    return (int)o;
+}
+
+extern "C" int printf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = lut_vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    uart_print(buf);
+    return n;
+}

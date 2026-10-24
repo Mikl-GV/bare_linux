@@ -15,6 +15,7 @@
 #include "emulator.h"
 #include "usb_kbd.h"
 #include "usb_msd.h"
+#include "sega_pad.h"
 
 /* Флаг «WiFi-слой активен» (пишет wifi_layer) — значок в шапке меню. */
 extern int wifi_active;
@@ -38,7 +39,7 @@ extern int wifi_active;
 #define MAX_ROWS   (NUM_SYSTEMS + GROUP_COUNT + 8)
 
 enum { RU_SYSTEMS, RU_BROWSER, RU_BUILTIN, RU_PLACEHOLDER,
-       RU_SETTINGS, RU_HELP, RU_ABOUT, RU_TRANSFER, RU_SOUND };
+       RU_SETTINGS, RU_HELP, RU_ABOUT, RU_TRANSFER, RU_SOUND, RU_PADTEST };
 
 enum { RT_GROUP = 0, RT_SYS, RT_SETT, RT_HELP, RT_ABOUT };
 
@@ -349,13 +350,14 @@ static void render_settings_help(void)
     fb_text(8, 24, g_screen == RU_SETTINGS ? "Settings" : g_screen == RU_HELP ? "Help" : "About",
             0x00FFFFFF, 0x00336699);
     if (g_screen == RU_SETTINGS) {
-        static const char *items[3] = {
+        static const char *items[4] = {
             "Transfer (WiFi to SD)",
             "Sound test",
-            "Storage test (write/delete)"
+            "Storage test (write/delete)",
+            "Sega pad test"
         };
         int y = 140;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             int sel = (i == g_settings_sel);
             uint32_t clr = sel ? 0x00FFFF00 : 0x00FFFFFF;
             if (sel) fill_row(y, 0x00181818);
@@ -386,6 +388,80 @@ static void render_settings_help(void)
         fb_text(60, 170, "FW " FW_VERSION_STR, 0x00FFFFFF, 0x000D1A33);
         fb_text(60, 200, "Orange Pi Lite (Allwinner H3)", 0x00FFFFFF, 0x000D1A33);
     }
+    fb_text(60, FB_H - 30, "B=back", 0x00A0C0D0, 0x000D1A33);
+    fb_clean();
+}
+
+/* Экран «Тест джойстика SEGA»: рисуем MD2-пад и подсвечиваем нажатия.
+ * Биты пада — как в sega_pad.h: UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08
+ * A=0x10 B=0x20 C=0x40 START=0x80 X=0x100 Y=0x200 Z=0x400 MODE=0x800. */
+static void render_padtest(void)
+{
+    fb_fill(0x000D1A33);
+    fb_rect(0, 0, FB_W - 1, 64, 0x00336699);
+    fb_text(8, 24, "Sega pad test (MD2)", 0x00FFFFFF, 0x00336699);
+
+    /* Сканируем пад (функция из драйвера, 1 к 1). */
+    uint16_t pad = sega_pad_scan();
+    uint32_t st  = sega_pad_get_status();
+
+    /* Индикатор связи. */
+    fb_text(60, 90, (st & SEGA_STATUS_ACK) ? "PCF8574@0x20: ACK" : "PCF8574@0x20: NO ACK",
+            (st & SEGA_STATUS_ACK) ? 0x0000FF00 : 0x00FF4040, 0x000D1A33);
+    fb_text(60, 116, (st & SEGA_STATUS_PAD) ? "Gamepad: detected" : "Gamepad: not detected",
+            (st & SEGA_STATUS_PAD) ? 0x0000FF00 : 0x00FFAA00, 0x000D1A33);
+    if (st & SEGA_STATUS_PAD6)
+        fb_text(60, 142, "6-button: yes", 0x0000FF00, 0x000D1A33);
+
+    /* Корпус пада. */
+    fb_rect(120, 170, 500, 420, 0x00333344);
+    fb_rect(126, 176, 494, 414, 0x00222233);
+
+    /* Крестовина: центр (60,300) в координатах корпуса. */
+    int cx = 250, cy = 290;
+    int w = 56, h = 18;
+    uint32_t upc   = (pad & 0x01) ? 0x00FFD700 : 0x00666688;
+    uint32_t dnc   = (pad & 0x02) ? 0x00FFD700 : 0x00666688;
+    uint32_t ltc   = (pad & 0x04) ? 0x00FFD700 : 0x00666688;
+    uint32_t rtc   = (pad & 0x08) ? 0x00FFD700 : 0x00666688;
+    fb_rect(cx - w/2, cy - h/2, cx + w/2, cy + h/2, 0x00444455);   /* центр */
+    fb_rect(cx - h/2, cy - h/2 - w + h, cx + h/2, cy - h/2, upc);   /* Up */
+    fb_rect(cx - h/2, cy + h/2, cx + h/2, cy + h/2 + w - h, dnc);   /* Down */
+    fb_rect(cx - w + h/2 + (w - h), cy - h/2, cx + w/2, cy + h/2, rtc); /* Right */
+    fb_rect(cx - w/2, cy - h/2, cx - (w - h)/2, cy + h/2, ltc);       /* Left */
+
+    /* Кнопки справа: A(0x10) B(0x20) C(0x40) — красные, X(0x100) Y(0x200) Z(0x400). */
+    int bx = 380, by = 210, r = 34;
+    uint32_t colA = (pad & 0x10) ? 0x00FF0000 : 0x00882222;  /* A — нижняя */
+    uint32_t colB = (pad & 0x20) ? 0x00FF0000 : 0x00882222;  /* B — левая */
+    uint32_t colC = (pad & 0x40) ? 0x00FF0000 : 0x00882222;  /* C — правая */
+    uint32_t colX = (pad & 0x100) ? 0x00FFFF88 : 0x00888877; /* X — левая */
+    uint32_t colY = (pad & 0x200) ? 0x00FFFF88 : 0x00888877; /* Y — верхняя */
+    uint32_t colZ = (pad & 0x400) ? 0x00FFFF88 : 0x00888877; /* Z — правая */
+    /* Рисуем круги (приблизительно прямоугольниками с фасками — упрощённо
+       квадраты 60x60 со скруглением через 3 вложенных прямоугольника). */
+    /* X (слева-верх), Y (верх-центр), Z (справа-верх): треугольник кнопок. */
+    fb_rect(bx - r, by - r, bx + r, by + r, 0x00444455);   /* зона 6-btn */
+    fb_rect(bx - 90, by - 70, bx - 30, by - 10, colX);      /* X */
+    fb_rect(bx - 30, by - 100, bx + 30, by - 40, colY);     /* Y */
+    fb_rect(bx + 30, by - 70, bx + 90, by - 10, colZ);      /* Z */
+    /* A (низ), B (лево), C (право): нижний треугольник. */
+    fb_rect(bx - 30, by + 40, bx + 30, by + 100, colA);      /* A */
+    fb_rect(bx - 90, by + 10, bx - 30, by + 70, colB);       /* B */
+    fb_rect(bx + 30, by + 10, bx + 90, by + 70, colC);       /* C */
+
+    /* Start (слева-внизу), Mode (справа): маленькие овалы-пилюли. */
+    fb_rect(190, 380, 230, 396, (pad & 0x80)  ? 0x0044AA44 : 0x00335533);
+    fb_rect(300, 380, 340, 396, (pad & 0x800) ? 0x00AA66FF : 0x00443366);
+
+    char buf[48];
+    buf[0] = '0'; buf[1] = 'x'; 
+    uint16_t v = pad;
+    char t[8]; int c = 0;
+    if (v == 0) t[c++] = '0';
+    while (v > 0 && c < 6) { int d = v & 15; t[c++] = (char)(d < 10 ? '0' + d : 'A' + d - 10); v >>= 4; }
+    int k = 2; while (c > 0) buf[k++] = t[--c]; buf[k] = 0;
+    fb_text(60, 440, buf, 0x00A0C0D0, 0x000D1A33);
     fb_text(60, FB_H - 30, "B=back", 0x00A0C0D0, 0x000D1A33);
     fb_clean();
 }
@@ -644,6 +720,7 @@ void retro_menu_run(void)
             else if (g_screen == RU_PLACEHOLDER) render_placeholder();
             else if (g_screen == RU_TRANSFER) render_transfer();
             else if (g_screen == RU_SOUND) render_sound();
+            else if (g_screen == RU_PADTEST) render_padtest();
             else render_settings_help();
             dirty = 0;
         }
@@ -790,27 +867,33 @@ void retro_menu_run(void)
                 dirty = 1;
             }
         } else if (g_screen == RU_SETTINGS) {
-            /* 0 = Transfer, 1 = Sound test, 2 = Storage test */
-            if (p & BTN_DOWN) { g_settings_sel = (g_settings_sel + 1) % 3; dirty = 1; }
-            else if (p & BTN_UP) { g_settings_sel = (g_settings_sel + 2) % 3; dirty = 1; }
+            /* 0 = Transfer, 1 = Sound test, 2 = Storage test, 3 = Sega pad test */
+            if (p & BTN_DOWN) { g_settings_sel = (g_settings_sel + 1) % 4; dirty = 1; }
+            else if (p & BTN_UP) { g_settings_sel = (g_settings_sel + 3) % 4; dirty = 1; }
             else if (p & BTN_A) {
                 if (g_settings_sel == 0) {
                     g_screen = RU_TRANSFER;
                 } else if (g_settings_sel == 1) {
                     g_screen = RU_SOUND;
-                } else {
+                } else if (g_settings_sel == 2) {
                     /* Запись/чтение/удаление WTEST.TXT на активном источнике
                        (SD, иначе USB-флешка): проверка fat_write_file/fat_delete. */
                     g_store_test_rc = fat_selftest_write();
                     uart_print("fat: selftest write rc=");
                     uart_print_int(g_store_test_rc);
                     uart_print("\r\n");
+                } else {
+                    g_screen = RU_PADTEST;
                 }
                 dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;
                 dirty = 1;
             }
+        } else if (g_screen == RU_PADTEST) {
+            /* Тест джойстика SEGA: показываем MD2-пад и подсвечиваем нажатия.
+               Экран перерисовывается постоянно (сканируем каждые ~20 мс). */
+            if (p & BTN_B) { g_screen = RU_SETTINGS; dirty = 1; }
         } else if (g_screen == RU_TRANSFER) {
             int n = h3_wifi_scan_ap_count();
             if (p & BTN_UP) {

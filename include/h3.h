@@ -5,6 +5,17 @@
 
 /* Карта периферии Allwinner H3 (Orange Pi Lite). */
 
+/* Совместимость с проектом-источником (sega_pad.c не правим): __IO = volatile. */
+#ifndef __IO
+#define __IO volatile
+#endif
+#ifndef __I
+#define __I  volatile const
+#endif
+#ifndef _CAST
+#define _CAST(t) (t)
+#endif
+
 #define H3_CCU_BASE       0x01C20000u
 #define H3_PIO_BASE       0x01C20800u
 #define H3_R_PIO_BASE     0x01F02C00u   /* always-on port L */
@@ -54,5 +65,20 @@
 
 /* DW-HDMI (0x01EE0000) — байтовые регистры ядра (см. dw_hdmi.h). */
 #define H3_HDMI_BYTE(off)     (*(volatile uint8_t *)(H3_HDMI_BASE + (off)))
+
+/* High-Speed Timer (0x01C60000) — структура как в проекте-источнике
+ * (нужна sega_pad.c/h3_hs_timer.h, драйвер не правим). */
+#define H3_HS_TIMER_BASE  0x01C60000u
+typedef struct {
+    __IO uint32_t IRQ_EN;      /* 0x00 */
+    __IO uint32_t IRQ_STAS;    /* 0x04 */
+    __I  uint32_t RES1[2];     /* 0x08-0x0C */
+    __IO uint32_t CTRL;        /* 0x10 */
+    __IO uint32_t INTV_LO;     /* 0x14 */
+    __IO uint32_t INTV_HI;     /* 0x18 */
+    __IO uint32_t CURNT_LO;    /* 0x1C */
+    __IO uint32_t CURNT_HI;    /* 0x20 */
+} H3_HS_TIMER_TypeDef;
+#define H3_HS_TIMER  (_CAST(H3_HS_TIMER_TypeDef *)(H3_HS_TIMER_BASE))
 
 #endif /* H3_H */

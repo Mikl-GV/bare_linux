@@ -1,0 +1,340 @@
+// sega_pad.c — Sega Mega Drive 6-button геймпад через PCF8574@0x20 (I2C).
+//
+// ============================================================================
+//   !!!  НЕ ЛАЗИТЬ БЕЗ СТЕНДА  !!!
+//   Это самый хрупкий файл проекта: все тайминги и порядок фаз подобраны
+//   ЭМПИРИЧЕСКИ на живом железе (Orange Pi Lite + PCF8574 + Sega 6-btn) и
+//   проверялись итерациями r147..r157. Любое «улучшение» ломает детект:
+//     * t_half = 130 тиков (~1.3 мкс, SCL ~370 кГц) — медленнее чип не успевает;
+//     * паузы фаз ровно 20 мкс — весь скан обязан уложиться в окно ~1.6 мс;
+//     * порядок 8 уровней TH (ур.1..8) и возврат TH=HIGH (idle) в конце;
+//     * clash-защита линий D0-D3 (иначе крестовина даёт «фантомные» X/Y/Z/Mode);
+//     * каждая фаза = отдельная I2C-транзакция со STOP (PCF8574 не обновляет
+//       выходы по Repeated-START).
+//   Если правишь — обязан прогнать Settings → Sega 6-button test: C3 должен
+//   показывать Z/Y/X/Mode при ОТПУЩЕННОЙ крестовине и НЕ показывать их при
+//   нажатой. Подробности протокола — ниже и в docs/HARDWARE.md.
+//
+//   ГДЕ ИСПОЛЬЗУЕТСЯ (два режима — НЕ путать):
+//     * МЕНЮ/браузер/настройки — слой usb_kbd.c (usb_pad_update): скан не чаще
+//       PAD_CACHE_US (12 мс) + антидребезг 3 скана + автоповтор D-Pad;
+//     * ИГРЫ (host-слои) — прямой sega_pad_scan() раз в кадр в build_input;
+//       меню-кэш (g_pad_cache_t) при этом не обновляется — это нормально.
+//   Вход/выход эмулятора: re-init пада sega_pad_init() (лечит сбой I2C).
+//   Выход из игры — удержание Start+Mode ~0.9 с (emu.c: armed + sticky).
+//
+//   PA_DAT (0x01C20810) ДЕЛЯТ ДВА ВЛАДЕЛЬЦА НА ДВУХ ЯДРАХ:
+//     CPU0 — i2s-SD (PA10, i2s.c) и PA15 (SD-LED, led.c);
+//     CPU1 — PA21 (CS тача TSC2046I) и PA2 (RST TFT, tft_drv.c).
+//   Битовые |= / &= на PA_DAT НЕ атомарны → возможна RMW-гонка. НЕ добавлять
+//   новые записи в PA_DAT из CPU0 без необходимости; «alive» держать на PL10.
+//   r614: Sega-пад/кнопки (bit-bang TWI) ПЕРЕВЕДЕНЫ с PA11/PA12 (TWI0) на
+//   PG9/PG8 (порт G, см. ниже) — чтобы убрать тысячи неатомарных записей
+//   PA_DAT из горячего пути и не рвать регистр с i2s-SD (PA10)/CPU1 (PA21).
+// ============================================================================
+//
+// Разводка (bit-bang TWI на порту G): PG9=SCL, PG8=SDA (разъём 40-pin 36/32).
+// PCF8574 (адрес 0x20), раскладка СЕГА (все линии данных — активный низ):
+//   P0 = D0  (Up)          — всегда (в 6-btn фазе = Z)
+//   P1 = D1  (Down)        — всегда (в 6-btn фазе = Y)
+//   P2 = D2  (Left / B / X)—— зависит от фазы SELECT
+//   P3 = D3  (Right / C / Mode) — зависит от фазы SELECT
+//   P4 = D4  (A)           — всегда
+//   P5 = D5  (Start)       — всегда
+//   P6 = не подключён
+//   P7 = TH (SELECT)       — выход 0/1
+//
+// Протокол чтения (эталон: gen_hw.txt / Sega 315-5638 ASIC):
+//   Консоль и пад общаются пульсацией SELECT (TH). В 3-button режиме пад
+//   отвечает крестовиной при TH=1 и A/Start при TH=0. Чтобы разблокировать
+//   старшие кнопки, консоль делает полную последовательность уровней TH:
+//
+//     ур.1 TH=1 : крестовина + B/C          (чтение)
+//     ур.2 TH=0 : A/Start                   (чтение)
+//     ур.3 TH=1 : холостой
+//     ур.4 TH=0 : холостой
+//     ур.5 TH=1 : холостой
+//     ур.6 TH=0 : D0-D3 принудительно 0000  (маркер 6-btn!)
+//     ур.7 TH=1 : Z/Y/X/Mode + B/C          (чтение)
+//     ур.8 TH=0 : сброс в idle
+//
+//   Линии D0-D3 общие: фаза 1 читает крестовину, фаза 7 — Z/Y/X/Mode.
+//   Поэтому старшая кнопка выдаётся ТОЛЬКО если её линия не занята
+//   крестовиной в фазе 1 (clash-защита). Иначе при нажатой крестовине
+//   фаза 7 давала «фантом»: Right→Mode, Left→X, Down→Y, Up→Z (а Mode в
+//   эмуляторах уходит в Select — «вправо выбирает игру» и т.п.).
+//   Если на ур.6 маркер D0-D3 != 0000 — пад не 6-button; XYZM не выдаём
+//   (clash-защита дополнительно гасит «крестовину как старшие кнопки»).
+//
+//   Тайминги (проверено на железе):
+//     - SCL ~370 кГц (t_half=130 тиков @97 МГц). Медленная I2C (~92 кГц) не
+//       успевает «насчитать» переключения TH за окно чипа.
+//     - Паузы между фазами TH = 20 мкс (th_settle/th_hold/th_idle).
+//       ВАЖНО: весь детект должен уложиться в ~1.6 мс от первого up-edge
+//       SELECT (allpinouts/retrosix; gbppr). При 50 мкс/фазу скан ~1.76 мс
+//       выходил за окно — чип сбрасывался. 20 мкс дают ~1.4 мс.
+//     - После скана TH возвращается в HIGH (idle, как у консоли) — иначе
+//       следующий скан стартует с лишнего up-edge и счётчик сбивается.
+//
+//   PCF8574: обновляет выходы ТОЛЬКО на условии STOP. Каждая фаза SELECT —
+//   отдельная I2C-транзакция со STOP (Repeated-START не подходит).
+//
+//   Маска пада (как GPGX input.pad):
+//     UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08 A=0x10 B=0x20 C=0x40
+//     START=0x80 X=0x100 Y=0x200 Z=0x400 MODE=0x800
+//
+//   ЗАЩЁЛКА на пакет: pad накапливается через |= — кнопка, пойманная хоть в
+//   одной фазе, не снимается до конца скана (отсекает дребезг контакта).
+
+#include <stdint.h>
+#include <string.h>
+#include "sega_pad.h"
+#include "pcf8574_bb.h"
+#include "h3.h"
+#include "h3_hs_timer.h"
+#include "uart.h"
+
+extern int printf(const char* fmt, ...);
+
+// ---- SCL = PG9, SDA = PG8 (GPIO на порту G, бит-банг I2C) ----
+// r614: перенос с PA11/PA12 (TWI0) на PG9/PG8 — убрать неатомарные RMW
+// записи в PA_DAT (делится с i2s-SD PA10 и CPU1-TFT PA21) из горячего пути
+// бит-банга (см. RMW-гонку PA_DAT, sega_pad.c:26-30/tft_drv.c:176-182).
+// Пины: разъём 40-pin — PG9=pin36, PG8=pin32. Функция GPIO: CFG=1.
+// Далее логика протокола НЕ меняется («1 в 1»): только база порта и пины.
+#define SCL_PIN  9
+#define SDA_PIN  8
+
+#define PG_BASE  0x01C208D8u   // H3_PIO_PORTG_BASE (порт G)
+#define PG_CFG1  (*(volatile uint32_t*)(PG_BASE + 0x04u))   // PG8..PG15
+#define PG_DAT   (*(volatile uint32_t*)(PG_BASE + 0x10u))
+
+static inline void pa_scl_out(int v) {
+    uint32_t cfg = PG_CFG1;
+    int shift = (SCL_PIN % 8) * 4;
+    if (v) { PG_DAT |=  (1u << SCL_PIN); cfg = (cfg & ~(0xFu << shift)) | (0x1u << shift); }
+    else   { PG_DAT &= ~(1u << SCL_PIN); cfg = (cfg & ~(0xFu << shift)) | (0x1u << shift); }
+    PG_CFG1 = cfg;
+}
+
+static inline void pa_sda_out(int v) {
+    uint32_t cfg = PG_CFG1;
+    int shift = (SDA_PIN % 8) * 4;
+    if (v) { PG_DAT |=  (1u << SDA_PIN); cfg = (cfg & ~(0xFu << shift)) | (0x1u << shift); }
+    else   { PG_DAT &= ~(1u << SDA_PIN); cfg = (cfg & ~(0xFu << shift)) | (0x1u << shift); }
+    PG_CFG1 = cfg;
+}
+
+static inline void pa_sda_in(void) {
+    uint32_t cfg = PG_CFG1;
+    cfg &= ~(0xFu << ((SDA_PIN % 8) * 4));
+    PG_CFG1 = cfg;
+}
+
+static inline int pa_sda_read(void) { return (PG_DAT & (1u << SDA_PIN)) ? 1 : 0; }
+
+// Полупериод SCL: 130 тиков @~97 МГц = ~1.3 мкс → SCL ~370 кГц.
+// Медленнее (92 кГц) 6-btn детект не успевает за окно 1.6 мс ↔
+// r0.390: не-static — общий с btn_pad.c (pcf8574_bb.h), «один поток» bit-bang.
+void i2c_t_half(void) {
+    const uint32_t t0 = H3_HS_TIMER->CURNT_LO;
+    while ((t0 - H3_HS_TIMER->CURNT_LO) < 130) {
+        __asm__ volatile("nop");
+    }
+}
+
+void i2c_start(void) { pa_sda_out(1); pa_scl_out(1); i2c_t_half();
+                              pa_sda_out(0); i2c_t_half(); pa_scl_out(0); i2c_t_half(); }
+
+void i2c_stop(void)  { pa_sda_out(0); pa_scl_out(1); i2c_t_half();
+                              pa_sda_out(1); i2c_t_half(); }
+
+// Возвращает 0 = ACK, 1 = NACK
+int i2c_write_byte(uint8_t b) {
+    for (int i = 7; i >= 0; i--) {
+        pa_sda_out((b >> i) & 1); i2c_t_half();
+        pa_scl_out(1); i2c_t_half(); pa_scl_out(0); i2c_t_half();
+    }
+    pa_sda_in(); i2c_t_half();
+    pa_scl_out(1); i2c_t_half();
+    int ack = pa_sda_read();
+    pa_scl_out(0); i2c_t_half();
+    return ack;
+}
+
+// last=1 — NACK после последнего байта чтения
+uint8_t i2c_read_byte(int last) {
+    uint8_t b = 0;
+    pa_sda_in();
+    for (int i = 7; i >= 0; i--) {
+        pa_scl_out(1); i2c_t_half();
+        if (pa_sda_read()) b |= (1u << i);
+        pa_scl_out(0); i2c_t_half();
+    }
+    pa_sda_out(last ? 1 : 0); i2c_t_half();
+    pa_scl_out(1); i2c_t_half(); pa_scl_out(0); i2c_t_half();
+    pa_sda_in();
+    return b;
+}
+
+// (PCF8574_W/R — общие константы из pcf8574_bb.h)
+
+// Записать SELECT (TH=1/0) в PCF8574 со STOP — обновление выходов.
+static int pcf_select(uint8_t sel) {
+    i2c_start();
+    if (i2c_write_byte(PCF8574_W)) { i2c_stop(); return 0; }
+    if (i2c_write_byte(sel))       { i2c_stop(); return 0; }
+    i2c_stop();
+    return 1;
+}
+
+// Прочитать PCF8574.
+static int pcf_read(uint8_t* out) {
+    i2c_start();
+    if (i2c_write_byte(PCF8574_R)) { i2c_stop(); return 0; }
+    *out = i2c_read_byte(1);
+    i2c_stop();
+    return 1;
+}
+
+// Паузы фаз детекта 6-btn. 20 мкс/фазу: весь скан ~1.4 мс — внутри окна 1.6 мс
+// от первого up-edge SELECT (allpinouts/retrosix; gbppr). ВАЖНО: отсчёт через
+// h3_hs_timer_lo_us() (64-бит) — по CURNT_LO (32 бита) раз в ~44 с пауза
+// срабатывала мгновенно и детект срывался.
+#define TH_SETTLE_US 20   // после записи SELECT (установление TH)
+#define TH_HOLD_US   20   // после чтения (дать линиям устояться)
+#define TH_IDLE_US   20   // между холостыми фазами счётчика
+static inline void th_settle(void) {
+    uint32_t t0 = h3_hs_timer_lo_us();
+    while ((h3_hs_timer_lo_us() - t0) < TH_SETTLE_US) {}
+}
+
+static inline void th_hold(void) {
+    uint32_t t0 = h3_hs_timer_lo_us();
+    while ((h3_hs_timer_lo_us() - t0) < TH_HOLD_US) {}
+}
+
+static inline void th_idle(void) {
+    uint32_t t0 = h3_hs_timer_lo_us();
+    while ((h3_hs_timer_lo_us() - t0) < TH_IDLE_US) {}
+}
+
+static uint8_t g_raw[3] = {0xFF, 0xFF, 0xFF};
+static uint32_t g_scan_us = 0;
+static uint32_t g_status = 0;
+
+void sega_pad_get_raw(uint8_t out[3]) {
+    out[0] = g_raw[0]; out[1] = g_raw[1]; out[2] = g_raw[2];
+}
+
+uint32_t sega_pad_get_scan_us(void) { return g_scan_us; }
+uint32_t sega_pad_get_status(void)  { return g_status; }
+
+int sega_pad_init(void) {
+    static int g_init_logged = 0;
+    pa_scl_out(1);
+    pa_sda_in();
+    const uint32_t t0 = H3_HS_TIMER->CURNT_LO;
+    while ((t0 - H3_HS_TIMER->CURNT_LO) < 100000) {}
+
+    // PCF8574: P0..P6 = 1 (вход), P7 = 1 (TH=1, idle)
+    int ok = pcf_select(0xFF);
+    // r0.411: печать в boot-лог (пользователь просит видеть инит джоя при
+    // загрузке «как раньше»). Печатаем ОДИН раз — при старте; повторные
+    // re-init'ы (вход/выход эмулятора) лог не засоряют.
+    if (!g_init_logged) {
+        printf("sega_pad: init %s\n", ok ? "OK" : "FAIL");
+        g_init_logged = 1;
+    }
+    return ok;
+}
+
+// Полный скан 6-кнопочного геймпада (эталон Rosenberg/Thysell/SegaController).
+//
+//  SELECT-импульс №1: TH=1 читаем крестовину (D0-D3) + B/C (TL/TR)
+//                     TH=0 читаем A/Start (TL/TR) + маркер геймпада (D2/D3=0)
+//  SELECT-импульс №2: TH=1, TH=0 — холостые (счётчик чипа тикает)
+//  SELECT-импульс №3: TH=1 — читаем X/Y/Z/Mode (D0-D3) + B/C (TL/TR)
+//                     TH=0 — стоп/сброс (чип выходит из 6-btn режима)
+//
+// ВАЖНО: старшие кнопки приходят на HIGH ТРЕТЬЕГО импульса. Если сделать
+// лишний 4-й импульс или слишком длинные паузы — чип не активирует 6-btn
+// и на этом месте отдаёт крестовину (симптом «Mode на крестовине»).
+// ЗАЩЁЛКА на пакет: pad накапливается через |= — кнопка, пойманная хоть в
+// одной фазе, не снимается до конца скана (отсекает дребезг контакта).
+uint16_t sega_pad_scan(void) {
+    uint8_t r;
+    uint8_t r_dpad = 0xFF;   // байт фазы 1 (крестовина): 0 = линия занята
+    uint16_t pad = 0;
+    uint32_t t0 = h3_hs_timer_lo_us();
+
+    g_status = 0;
+
+    // --- ИМПУЛЬС 1, TH=1: крестовина (D0-D3) + B/C (TL/TR) ---
+    if (!pcf_select(0xFF)) return 0;    // TH=1
+    th_settle();
+    if (!pcf_read(&r)) return 0;
+    g_raw[0] = r;
+    r_dpad = r;
+    th_hold();
+    if (!(r & 0x01)) pad |= 0x01;  // Up
+    if (!(r & 0x02)) pad |= 0x02;  // Down
+    if (!(r & 0x04)) pad |= 0x04;  // Left
+    if (!(r & 0x08)) pad |= 0x08;  // Right
+    if (!(r & 0x10)) pad |= 0x20;  // B
+    if (!(r & 0x20)) pad |= 0x40;  // C
+
+    // --- ИМПУЛЬС 1, TH=0: A/Start (TL/TR) + маркер геймпада ---
+    if (!pcf_select(0x7F)) return 0;    // TH=0
+    th_settle();
+    if (!pcf_read(&r)) return 0;
+    g_raw[1] = r;
+    th_hold();
+    if (!(r & 0x10)) pad |= 0x10;  // A
+    if (!(r & 0x20)) pad |= 0x80;  // Start
+    if (!(r & 0x04) && !(r & 0x08)) g_status |= SEGA_STATUS_PAD;
+
+    // --- ИМПУЛЬСЫ 2-4: полный 6-button детект (gen_hw.txt + факт с железа):
+//     маркер D0-D3=0 на 6-й фазе (LOW), XYZ — на 7-й (HIGH) ---
+//   1:H(read) 2:L(read) 3:H(idl) 4:L(idl) 5:H(idl) 6:L(marker!) 7:H(XYZ!) 8:L(reset)
+    if (!pcf_select(0xFF)) return 0;    // TH=1 (ур.3, холостой)
+    th_idle();
+    if (!pcf_select(0x7F)) return 0;    // TH=0 (ур.4, холостой)
+    th_idle();
+    if (!pcf_select(0xFF)) return 0;    // TH=1 (ур.5, холостой)
+    th_idle();
+    if (!pcf_select(0x7F)) return 0;    // TH=0 (ур.6 — маркер)
+    th_settle();
+    if (!pcf_read(&r)) return 0;        // маркер 6-btn: D0-D3 должны быть 0000
+    if ((r & 0x0F) == 0) g_status |= SEGA_STATUS_PAD6;   // r152: не выходим, а метим
+    th_hold();
+
+    // --- ур.7: TH=1, X/Y/Z/Mode (D0-D3) + B/C (TL/TR) ---
+    if (!pcf_select(0xFF)) return 0;    // TH=1 (ур.7)
+    th_settle();
+    if (!pcf_read(&r)) return 0;
+    g_raw[2] = r;
+    th_hold();
+    // ЛИНИИ D0-D3 ОБЩИЕ: фаза 1 = крестовина, фаза 7 = Z/Y/X/Mode.
+    // Если крестовина держит линию (r_dpad bit = 0), в фазе 7 читается
+    // ФАНТОМ старшей кнопки (Right→Mode, Left→X, Down→Y, Up→Z) —
+    // реальная консоль различить их не может, поэтому не выдаём.
+    if ((r_dpad & 0x01) && !(r & 0x01)) pad |= 0x400;  // Z
+    if ((r_dpad & 0x02) && !(r & 0x02)) pad |= 0x200;  // Y
+    if ((r_dpad & 0x04) && !(r & 0x04)) pad |= 0x100;  // X
+    if ((r_dpad & 0x08) && !(r & 0x08)) pad |= 0x800;  // Mode
+    if (!(r & 0x10)) pad |= 0x20;   // B (защёлка — уже стоит из ИМПУЛЬС 1)
+    if (!(r & 0x20)) pad |= 0x40;   // C (защёлка)
+
+    // --- ур.8: TH=0 — сброс в idle (чип выходит из 6-btn режима) ---
+    if (!pcf_select(0x7F)) return 0;
+    th_idle();
+    // r151: idle-состояние пада = TH HIGH (как у консоли). Возвращаем TH=1,
+    // иначе следующий скан стартует с фронтом 0→1 «первого up-edge Sel».
+    pcf_select(0xFF);
+    th_idle();
+
+    g_status |= SEGA_STATUS_ACK;
+    g_scan_us = h3_hs_timer_lo_us() - t0;
+    return pad;
+}
