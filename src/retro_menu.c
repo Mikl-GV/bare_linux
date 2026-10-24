@@ -72,6 +72,8 @@ static int g_screen = RU_SYSTEMS;
 static int g_sys = 0;                    /* выбранная система для BROWSER */
 static int g_browser_sel = 0;
 static int g_browser_n = 0;
+static int g_browser_confirm = 0;        /* 1 = диалог подтверждения удаления */
+static char g_confirm_name[FAT_NAME_LEN];/* имя файла на подтверждении (копия) */
 static int g_placeholder_sel = 0;        /* 0=встроенный, 1=с SD */
 static int g_transfer_sel = 0;           /* выбранная сеть в Transfer */
 static int g_transfer_top = 0;           /* скролл списка сетей */
@@ -301,7 +303,14 @@ static void render_browser(void)
             y += ROW_H;
         }
     }
-    fb_text(60, FB_H - 30, "A=load  B=back", 0x00A0C0D0, 0x000D1A33);
+    if (g_browser_confirm && g_browser_n > 0) {
+        fb_rect(20, 150, FB_W - 20, 236, 0x00303050);
+        fb_rect(22, 152, FB_W - 22, 234, 0x000D1A33);
+        text_clipped(32, 168, "Delete this file?", 0x00FFFF00, 0x000D1A33);
+        text_clipped(32, 192, g_confirm_name, 0x00FFFFFF, 0x000D1A33);
+        fb_text(32, 214, "Enter=confirm  B=cancel", 0x00A0C0D0, 0x000D1A33);
+    }
+    fb_text(60, FB_H - 30, "A=load  Select=delete  B=back", 0x00A0C0D0, 0x000D1A33);
     fb_clean();
 }
 
@@ -695,7 +704,36 @@ void retro_menu_run(void)
                 dirty = 1;
             }
         } else if (g_screen == RU_BROWSER) {
-            if (p & BTN_UP) {
+            if (g_browser_confirm) {
+                /* Диалог удаления: Enter — удалить, B/Select — отмена.
+                   Первый Enter (Select) открыл диалог, второй — удаляет. */
+                if (p & BTN_A) {
+                    char dirbuf[FAT_NAME_LEN + 16];
+                    const char *pfx = "/roms/";
+                    int k = 0;
+                    for (const char *s = pfx; *s && k < (int)sizeof(dirbuf) - 1; s++)
+                        dirbuf[k++] = *s;
+                    for (const char *s = system_rom_dir(g_sys);
+                         *s && k < (int)sizeof(dirbuf) - 1; s++)
+                        dirbuf[k++] = *s;
+                    dirbuf[k] = 0;
+                    int rc = fat_delete(dirbuf, g_confirm_name);
+                    uart_print("rm: ");
+                    uart_print(dirbuf);
+                    uart_print("/");
+                    uart_print(g_confirm_name);
+                    uart_print(" rc=");
+                    uart_print_int(rc);
+                    uart_print("\r\n");
+                    g_browser_confirm = 0;
+                    g_confirm_name[0] = 0;
+                    load_browser();   /* обновить список после удаления */
+                    dirty = 1;
+                } else if (p & (BTN_B | BTN_SELECT)) {
+                    g_browser_confirm = 0;
+                    dirty = 1;
+                }
+            } else if (p & BTN_UP) {
                 if (g_browser_n > 1)
                     g_browser_sel = (g_browser_sel == 0) ? g_browser_n - 1 : g_browser_sel - 1;
                 dirty = 1;
@@ -703,6 +741,14 @@ void retro_menu_run(void)
                 if (g_browser_n > 1)
                     g_browser_sel = (g_browser_sel >= g_browser_n - 1) ? 0 : g_browser_sel + 1;
                 dirty = 1;
+            } else if (p & BTN_SELECT) {
+                /* Удаление: первый шаг — запомнить имя и показать диалог. */
+                if (g_browser_n > 0) {
+                    fat_entry_t *list = fat_scratch();
+                    form_cp(g_confirm_name, list[g_browser_sel].name);
+                    g_browser_confirm = 1;
+                    dirty = 1;
+                }
             } else if (p & BTN_A) {
                 /* Запуск эмулятора: диспетчер по id системы + ром из браузера.
                    Загружает ром с SD в RAM, вызывает ядро (если реализовано),

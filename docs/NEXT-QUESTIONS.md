@@ -14,8 +14,10 @@
   находит целевой раздел (с `/roms`, иначе первый валидный FAT32) из MBR;
   запись: mkdir/write_file/delete.
 - **Ретро-меню**: список систем (systems.h) → браузер ромов `/roms/<система>`
-  → запуск (заглушка диспетчера). Settings: Transfer (WiFi-скан/connect)
-  и Sound test (физ. кнопки: UP/DOWN частота 440/697/1209, A play/stop, B back).
+  → запуск (заглушка диспетчера). Удаление рома: Select → подтверждение
+  Enter (W.933). Settings: Transfer (WiFi-скан/connect), Sound test (физ.
+  кнопки: UP/DOWN частота 440/697/1209, A play/stop, B back), Storage test
+  (запись/чтение/удаление WTEST.TXT).
 - **USB-host (OHCI+EHCI) — флешка и клавиатура работают (W.929)**: на каждом
   OHCI-порту общий enum (`usb_ohci_enum_common`), класс устройства — по
   config-дескриптору (MSD 8/6/0x50 → `usb_ohci_msd_start`, HID boot 3/1/1 →
