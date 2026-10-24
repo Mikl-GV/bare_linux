@@ -278,3 +278,6 @@
 - Итоговый лог W.929: `INQUIRY ok: Generic Flash Disk`, `block=512
   last_lba=31334399`, `MBR sig=0xAA55`, FAT: `part lba=131072 sec/clu=16
   root_clu=2`, `sd: ready`.
+- **W.930**: штатный `CHECK CONDITION` у TUR (носитель ещё не готов) больше
+  не печатает CSW-дамп — он остаётся только для остальных команд; строка
+  порта печатается целиком после reset. Рабочий лог стал чистым.

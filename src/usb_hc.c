@@ -620,21 +620,23 @@ static int usb_ohci_claim_port(int port)
     static struct usb_msd_dev mdev;
     uint32_t wlen = 0;
 
-    uart_print("usb: port");
-    uart_print_int(port);
     if (!usb_ohci_port_connected(base)) {
+        uart_print("usb: port");
+        uart_print_int(port);
         uart_print(": no device (CCS=0)\r\n");
         return 0;
     }
     int rr = (port == 1) ? usb_ohci_port_reset_all1()
                          : usb_ohci_port_reset_all2();
     if (rr != 0) {
+        uart_print("usb: port");
+        uart_print_int(port);
         uart_print(": reset fail\r\n");
         return 0;
     }
-    /* Port reset печатает своё состояние сам — продолжаем той же строкой
-       порта только после него, чтобы лог не склеивался. */
-    uart_print("\r\nusb: port");
+    /* Port reset печатает своё состояние сам (usb_ohci.c), поэтому строку
+       порта печатаем целиком после него — иначе лог склеивается. */
+    uart_print("usb: port");
     uart_print_int(port);
     uart_print(": DEVICE on OHCI, enum...\r\n");
     if (usb_ohci_enum_common(base, cfg, sizeof(cfg), &wlen) != 0) return 0;

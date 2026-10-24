@@ -148,17 +148,21 @@ static int usb_msd_cmd(struct usb_msd_dev *dev, const uint8_t *cdb, uint8_t cb_l
     }
     struct usb_msd_csw *csw = (struct usb_msd_csw *)g_csw_buf;
     if (csw->signature != USB_MSD_CSW_SIG || csw->status != 0) {
-        uart_print("msd: csw op=0x");
-        uart_print_hex(cdb[0]);
-        uart_print(" sig=0x");
-        uart_print_hex(csw->signature);
-        uart_print(" tag=0x");
-        uart_print_hex(csw->tag);
-        uart_print(" status=");
-        uart_print_int((int)csw->status);
-        uart_print(" residue=");
-        uart_print_int((int)csw->residue);
-        uart_print("\r\n");
+        /* TUR (0x00) законно отвечает CHECK CONDITION, пока носитель не
+           готов (ретраи — usb_msd_wait_ready); его дамп только шумит. */
+        if (MSD_VERBOSE_LOG || cdb[0] != 0x00) {
+            uart_print("msd: csw op=0x");
+            uart_print_hex(cdb[0]);
+            uart_print(" sig=0x");
+            uart_print_hex(csw->signature);
+            uart_print(" tag=0x");
+            uart_print_hex(csw->tag);
+            uart_print(" status=");
+            uart_print_int((int)csw->status);
+            uart_print(" residue=");
+            uart_print_int((int)csw->residue);
+            uart_print("\r\n");
+        }
         return -5;
     }
     return 0;
