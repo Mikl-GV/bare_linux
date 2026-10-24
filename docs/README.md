@@ -38,6 +38,7 @@
 | **SD-карта (SDC0) + FAT32** | ✅ | Двухфазный init (Фаза A: наследование U-Boot без CMD0; Фаза B: полный подъём CMD0/8/ACMD41/2/3/7/9, 4-bit), чтение секторов PIO; FAT32-ридер (MBR→раздел с /roms, BPB, каталоги 8.3+LFN, цепочки кластеров) + запись: fat_mkdir/fat_write_file/fat_delete. Удаление рома прямо из браузера — Select → подтверждение Enter (W.933). |
 | **USB-host (EHCI+OHCI) + MSD** | ✅ | Полный подъём USB: PHY1 (EHCI 0x01C1B000, HS-устройства) + OHCI обоих портов (FS/LS). CCU gate/reset (25/29 и 26/30), CCU USB_CLK_CFG 0x0CC (reset/clock PHY, clock OHCI), SIDDQ снят (pmu1 0x01C1B810 bit1=0), passby 0x701. **Флешка работает (W.929)**: INQUIRY → READ CAPACITY → READ(10)/WRITE(10)/TUR, MBR и FAT32 (через `fat_set_block_source`, USB — если SD нет), запись/удаление файлов; самопроверка — Settings → Storage test (W.931). Порт не важен: класс устройства (MSD 8/6/0x50 или HID-клавиатура) определяется по config-дескриптору, флешка и клавиатура работают в любом из двух разъёмов. Клавиатура (LS/FS) — interrupt-IN через OHCI. |
 | **SMP (4 ядра Cortex-A7)** | ✅ | Подъём CPU1 (слой звука через почту); CPU2/CPU3 припаркованы (задел под эмуляторы). |
+| **Эмулятор Atari Lynx** | 🚧 | Первый эмулятор (WU.1.000): ядро Handy (порт libretro-handy) как независимый C++-слой. Ром — с SD/USB из `/roms/lynx/`; экран — оригинальный 160×102 (портрет, поворот на HDMI); звук — CPU1 через почту (i2s/DMA). Прогон на железе — в работе. |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -231,8 +232,8 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ на 0
 ```
 
 - Сборка многопоточная при желании: `make -j8 bin`.
-- Версия прошивки (`FW vW.xxx`) авто-инкрементируется при сборке
-  (`tools/scripts/bump_version.sh`), выводится по UART и на экран.
+- Версия прошивки (`FW vWU.MAJOR.MINOR`, сборки с WU.1.000) авто-инкрементируется
+  при сборке (`tools/scripts/bump_version.sh`), выводится по UART и на экран.
 - Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~113 КБ).
 
 ## Заливка

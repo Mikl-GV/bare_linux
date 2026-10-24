@@ -5,6 +5,7 @@
 SHELL      := sh
 TOOLCHAIN  ?= /c/ARM/gcc-arm-none-eabi-15.2.1/bin
 CC         := $(TOOLCHAIN)/arm-none-eabi-gcc
+CXX        := $(TOOLCHAIN)/arm-none-eabi-g++
 OBJCOPY    := $(TOOLCHAIN)/arm-none-eabi-objcopy
 SIZE       := $(TOOLCHAIN)/arm-none-eabi-size
 
@@ -16,10 +17,17 @@ OBJDIR     := build
 SRC_C := main.c uart.c ports.c sys.c h3_mmu.c h3_dma.c i2s.c gic.c \
          h3_i2c_bb.c pcf8574.c display.c h3_de2.c h3_lcd.c h3_hdmi.c \
          dw_hdmi.c h3_display.c wifi_layer.c secure.c font8x8.c h3_sdc.c wpa_crypto.c wifi_net.c \
-         h3_sdc0.c h3_smp.c fat.c retro_menu.c mem.c mailbox.c emulator.c usb_hc.c usb_msd.c usb_ohci.c usb_kbd.c
+         h3_sdc0.c h3_smp.c fat.c retro_menu.c mem.c mailbox.c emulator.c usb_hc.c usb_msd.c usb_ohci.c usb_kbd.c \
+         audio_cpu1.c
+# Слой Atari Lynx (Handy) — независимый C++-ядро + микшер blip.
+SRC_CXX := lynx/_support.cpp lynx/lynxdec.cpp lynx/cart.cpp lynx/memmap.cpp \
+           lynx/mikie.cpp lynx/ram.cpp lynx/rom.cpp lynx/susie.cpp lynx/system.cpp lynx/eeprom.cpp \
+           blip/Blip_Buffer.cpp blip/Stereo_Buffer.cpp lynx_emu.cpp
 SRCS  := $(addprefix $(SRCDIR)/,$(SRC_C))
+SRCSXX := $(addprefix $(SRCDIR)/,$(SRC_CXX))
 ASM   := boot.s fw_blob.S
-OBJS  := $(OBJDIR)/boot.o $(OBJDIR)/fw_blob.o $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
+OBJS  := $(OBJDIR)/boot.o $(OBJDIR)/fw_blob.o $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS)) \
+         $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SRCSXX))
 
 CFLAGS := -mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard \
           -O2 -g -Wall -Wextra -ffreestanding -fno-builtin -nostdlib \
@@ -27,6 +35,14 @@ CFLAGS := -mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard \
           -fno-unwind-tables -fno-asynchronous-unwind-tables \
           -MMD -MP \
           -I$(INCDIR) -Isrc
+# C++ для слоя Lynx (ядро Handy): без исключений/RTTI/libstdc++.
+CXXFLAGS := -mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard \
+            -O2 -g -Wall -Wextra \
+            -fno-exceptions -fno-rtti -fno-threadsafe-statics \
+            -fno-stack-protector -fno-common \
+            -fno-unwind-tables -fno-asynchronous-unwind-tables \
+            -MMD -MP \
+            -I$(INCDIR) -Isrc -Isrc/lynx -Isrc/blip
 LDFLAGS := -T linker.ld -nostartfiles -nostdlib -Wl,--no-warn-rwx-segments -lgcc
 
 # Автозависимости от заголовков (генерируются -MMD; см. %.d ниже).
@@ -57,6 +73,14 @@ bump:
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
+	@mkdir -p $(OBJDIR)/lynx
+	@mkdir -p $(OBJDIR)/blip
+
+$(OBJDIR)/lynx:
+	mkdir -p $(OBJDIR)/lynx
+
+$(OBJDIR)/blip:
+	mkdir -p $(OBJDIR)/blip
 
 $(OBJDIR)/boot.o: boot.s | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -70,6 +94,10 @@ $(OBJDIR)/main.o: $(SRCDIR)/main.c $(VERSION_H) | $(OBJDIR)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/%.o: $(SRCDIR)/%.cpp | $(OBJDIR)
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(TARGET).elf: $(OBJS) linker.ld
 	$(CC) $(CFLAGS) $(OBJS) -T linker.ld -nostartfiles -nostdlib \

@@ -75,13 +75,8 @@ int emu_load_rom(const char *path, uint32_t *out_addr, uint32_t *out_size)
     for (uint32_t i = 0; dir[i] && li < sizeof(lookup) - 1; i++)
         lookup[li++] = (dir[i] == '/') ? '/' : dir[i];   /* уже с '/' */
     lookup[li] = 0;
-    if (fat_find("roms", lookup + 1, &fe) == 0) {
-        /* иначе пробуем "roms" как корень: fat_find("roms","name") */
-    }
-    /* Через fat_find ищем файл в каталоге dir относительно /roms. */
-    if (fat_find("roms", name, &fe) == 0) {
-        if (fat_find(dir, name, &fe) == 0) return EMU_ERR_ROM;
-    }
+    /* Ищем файл с полным путём "dir/name" (dir = "roms/<система>"). */
+    if (fat_find(dir, name, &fe) == 0) return EMU_ERR_ROM;
     if (fe.size == 0) return EMU_ERR_ROM;
 
     /* Зона ROM. */

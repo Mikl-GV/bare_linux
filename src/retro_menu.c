@@ -768,6 +768,8 @@ void retro_menu_run(void)
                          *s && k < (int)sizeof(rompath) - 1; s++)
                         rompath[k++] = *s;
                     rompath[k] = 0;
+                    extern void lynx_register(void);
+                    lynx_register();   /* слои регистрируют свои ядра при запуске */
                     int erc = emulator_run(g_sys, rompath, list[g_browser_sel].size);
                     if (erc != EMU_OK) {
                         /* ядро не реализовано или ошибка загрузки — короткий

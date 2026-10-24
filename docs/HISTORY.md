@@ -6,6 +6,8 @@
 
 ## Этап 1 — Звук (I2S0 → MAX98357A), W.000-W.099
 
+> Нумерация сборок: **с этапа эмуляторов (WU.1.000) формат заменён с `W.<minor>` на `WU.<major>.<minor>`**. Скрипт `tools/scripts/bump_version.sh` инкрементирует `FW_VERSION_MINOR` (3 знака), при переполнении 999 — `FW_VERSION_MAJOR+1`, minor сброс.
+
 - С нуля переписан I2S/DMA по даташиту H3 V1.2 (§8.6) и драйверу sun8i-h3-i2s.c.
 - Ключевые находки: I2SPCM0_CLK mux=11 (PLL_AUDIO 1X), TXIM=0 (данные в MSB),
   секции .coherent/.dma_buf на 1МБ-границах, **H3 не кэш-когерентен для DMA
@@ -294,3 +296,21 @@
   нажат — диалог «Delete this file?», второй (Enter) — fat_delete; B/Select
   — отмена. Лог m: /roms/<система>/<файл> rc=N. Подсказка внизу
   браузера «A=load  Select=delete  B=back». (Прогон на железе — за владельцем.)
+
+## Этап 14 — Эмуляторы. Atari Lynx (WU.1.000)
+
+- **Нумерация сборок сменилась**: с этого этапа формат `W.<minor>` заменён на
+  `WU.<major>.<minor>` (bump-скрипт обновлён, первая сборка — WU.1.000).
+- **Слой Lynx (ядро Handy, порт libretro-handy)**: независимый C++-слой
+  (`src/lynx/*.cpp` + `src/blip/*`) + glue `src/lynx_emu.cpp`. C++ компилируется
+  в bare-metal (CXX, new/delete/malloc/floor/str* в `_support.cpp`).
+  - Ром: из FAT (SD или USB) в ROM-зону, BIOS — HLE (без lynxboot.img);
+  - Экран: оригинальное разрешение 160x102 (портрет), поворот 90° в
+    fb 1024x600, пиксель XRGB8888;
+  - Звук: `FetchAudioSamples()` → `gAudioBuffer` (uncached `.coherent`) →
+    почта `MB_MSG_AUDIO_DATA` → CPU1 (`audio_cpu1.c`) → `i2s_write` (DMA);
+  - Кнопки: PCF8574 → биты Handy (SetButtonData); выход — длинное нажатие START.
+- **Фикс загрузки рома**: `emu_load_rom` больше не делает лишний
+  `fat_find("roms", name)` — ищет файл напрямую `fat_find(dir, name)`.
+- Сборка слоя возможна только чистой (`make clean && make -j8 bin`).
+- Прогон на железе — за владельцем (нужен .lnx-ром в `/roms/lynx/`).

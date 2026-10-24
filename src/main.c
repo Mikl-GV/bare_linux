@@ -40,7 +40,8 @@ void kmain(void)
     mb_init();
     /* Поднять вторичные ядра: CPU1 (слой звука через почту), CPU2/CPU3
        «потушены» (не поднимаем) — архитектура ядер проекта. */
-    h3_smp_boot(0);
+    extern void audio_cpu1_main(void);
+    h3_smp_boot(audio_cpu1_main);
     /* GIC: инициализировать distributor + CPU interface, включить обе группы
        (U-Boot закрывает GIC; без этого DMA/SPI прерывания не маршрутизируются). */
     gic_init();
