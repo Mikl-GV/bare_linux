@@ -104,6 +104,9 @@ static void cpuN_loop(void)
     }
 }
 
+/* Запустить ОДНО вторичное ядро (PSCI в non-secure, либо трамплин SRAM A1). */
+static int h3_smp_start_cpu(int cpu, void (*entry)(void));
+
 int h3_smp_start_secondaries(void (*entry)(void))
 {
     int started = 1;   /* ядро-0 (мы) уже работает */
@@ -113,18 +116,7 @@ int h3_smp_start_secondaries(void (*entry)(void))
     uart_print(")\r\n");
 
     for (int cpu = 1; cpu <= 3; cpu++) {
-        if (scr & 1u) {
-            /* Non-secure: R_CPUCFG закрыт — будим через PSCI. */
-            uint32_t r = h3_psci_cpu_on((uint32_t)cpu, (uint32_t)entry);
-            uart_print("smp: CPU");
-            uart_print_int(cpu);
-            uart_print(" PSCI ret=0x");
-            uart_print_hex(r);
-            uart_print("\r\n");
-            if (r == 0) started++;
-        } else {
-            if (h3_secondary_start(cpu, entry)) started++;
-        }
+        if (h3_smp_start_cpu(cpu, entry)) started++;
     }
     uart_print("smp: secondaries up: ");
     uart_print_int(started - 1);
@@ -132,10 +124,30 @@ int h3_smp_start_secondaries(void (*entry)(void))
     return started;
 }
 
-/* Публичная обёртка: глобальный entry + запуск вторичных. Вызывается
- * один раз в kmain сразу после старта (до/вместо прочих инициализаций). */
+/* Запустить ОДНО вторичное ядро (PSCI в non-secure, либо трамплин SRAM A1). */
+static int h3_smp_start_cpu(int cpu, void (*entry)(void))
+{
+    uint32_t scr = h3_read_scr();
+    if (scr & 1u) {
+        /* Non-secure: R_CPUCFG закрыт — будим через PSCI. */
+        uint32_t r = h3_psci_cpu_on((uint32_t)cpu, (uint32_t)entry);
+        uart_print("smp: CPU");
+        uart_print_int(cpu);
+        uart_print(" PSCI ret=0x");
+        uart_print_hex(r);
+        uart_print("\r\n");
+        return (r == 0) ? 1 : 0;
+    }
+    return h3_secondary_start(cpu, entry) ? 1 : 0;
+}
+
+/* Публичная обёртка: поднять ТОЛЬКО CPU1 (слой звука через почту). CPU2/CPU3
+ * «потушены» (не поднимаем) — по архитектуре ядер проекта (см. память):
+ * CPU0 — эмулятор/меню/WiFi, CPU1 — звук, CPU2 — SPI-экран (позже),
+ * CPU3 — резерв. Вызывается один раз в kmain (после mb_init). */
 void h3_smp_boot(void (*entry)(void))
 {
     g_sec_entry = entry ? entry : cpuN_loop;
-    h3_smp_start_secondaries(g_sec_entry);
+    uart_print("smp: boot cpu1 (audio), cpu2/3 parked\r\n");
+    h3_smp_start_cpu(1, g_sec_entry);
 }

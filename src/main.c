@@ -13,6 +13,8 @@
 #include "h3_smp.h"
 #include "retro_menu.h"
 #include "version.h"
+#include "mailbox.h"
+#include "usb.h"
 
 /* Индикатор «я жив» (heartbeat на LED): переключать каждые ~500 мс. */
 static uint32_t led_last = 0;
@@ -34,8 +36,10 @@ void kmain(void)
     secure_unlock();
     /* Таймер ДО SMP: h3_smp_boot/udelay работают через HSTMR (sys_timer_init). */
     sys_timer_init();
-    /* Поднять все 4 ядра Cortex-A7 сразу при старте: вторичные (CPU1..CPU3)
-       уходят в idle-цикл (заглушка под будущие задачи). */
+    /* Почта CPU0<->CPU1: инициализировать ДО старта CPU1 (область uncached). */
+    mb_init();
+    /* Поднять вторичные ядра: CPU1 (слой звука через почту), CPU2/CPU3
+       «потушены» (не поднимаем) — архитектура ядер проекта. */
     h3_smp_boot(0);
     /* GIC: инициализировать distributor + CPU interface, включить обе группы
        (U-Boot закрывает GIC; без этого DMA/SPI прерывания не маршрутизируются). */
@@ -73,6 +77,14 @@ void kmain(void)
     }
 
     /* WiFi отдельным слоем (wifi_layer_start) — вызывается из меню (Settings). */
+
+    /* USB host: полный подъём с нуля (FEL+SPL — наследовать нечего).
+       Поднимает обе шины, ищет устройства; флешка ожидается на USB0. */
+    uart_print("usb init...\r\n");
+    int usb_devs = usb_hc_init();
+    uart_print("usb ok (devs=");
+    uart_print_int(usb_devs);
+    uart_print(")\r\n");
 
     /* Главное ретро-меню: блокирует, внутри крутит wifi_layer_poll() и
        кнопки PCF8574. Это основной экран системы. */

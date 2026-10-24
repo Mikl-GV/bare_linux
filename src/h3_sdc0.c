@@ -153,18 +153,19 @@ static int sdc0_write_block(uint32_t addr, const uint8_t *buf)
     return 0;
 }
 
-/* Индикатор «идёт опрос SD»: PA15 (LED_EN_SD) — АКТИВНЫЙ УРОВЕНЬ 0.
-   LED светится при логическом 0 на PA15: 0 = карта используется программой,
-   1 = не используется (горит постоянно вне операций, если не гасить).
+/* Индикатор «идёт опрос SD»: PA15 (LED_EN_SD) — АКТИВНЫЙ УРОВЕНЬ 1.
+   LED светится при логической 1 на PA15: 1 = карта используется программой,
+   0 = не используется (гаснет вне операций; на этой плате выход и так
+   даёт 1 по умолчанию, поэтому токен OFF обязан писать 0 явно).
    PA15 = output (config1, function 1) — настраиваем при каждом включении
    (дёшево: одна запись MMIO), чтобы не зависеть от порядка вызовов. */
 #define SD0_LED_ON()  do { \
         set_pin_mode(PORTA, 15, 1); \
-        set_pin_data(PORTA, 15, 0); \
+        set_pin_data(PORTA, 15, 1); \
         __asm volatile("dmb sy" ::: "memory"); \
     } while (0)
 #define SD0_LED_OFF() do { \
-        set_pin_data(PORTA, 15, 1); \
+        set_pin_data(PORTA, 15, 0); \
         __asm volatile("dmb sy" ::: "memory"); \
     } while (0)
 

@@ -16,7 +16,7 @@ OBJDIR     := build
 SRC_C := main.c uart.c ports.c sys.c h3_mmu.c h3_dma.c i2s.c gic.c \
          h3_i2c_bb.c pcf8574.c display.c h3_de2.c h3_lcd.c h3_hdmi.c \
          dw_hdmi.c h3_display.c wifi_layer.c secure.c font8x8.c h3_sdc.c wpa_crypto.c wifi_net.c \
-         h3_sdc0.c h3_smp.c fat.c retro_menu.c mem.c mailbox.c
+         h3_sdc0.c h3_smp.c fat.c retro_menu.c mem.c mailbox.c emulator.c usb_hc.c usb_msd.c usb_ohci.c usb_kbd.c
 SRCS  := $(addprefix $(SRCDIR)/,$(SRC_C))
 ASM   := boot.s fw_blob.S
 OBJS  := $(OBJDIR)/boot.o $(OBJDIR)/fw_blob.o $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
@@ -43,9 +43,13 @@ BUMP_SCRIPT := tools/scripts/bump_version.sh
 VERSION_H   := include/version.h
 MSYS_BIN    := /c/msys64/usr/bin
 
-# Увеличить версию перед сборкой (независимо от того, вызван all или bin).
-all: bump $(TARGET).elf
-bin: bump $(TARGET).elf
+# Увеличить версию ДО компиляции. Вызов через рекурсивный make обязателен:
+# при `make -j` цели bump и $(TARGET).elf иначе стартуют параллельно, и
+# main.c успевает собраться со старой версией (в логе W.907 вместо W.908).
+all: bump
+	@$(MAKE) --no-print-directory $(TARGET).elf
+bin: bump
+	@$(MAKE) --no-print-directory $(TARGET).elf
 	$(OBJCOPY) -O binary $(TARGET).elf $(TARGET).bin
 
 bump:

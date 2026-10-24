@@ -119,8 +119,8 @@
   пины PC0..PC5 (function 2), CMD0/CMD8/CMD55+ACMD41(HCS)/CMD2/CMD3/CMD7/
   ACMD6(4-bit)/CMD16/CMD58(SDSC/SDHC). Чтение/запись сектора PIO (1 блок).
 - **FAT32 (чтение)**: `fat.c`/`fat.h` — поиск целевого раздела из MBR
-  (типы 0x0B/0x0C/0x06, приоритет раздела с папкой `/roms`; системный
-  раздел с boot.scr пропускается), BPB, каталоги 8.3+LFN, цепочки
+  (типы 0x0B/0x0C, приоритет раздела с папкой `/roms`; теперь — первый
+  валидный FAT32, если `/roms` нет), BPB, каталоги 8.3+LFN, цепочки
   кластеров, `fat_read_file`. Запись — отдельным этапом (системный раздел
   сейчас только чтение).
 - **Ретро-меню** (`retro_menu.c`/`retro_menu.h`): главный экран — список
@@ -148,7 +148,7 @@
   описание платформы (проц / ОЗУ / частота / год) внизу экрана;
   **сортировка по годам** внутри групп (Portable/Consoles/Arcade/Computers/Laptops);
   не-ASCII символы (`·`, `μ`) в описаниях заменены на ASCII (шрифт 8x8 не имеет).
-- **PA15 = EN_SD** (LED_EN_SD, активный уровень 0): горит ТОЛЬКО на время
+- **PA15 = EN_SD** (LED_EN_SD, активный уровень 1): горит ТОЛЬКО на время
   операций с картой (токены `SD0_LED_ON/OFF` в `h3_sdc0.c`), постоянного
   включения в меню нет (`sd_enable` из меню убран).
 - **Индикатор жизни процессора**: мигание PL10 (~500 мс) вызывается из `udelay`
@@ -172,10 +172,11 @@
   atari8/cave/pc98/pc286/pc386, Vectrex=vectrex, C64=Computer, cps2, ~113 КБ),
   DEVELOPER-GUIDE (ревизия, PA15-токены), NEXT-QUESTIONS (W.821), HISTORY
   (этапы 8/9, PA15), LAKKA-ETALON (fw_nic.bin = 18802).
-- **PA15 (LED_EN_SD) — ИНВЕРСИЯ уровня (W.823)**: LED светится при логическом 0.
-  `SD0_LED_ON()` пишет 0 (карта используется → горит), `SD0_LED_OFF()` — 1 (гаснет).
-  Раньше 0 = погашен, и вне операций LED горел постоянно (инвертированная
-  аппаратная логика LED_EN_SD). Комментарии/доки «активный уровень 0».
+- **PA15 (LED_EN_SD) — активный уровень 1 (W.823, уточнено W.825)**: LED
+  светится при логической 1 на PA15. `SD0_LED_ON()` пишет 1 (карта
+  используется → горит), `SD0_LED_OFF()` — 0 (гаснет). Экранная правка W.823
+  с акт. уровнем 0 давала постоянное свечение (выход по умолчанию 1);
+  на этой плате LED_EN_SD активен по высокому уровню.
 - **Экран Transfer перерисовывается при получении IP (W.824)**: в главном цикле
   меню `transfer_ip_state()` (свёрнутый IP+ACK) сравнивается каждую итерацию;
   при изменении ставится `dirty=1` — IP появляется на экране БЕЗ нажатия кнопки
@@ -194,3 +195,86 @@
     и помечается uncached в i2s.c.
   - Архитектура ядер (предварительно): CPU0 — эмулятор/меню/WiFi, CPU1 — звук
     (DMA), CPU2/CPU3 — потушены (перспектива: SPI-экран/резерв).
+
+## Этап 11 — USB-host (OHCI), клавиатура в меню, звуковой тест, W.839-W.896
+
+- **USB-host с нуля (persist до W.896)**: FEL+SPL не наследует USB (U-Boot его
+  не инициализирует) — полный подъём CCU GATING0/RST0 (биты 25/29) +
+  USBPHY_CFG (биты 1/9/17) + SIDDQ снят (pmu1 0x01C1B810 bit1=0), passby/ICR
+  0x701 (0x01C1B800, 0x01C1B000+0x800). Порт работает через **OHCI** (эталон
+  pico-retro usb_ohci.c): per-port пулы ED/TD/HCCA в `.coherent`, root-port
+  PPS→PRS→CCS/PES, control через ED/TD+CLF+D-cache и ctrlhead/ctrlcur.
+- **OHCI per-port (W.839-w): PHY1** (USB1 0x01C1B400, флешка) и **PHY2**
+  (USB2 0x01C1C400, клавиатура) поднимаются и enum-ятся независимо; лог
+  `usb: ohci(idx) rev/port`, `DEVICE on OHCI`, `port after reset=0x303`.
+- **Клавиатура AVATTO i8 (0603:0002, донгл) enum-ится (W.844-w)**: GET_DESC(8)
+  → mps=8 (Low-Speed) → SET_ADDRESS(1) → полный config → парсинг boot-keyboard
+  (3,1,1) + EP IN → SET_CONFIGURATION + SET_PROTOCOL(boot). Лог:
+  `usb-kbd: vid=0x00000603 pid=0x00000002 mps=8`, `-> KEYBOARD (ep=...) ls=1`.
+- **Interrupt-IN (W.86x)**: периодический ED/TD в HCCA-таблицу (slot0),
+  PLE, переарм по снятию пакета (по эталону pico-retro usb_ohci.c:
+  `usb_ohci_intr_in_start/poll`).
+- **Баг «kbd: silent» (W.894)**: парсер config-дескриптора брал EP IN мыши
+  (0x82, интерфейс 1) вместо клавиатурных стрелок (0x81, интерфейс 0) —
+  композитный донгл (2 интерфейса). Исправление: сброс `type` на каждом
+  interface-дескрипторе (W.895). После фикса клавиатурный EP=0x81, отчёты
+  идут: `kbd rep: 00 00 51 ...` (0x51=Down, 0x52=Right, 0x4F=Left).
+- **Баг «постоянные автоповторы» (W.896)**: отпускание (пустой отчёт) не
+  сбрасывало `g_last_btn` — меню «прыгало». Исправление: пустой отчёт →
+  `g_last_btn=0`, автоповтор стрелок (первый через 350 мс, далее 90 мс);
+  документировано в
+  `docs/avatto-i8-pro-hid.md` (донгл шлёт отчёт только при изменении,
+  без повторов при удержании).
+- **Флешка (USB1) — STALL на OHCI (W.89x)**: GET_DESCRIPTOR при addr 0 падает
+  `data cc=0x08` (STALL). Причина: флешка High-Speed, а OHCI не ведёт HS;
+  результат из лога W.892, до переноса на EHCI. Задел EHCI (SIDDQ снят,
+  `usb_ehci_init_bus/ctrl/bulk`) — задача отдельного шага (задача 5).
+- **Sound test — физические кнопки (W.89x, собрано 125892)**: UP/DOWN
+  переключают частоту (440/697/1209 Гц), A=play/stop, B=back; кнопки PCF8574.
+- **Доки по клавиатуре добавлены в docs/**: `avatto-i8-pro-full.md`,
+  `avatto-i8-pro-hid.md` (протокол донгла 0603:0002, тайминги, алгоритм
+  short/long press), `keyboard-autorepeat-howto.md`.
+
+## Этап 12 — Аудит USB/FAT32 + фиксы (план W.9xx)
+
+- **FAT**: убрана бесконечная рекурсия `blk_read/blk_write` (источник по
+  умолчанию — SD); контекст тома вместо глобалов для честного поиска
+  раздела по `/roms`; только FAT32 (типы 0x0B/0x0C); total_sectors16,
+  «..»=0 для корня; запись: `fat_write_file`, `fat_delete`, расширение
+  полного каталога; кэш FAT-сектора (вдвое меньше чтений).
+- **USB**: EHCI error mask (Halted/DBE/Babble), SET_CONFIGURATION перед
+  MSD, статический `usb_msd_dev` (ушёл висячий g_dev), qTD-разбиение по
+  4К, bounce-буфер .coherent для MSD/HID, EP0 MPS из дескриптора
+  (usb_ohci_set_mps), приоритет источника SD→USB (флешка только при
+  неудаче SD), чистка мёртвого кода, отладочные принты под
+  USB_VERBOSE_LOG.
+- **mem**: ROM-зона больше не перекрывает стеки (резерв 2 МБ от верха).
+- Доки синхронизированы: README/DEVELOPER-GUIDE/NEXT-QUESTIONS/HARDWARE
+  (нумерация PHY1/PHY2, биты CCU 0x0CC, SIDDQ в pmuN+0x10, автоповтор
+  350/90 мс).
+
+## Этап 13 — USB Mass Storage на OHCI: флешка работает (W.926–W.929)
+
+- **Главная причина «тихих» отказов MSD**: `usb_msd_activate()` вызывался
+  после INQUIRY/TUR/READ CAPACITY. До активации `usb_bulk_*` возвращают -1
+  без печати — в логе оставались только `INQUIRY fail`/`TUR fail` без шага и
+  CSW. Теперь активация идёт сразу после `usb_msd_init()`, до любых команд.
+- **MPS эндпоинтов — пер-устройство**: глобальная таблица EP→MPS затиралась
+  клавиатурой (EP1/EP2 = 8 после её enum). MPS хранится в `usb_msd_dev`
+  (`ep_in_mps/ep_out_mps`) и передаётся в каждый `usb_bulk_*`.
+- **Bulk-ED на OHCI**: направление задаётся в ED (D=IN/OUT), а не «из TD» —
+  как в Linux и эталоне pico-retro.
+- **CLEAR_FEATURE(HALT)**: wIndex = номер EP с битом направления (было
+  0x02 — несуществующий EP2 OUT).
+- **Порт не важен**: класс устройства определяется по interface-дескрипторам
+  конфигурации (MSD 8/6/0x50 или HID boot 3/1/1); флешка и клавиатура
+  работают в любом из двух USB-разъёмов. Общий enum — `usb_ohci_enum_common`,
+  драйверы — `usb_ohci_msd_start` / `usb_kbd_init_on`.
+- **TUR с ретраями** (`usb_msd_wait_ready`, 3×100 мс): сразу после
+  SET_CONFIGURATION носитель отвечает CHECK CONDITION (CSW status=1).
+- **Диагностика**: `ohci-bulk: TIMEOUT …` (edhead/edtail/cmdst),
+  `msd: op=… CBW/DATA-IN/CSW fail`, дамп CSW; в рабочей сборке
+  `USB_VERBOSE_LOG=0`, `MSD_VERBOSE_LOG=0`.
+- Итоговый лог W.929: `INQUIRY ok: Generic Flash Disk`, `block=512
+  last_lba=31334399`, `MBR sig=0xAA55`, FAT: `part lba=131072 sec/clu=16
+  root_clu=2`, `sd: ready`.

@@ -35,7 +35,8 @@ uint32_t get_pin_data(uint32_t port, uint32_t pin)
 
 void set_pin_pull(uint32_t port, uint32_t pin, uint32_t pull)
 {
-    volatile uint32_t *pull_reg = (volatile uint32_t *)(port + 0x1C);   /* PULL0 */
+    /* Всев run-time: PULL0 (0x1C) на пины 0..15, PULL1 (0x20) на 16..31. */
+    volatile uint32_t *pull_reg = (volatile uint32_t *)(port + ((pin < 16) ? 0x1C : 0x20));
     uint32_t shift = (pin % 16) * 2;
     uint32_t v = *pull_reg;
     v &= ~(3u << shift);

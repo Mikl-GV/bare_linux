@@ -40,7 +40,10 @@ void mem_init(uint32_t heap_size)
     }
     if (rom_need > avail / 2) rom_need = avail / 2;   /* ROM не более половины */
 
-    mem_rom_end   = stack_top - 0x10000u;             /* 64 КБ на служебное у стека */
+    /* Резерв 2 МБ у верха DRAM: стеки исключений (0x5FF00000..0x5FF03000,
+       boot.s) и стек CPU1 (0x5FE00000, h3_smp.c) не должны пересекаться с
+       ROM-зоной. Раньше резерв был 64 КБ — ROM ~128 МБ затирал стеки. */
+    mem_rom_end   = 0x5FE00000u;
     mem_rom_start = mem_rom_end - rom_need;
 
     mem_heap_start = base;

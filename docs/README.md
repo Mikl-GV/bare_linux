@@ -35,8 +35,9 @@
 | **Звук I2S0 → MAX98357A** | ✅ | Чистый тест-тон 440/697/1209 Гц, DMA (sunxi-DMA → I2S). Работает в FEL и SD+U-Boot. |
 | **HDMI-меню 1024×600** | ✅ | Ретро-меню систем (systems.h) + браузер ромов с SD + Settings/Help/About. DE2/TCON1/HDMI по u-boot, кнопки PCF8574, LED PL10. |
 | **WiFi RTL8189FTV (SDIO)** | ✅ | Полный 802.11 join + WPA2 4-way + TX 3-стр кадров + полный DHCP (DISCOVER→OFFER→REQUEST→ACK, W.770) + **пинг с ПК (0% потерь, W.778)**. Экран Transfer (скан/connect) — внутри Settings. |
-| **SD-карта (SDC0) + FAT32** | ✅ | Двухфазный init (Фаза A: наследование U-Boot без CMD0; Фаза B: полный подъём CMD0/8/ACMD41/2/3/7/9, 4-bit), чтение секторов PIO; FAT32-ридер (MBR→раздел с /roms, BPB, каталоги 8.3+LFN, цепочки кластеров) + fat_mkdir (посев папок, не вызывается). |
-| **SMP (4 ядра Cortex-A7)** | ✅ | Подъём CPU1..CPU3 при старте (трамплин SRAM A1, R_CPUCFG / PSCI); ядра в idle-цикле (задел под эмуляторы). |
+| **SD-карта (SDC0) + FAT32** | ✅ | Двухфазный init (Фаза A: наследование U-Boot без CMD0; Фаза B: полный подъём CMD0/8/ACMD41/2/3/7/9, 4-bit), чтение секторов PIO; FAT32-ридер (MBR→раздел с /roms, BPB, каталоги 8.3+LFN, цепочки кластеров) + запись: fat_mkdir/fat_write_file/fat_delete. |
+| **USB-host (EHCI+OHCI) + MSD** | ✅ | Полный подъём USB: PHY1 (EHCI 0x01C1B000, HS-устройства) + OHCI обоих портов (FS/LS). CCU gate/reset (25/29 и 26/30), CCU USB_CLK_CFG 0x0CC (reset/clock PHY, clock OHCI), SIDDQ снят (pmu1 0x01C1B810 bit1=0), passby 0x701. **Флешка работает (W.929)**: INQUIRY → READ CAPACITY → READ(10)/WRITE(10)/TUR, MBR и FAT32 (через `fat_set_block_source`, USB — если SD нет). Порт не важен: класс устройства (MSD 8/6/0x50 или HID-клавиатура) определяется по config-дескриптору, флешка и клавиатура работают в любом из двух разъёмов. Клавиатура (LS/FS) — interrupt-IN через OHCI. |
+| **SMP (4 ядра Cortex-A7)** | ✅ | Подъём CPU1 (слой звука через почту); CPU2/CPU3 припаркованы (задел под эмуляторы). |
 | JTAG-отладка (JTAGprobe/Pico, OpenOCD) | ✅ | Пины PA0-PA3 (function 3), H3 сам JTAG не включает. |
 
 ### Этап WiFi (RTL8189FTV) — статус
@@ -98,6 +99,34 @@
 к SD из проводника Windows (связность с ПК подтверждена: ping — 0% потерь, W.778).
 Цель — «эмулятор + сетевой доступ к ROM на SD».
 Подробности: `NEXT-QUESTIONS.md`, `HARDWARE.md`.
+
+### Этап USB (host) — статус
+
+Поднят **USB-host на H3** для чтения флешки с ромами (альтернатива SD)
+и клавиатуры в меню.
+
+- **Аппаратура**: OTG/MUSB 0x01C19000 (там FEL-кабель, НЕ трогаем),
+  PHY1 — флешка (EHCI 0x01C1B000 / OHCI 0x01C1B400, DP1/DM1),
+  PHY2 — клавиатура (EHCI 0x01C1C000 / OHCI 0x01C1C400; AVATTO i8 0603:0002).
+- **Подъём с нуля** (при FEL+SPL наследовать нечего): CCU GATING0/RST0
+  (PHY1: 25/29, PHY2: 26/30) + CCU USB_CLK_CFG 0x0CC (reset/clock PHY,
+  clock OHCI), SIDDQ снят (pmu1 0x01C1B810 bit1=0), passby/ICR = 0x701
+  (pmu1 0x01C1B800) — по эталону `ref/allwinner-bare-metal/usb.c` (uli)
+  и U-Boot phy-sun4i-usb.
+- **OHCI-путь** (паттерн pico-retro `usb_ohci.c`): init без HCR
+  (fminterval/periodstart/lsperiod), root port PPS→PRS, ожидание CCS/PES,
+  per-port пулы ED/TD/HCCA в `.coherent`.
+- **Клавиатура (PHY2) — РАБОТАЕТ**: enum (0603:0002), support LS/FS
+  (EP0 MPS из дескриптора), interrupt-IN (периодический ED/TD, PLE),
+  отчёты клавиш; навигация в меню (стрелки/Enter/Esc), автоповтор
+  (первый повтор 350 мс, далее 90 мс). Доки протокола донгла:
+  `docs/avatto-i8-pro-hid.md`, `docs/avatto-i8-pro-full.md`.
+- **MSD (BOT, EHCI-путь)**: CBW/CSW, READ(10)/WRITE(10), INQUIRY,
+  SET_CONFIGURATION до MSD, READ(10) MBR-тест; блочные обёртки
+  `usb_msd_block_read/write` (bounce-буфер .coherent); FAT-абстракция
+  (`fat_set_block_source`). EHCI: qH/qTD (разбиение 4К-страниц), error mask.
+- **Флешка как источник**: меню пробует FAT по активному USB-блоку
+  ТОЛЬКО если SD недоступна (`/roms` на флешке — та же структура, что на SD).
 
 ## Системы и папки на SD
 

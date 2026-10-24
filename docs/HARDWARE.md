@@ -20,6 +20,12 @@
 | GIC dist / cpu | 0x01C81000 / 0x01C82000 | GIC-400 |
 | MMC0 (SD) | 0x01C0F000 | SD-карта |
 | MMC1 (SDC1) | 0x01C10000 | WiFi RTL8189FTV (PG0-PG5) |
+| USB0 (OTG/MUSB) | 0x01C19000 | FEL-кабель, НЕ трогаем |
+| PHY1: EHCI / OHCI | 0x01C1B000 / 0x01C1B400 | флешка (DP1/DM1) |
+| PHY2: EHCI / OHCI | 0x01C1C000 / 0x01C1C400 | клавиатура AVATTO i8 |
+| (EHCI0/OHCI0, OTG) | 0x01C1A000 / 0x01C1A400 | не используется |
+| USB PHY ctrl | 0x01C19400 | PHYCTL (A33) |
+| pmu1 / pmu2 | 0x01C1B800 / 0x01C1C800 | passby 0x701; SIDDQ в +0x10 bit1 |
 | HSTMR | 0x01C60000 | 64-bit счётчик вниз (~97 МГц) |
 | SRAM A1 | 0x00000000 | трамплин CPU1..3 |
 
@@ -247,14 +253,18 @@ Order: `CMD5/3/7 → pwon → fn1(CCCR 0x02) → fwdl`. [СТЕНД]
 
 ### Таблица разделов / FAT32 (W.78x)
 
-- Карта: **MBR**; системный раздел (0, boot.scr на FAT) + целевой (1):
-  `roms/`, `cheats/` (вся таблица 0x0B/0x0C/0x06 сканируется из MBR).
+- Карта: **MBR**; раздел выбирается по наличию `/roms` (типы 0x0B/0x0C —
+  только FAT32; FAT16 не поддерживается). На SD целевой раздел обычно 1,
+  на USB-флешке — 0.
 - FAT32-ридер (`fat.c`): ищет раздел, в корне которого есть папка `/roms`
-  (системный пропускается); BPB: sec/clu (13), reserved (14), fats (16),
-  fat_size (36), root_clu (44); data_start = part + reserved + fats*fat_size.
+  (если такого нет — первый валидный FAT32); BPB: sec/clu (13), reserved
+  (14), fats (16), fat_size (36), root_clu (44); data_start = part +
+  reserved + fats*fat_size.
 - Чтение: кластер→сектор `data_start + (cl-2)*spc`; FAT-цепочка по
-  `part + reserved + cl*4`; каталоги 8.3 + LFN (фрагменты в обратном
-  порядке на диске). Только чтение (запись — отдельный этап).
+  `part + reserved + cl*4` (с кэшем FAT-сектора); каталоги 8.3 + LFN
+  (фрагменты на диске от старшего номера к младшему). Запись:
+  fat_mkdir/fat_write_file (8.3-имя)/fat_delete. Источник секторов — SD
+  или USB-флешка (fat_set_block_source).
 
 ### Загрузка прошивки (MCUFWDL)
 

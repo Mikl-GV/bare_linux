@@ -11,9 +11,12 @@ static uint32_t s_scl_port, s_scl_pin;
 static uint32_t s_sda_port, s_sda_pin;
 
 static void scl_hi(void) { set_pin_mode(s_scl_port, s_scl_pin, 0); }          /* input -> подтяжка вверх */
-static void scl_lo(void) { set_pin_mode(s_scl_port, s_scl_pin, 1); set_pin_data(s_scl_port, s_scl_pin, 0); }
+/* Переход в «выход-0»: сначала пишем data=0, затем режим output.
+   Обратный порядок (mode, потом data) даёт короткий высокий импульс,
+   если в data-регистре осталась 1 от прошлого такта. */
+static void scl_lo(void) { set_pin_data(s_scl_port, s_scl_pin, 0); set_pin_mode(s_scl_port, s_scl_pin, 1); }
 static void sda_hi(void) { set_pin_mode(s_sda_port, s_sda_pin, 0); }          /* input -> подтяжка вверх */
-static void sda_lo(void) { set_pin_mode(s_sda_port, s_sda_pin, 1); set_pin_data(s_sda_port, s_sda_pin, 0); }
+static void sda_lo(void) { set_pin_data(s_sda_port, s_sda_pin, 0); set_pin_mode(s_sda_port, s_sda_pin, 1); }
 static uint32_t sda_read(void) { return get_pin_data(s_sda_port, s_sda_pin); }
 
 static void delay_half(void) { udelay(5); }   /* ~100 кГц */

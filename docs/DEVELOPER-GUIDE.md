@@ -152,17 +152,20 @@ seq данных в TX-дескрипторе).
 
 - **SD-карта** (`h3_sdc0.c`): двухфазный init — фаза A наследование U-Boot
   (только gate + CMD17, без сброса/CMD0; при загрузке с SD), фаза B полный
-  подъём (FEL). **PA15 = EN_SD** (LED_EN_SD, активный уровень 0) — горит
+  подъём (FEL). **PA15 = EN_SD** (LED_EN_SD, активный уровень 1) — горит
   только на время операций с картой (токены `SD0_LED_ON/OFF` внутри
   `h3_sdc0.c`); постоянного включения в меню нет.
 - **Структура SD** = как корень проекта: `roms/<система>/` в корне раздела
   (системный раздел с boot.scr не трогаем). Папки систем созданы в корне
   проекта `roms/`; на SD папки НЕ создаём автоматически (только отмечаем
   наличие рядом с пунктом меню `[OK]`).
-- **FAT32** (`fat.c`): MBR → раздел с `/roms` (или первый не-system), BPB,
-  каталоги 8.3+LFN, чтение файлов. `path_lookup("roms/<система>")` — поиск
-  папки системы внутри `/roms`. `fat_mkdir` реализован, но НЕ вызывается
-  автоматически (на будущее).
+- **FAT32** (`fat.c`): MBR → раздел с `/roms` (или первый валидный FAT32),
+  BPB, каталоги 8.3+LFN, чтение файлов. `path_lookup("roms/<система>")` —
+  поиск папки системы внутри `/roms`. Запись: `fat_mkdir`, `fat_write_file`
+  (8.3-имя, перезапись), `fat_delete`. FAT16 не поддерживается.
+- **Блочный источник**: по умолчанию SD (`h3_sdc0_read/write_sector`);
+  меню переключает на USB-флешку (`fat_set_block_source`) ТОЛЬКО при
+  неудаче SD (см. 6d).
 - **Ретро-меню** (`retro_menu.c`): список систем по группам (Portable /
   Consoles / Arcade / Computers / Laptops-PDAs), **сортировка по годам**
   внутри групп; описание платформы (проц/ОЗУ/частота/год) внизу экрана;
@@ -175,8 +178,71 @@ seq данных в TX-дескрипторе).
 - **Transfer перерисовывается при получении IP** (без кнопки): в главном цикле
   меню `transfer_ip_state()` сравнивается с предыдущим — при смене (OFFER/ACK)
   ставится `dirty=1` (`retro_menu.c`).
-- **PA15 (LED_EN_SD) — инверсия уровня**: LED светится при **0** на PA15;
-  `SD0_LED_ON()` пишет 0 (карта используется), `SD0_LED_OFF()` — 1 (гаснет).
+- **PA15 (LED_EN_SD) — инверсия уровня**: LED светится при **1** на PA15;
+  `SD0_LED_ON()` пишет 1 (карта используется), `SD0_LED_OFF()` — 0 (гаснет).
+
+## 6d. USB-host (флешка с ромами) — статус
+
+- **Зачем**: если SD нет — читать ромы с USB-флешки (`/roms`, та же структура).
+  Реализация — в `usb_hc.c` (подъём + OHCI), `usb_ohci.c/h` (OHCI-путь,
+  паттерн эталона pico-retro), `usb_msd.c/h` (BOT: CBW/CSW, READ10, блочные
+  обёртки), FAT-абстракция в `fat.c` (`fat_set_block_source`).
+- **Аппаратура**: OTG/MUSB 0x01C19000 (FEL, НЕ трогать), PHY1=флешка (EHCI
+  0x01C1B000 / OHCI 0x01C1B400, DP1/DM1), PHY2=клавиатура (EHCI/OHCI
+  0x01C1C000/0x01C1C400; AVATTO i8). (В даташите H3 эти контроллеры —
+  EHCI1/EHCI2; в проекте — нейтрально «PHY1/PHY2».)
+- **Подъём с нуля** (FEL+SPL — наследовать нечего; эталон
+  `ref/allwinner-bare-metal/usb.c`, uli + U-Boot phy-sun4i-usb): CCU
+  GATING0/RST0 (PHY1: 25/29, PHY2: 26/30), CCU USB_CLK_CFG 0x0CC (bitN =
+  reset PHY N, bit(8+N) = clock PHY N, bit(16+N) = clock OHCI N), SIDDQ
+  снят НЕ в CCU, а в pmuN+0x10 (0x01C1B810/0x01C1C810) bit1, passby 0x701
+  — в pmuN (0x01C1B800/0x01C1C800).
+- **OHCI-путь** (эталон `ref/pico-retro-new-gen-usb/usb_ohci.c`): init без
+  HCR (fminterval=0x2edf+fsmps, periodstart, lsperiod=0x628), root port
+  PPS→PRS, ожидание CCS/PES, per-port пулы ED/TD/HCCA. Порт работает:
+  `DEVICE on OHCI(idx)`, `port after reset=0x103` (CCS+PES).
+- **Клавиатура (PHY2) — РАБОТАЕТ**: `usb_kbd.c/h` (enum: GET_DESC→
+  SET_ADDRESS→config→boot-keyboard 3,1,1→EP IN→SET_CONFIGURATION+
+  SET_PROTOCOL), support LS/FS (EP0 MPS из дескриптора → usb_ohci_set_mps),
+  interrupt-IN (периодический ED/TD в HCCA, PLE; старт/poll в `usb_ohci.c`),
+  маппинг HID-кодов в BTN_* в `wait_btn` (retro_menu.c).
+  Донгл 0603:0002: отчёт 8 байт только при изменении; автоповтор свой
+  (первый повтор 350 мс, далее 90 мс, удержание до 0,7 с). Доки:
+  `docs/avatto-i8-pro-hid.md`, `avatto-i8-pro-full.md`.
+  Важно: парсер config-дескриптора должен сбрасывать `type` на каждом
+  интерфейсе (композит: клавиатура intf 0 + мышь intf 1) — иначе берётся
+  EP мыши и «kbd: silent» (W.894).
+- **MSD — РАБОТАЕТ (W.929)**: FS-флешка идёт через OHCI (EHCI FS/LS не
+  ведёт — порт отдаётся компаньону `PO=1`), HS — через EHCI. Общий enum для
+  обоих OHCI-портов — `usb_ohci_enum_common` (GET_DESC(8)→SET_ADDRESS(1)→
+  device→config 9/full→SET_CONFIGURATION), затем класс определяется по
+  interface-дескриптору: MSD 8/6/0x50 → `usb_ohci_msd_start`, HID boot
+  3/1/1 → `usb_kbd_init_on`. Порт не важен: флешка и клавиатура работают в
+  любом из двух разъёмов.
+- **Порядок MSD**: `usb_msd_activate()` — ДО любых команд (иначе
+  `usb_bulk_*` молча возвращает -1; именно так выглядели «тихие»
+  INQUIRY/TUR/READ CAPACITY), затем BOT recovery (GET_MAX_LUN, Bulk-Only
+  Reset 0xFF, CLEAR_FEATURE(HALT) с `wIndex = ep|0x80` для IN), INQUIRY,
+  `usb_msd_wait_ready` (TUR ×3 по 100 мс — носитель «просыпается»),
+  READ CAPACITY, MBR. MPS bulk-EP — в `usb_msd_dev`
+  (`ep_in_mps/ep_out_mps`): глобальная таблица EP→MPS затиралась
+  клавиатурой.
+- **Bulk на OHCI**: ED с явным направлением (D=IN/OUT), TD с явным toggle
+  (T=DATA0/DATA1), dummy-TD в TailP; каждый вызов пересоздаёт ED/TD.
+- **EHCI-путь (HS-флешка)**: `usb_ehci_init_bus(bus)` — HC reset, RS=1,
+  CONFIGFLAG=1, снятие SIDDQ (pmu1 0x01C1B810 bit1), port reset: USBSTS
+  W1C (HSE!), PORTSC пишется напрямую `PP|PR` (read-modify-write затирает
+  W1C-биты); `struct ehci_qh`/`ehci_qtd` (`include/usb.h`) — строго по EHCI
+  spec, qTD делит буфер на 4К-страницы (до 5 указателей, лимит 20 КБ);
+  `usb_ehci_ctrl` — control EP0 (C=1, MaxPacket=MPS, PID SETUP/IN/OUT,
+  маска ошибок Halted/DBE/Babble); `usb_bulk_in/out` → `usb_ehci_bulk`;
+  `usb_ehci_enumerate_msd` — тот же порядок, что и на OHCI.
+- **Диагностика MSD**: `usb-ohci: INQUIRY ok/block/last_lba`, `MBR sig`;
+  при сбое — `msd: op=… CBW/DATA-IN/CSW fail` (шаг), `ohci-bulk: TIMEOUT …`
+  (edhead/edtail/cmdst) или `ohci-bulk: fail … cc/h`. Шумные строки — под
+  `USB_VERBOSE_LOG`/`MSD_VERBOSE_LOG` (в рабочей сборке 0).
+- **Интеграция**: `sd_init_menu` при отсутствии SD переключает FAT на
+  USB-блок (если накопитель активен) — иначе SD всегда в приоритете.
 
 ## 7. Диагностика
 

@@ -12,6 +12,9 @@
 #include "sys.h"
 #include "ports.h"
 #include "version.h"
+#include "emulator.h"
+#include "usb_kbd.h"
+#include "usb_msd.h"
 
 /* Флаг «WiFi-слой активен» (пишет wifi_layer) — значок в шапке меню. */
 extern int wifi_active;
@@ -476,11 +479,22 @@ static uint32_t wait_btn(void)
     g_prev = btns;
     uint32_t now = micros() / 1000;
 
+    /* USB-клавиатура: нажатие клавиши = как зажатие физической кнопки
+       (автоповтор внутри usb_kbd_poll). */
+    uint32_t kbd = usb_kbd_poll();
+
     if (pressed) {
         /* зажали новую кнопку — обычное событие + начали отсчёт удержания */
         g_hold_start_ms = now;
         g_repeat_at_ms  = now + AR_HOLD_MS;
         return pressed;
+    }
+    if (kbd) {
+        /* клавиатура: событие сразу; свой автоповтор, не смешиваем
+           с удержанием физических кнопок */
+        g_hold_start_ms = 0;
+        g_repeat_at_ms  = 0;
+        return kbd;
     }
     if (btns == 0) {
         g_hold_start_ms = 0;   /* отпустили всё */
@@ -510,8 +524,8 @@ void led_heartbeat(void)
     }
 }
 
-/* Включить слот SD: PA15 = EN_SD/LED_EN_SD, АКТИВНЫЙ УРОВЕНЬ 0.
-   LED светится при логическом 0 (используется карта); гаснет при 1. */
+/* Включить слот SD: PA15 = EN_SD/LED_EN_SD, АКТИВНЫЙ УРОВЕНЬ 1.
+   LED светится при логической 1 (используется карта); гаснет при 0. */
 /* Инициализация SD при входе в меню: SDC0 + FAT32.
    PA15 (LED_EN_SD) здесь НЕ включается постоянно — он горит только на время
    операций с картой (токены SD0_LED_ON/OFF в h3_sdc0.c). */
@@ -521,6 +535,19 @@ static void sd_init_menu(void)
     uart_print("sd0: init...\r\n");
     if (h3_sdc0_init(&info) != 0) {
         uart_print("sd0: FAIL\r\n");
+        /* SD нет — пробуем USB-флешку (если накопитель активен после
+           usb_hc_init): «нет SD → читаем /roms с флешки». Источник
+           ставим ЗДЕСЬ, а не в usb_hc_init: иначе флешка перекрывала бы
+           SD при её наличии. */
+        if (usb_msd_active()) {
+            fat_set_block_source(usb_msd_block_read, usb_msd_block_write);
+            uart_print("fat: init (USB source)...\r\n");
+            if (fat_init() == 0) {
+                g_sd_ok = 1;   /* носитель есть (флешка) */
+                goto roms_probe;
+            }
+            uart_print("fat: FAIL (usb)\r\n");
+        }
         g_sd_ok = -1;
         return;
     }
@@ -532,7 +559,8 @@ static void sd_init_menu(void)
     }
     g_sd_ok = 1;
 
-    /* Только ОТМЕЧАЕМ наличие папок систем на SD (без создания!):
+roms_probe:
+    /* Только ОТМЕЧАЕМ наличие папок систем (без создания!):
        g_sys_has_dir нужен для [OK]/цвета. Папки систем лежат в roms/<система>
        (структура как в корне проекта) — ищем ВНУТРИ /roms, не в корне. */
     {
@@ -663,8 +691,39 @@ void retro_menu_run(void)
                     g_browser_sel = (g_browser_sel >= g_browser_n - 1) ? 0 : g_browser_sel + 1;
                 dirty = 1;
             } else if (p & BTN_A) {
-                g_screen = RU_PLACEHOLDER;
-                dirty = 1;
+                /* Запуск эмулятора: диспетчер по id системы + ром из браузера.
+                   Загружает ром с SD в RAM, вызывает ядро (если реализовано),
+                   на выходе освобождает память. */
+                if (g_browser_n > 0) {
+                    fat_entry_t *list = fat_scratch();
+                    char rompath[FAT_NAME_LEN + 16];
+                    int k = 0;
+                    const char *dir = system_rom_dir(g_sys);
+                    rompath[k++] = '/';
+                    rompath[k++] = 'r'; rompath[k++] = 'o'; rompath[k++] = 'm';
+                    rompath[k++] = 's'; rompath[k++] = '/';
+                    for (const char *s = dir; *s && k < (int)sizeof(rompath) - 1; s++)
+                        rompath[k++] = *s;
+                    rompath[k++] = '/';
+                    for (const char *s = list[g_browser_sel].name;
+                         *s && k < (int)sizeof(rompath) - 1; s++)
+                        rompath[k++] = *s;
+                    rompath[k] = 0;
+                    int erc = emulator_run(g_sys, rompath, list[g_browser_sel].size);
+                    if (erc != EMU_OK) {
+                        /* ядро не реализовано или ошибка загрузки — короткий
+                           лог, останемся в браузере (см. emulator.h) */
+                        uart_print("emu: run rc=");
+                        uart_print_int(erc);
+                        uart_print("\r\n");
+                    }
+                    /* После выхода из эмулятора — вернуться в браузер. */
+                    g_screen = RU_BROWSER;
+                    dirty = 1;
+                } else {
+                    g_screen = RU_PLACEHOLDER;
+                    dirty = 1;
+                }
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;
                 dirty = 1;
@@ -710,7 +769,21 @@ void retro_menu_run(void)
                 dirty = 1;
             }
         } else if (g_screen == RU_SOUND) {
-            if (p & BTN_A) {
+            /* UP/DOWN переключают частоту (440/697/1209), A=play/stop, B=back. */
+            static const int freqs[3] = { 440, 697, 1209 };
+            if (p & BTN_UP) {
+                int idx = 0;
+                while (idx < 2 && freqs[idx] != g_sound_freq) idx++;
+                g_sound_freq = freqs[(idx + 2) % 3];   /* на шаг вверх */
+                if (g_sound_on) { i2s_stop(); i2s_play_freq(g_sound_freq); }
+                dirty = 1;
+            } else if (p & BTN_DOWN) {
+                int idx = 0;
+                while (idx < 2 && freqs[idx] != g_sound_freq) idx++;
+                g_sound_freq = freqs[(idx + 1) % 3];   /* на шаг вниз */
+                if (g_sound_on) { i2s_stop(); i2s_play_freq(g_sound_freq); }
+                dirty = 1;
+            } else if (p & BTN_A) {
                 if (g_sound_on) { i2s_stop(); g_sound_on = 0; }
                 else { i2s_play_freq(g_sound_freq); g_sound_on = 1; }
                 dirty = 1;
