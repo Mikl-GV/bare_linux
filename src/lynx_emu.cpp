@@ -18,10 +18,11 @@ extern "C" {
 #include "emulator.h"
 #include "display.h"
 #include "mailbox.h"
-#include "pcf8574.h"
 #include "uart.h"
 #include "systems.h"
+#include "sys.h"
 }
+#include "emu_io.h"
 #include <string.h>
 
 /* Ядро Handy (C++). */
@@ -53,41 +54,47 @@ void i2s_stop(void);
 #define LB_DOWN   0x0080u
 #define LB_PAUSE  0x0100u
 
-static uint8_t g_lynx_fb[LYNX_W * LYNX_H * 4];
+static uint16_t g_lynx_fb[LYNX_W * LYNX_H];   /* RGB565, как в эталоне */
 static CSystem *g_sys = 0;
 static int g_lynx_registered = 0;
+static volatile int g_lynx_frame_ready = 0;   /* 1 = кадр отрисован (callback) */
+static uint32_t g_last_audio_sent = 0;   /* число отправленных аудиокусков (для ack) */
 
-/* Дисплейный callback Mikie: вернуть адрес буфера кадра. */
+/* Дисплейный callback Mikie: вернуть адрес буфера кадра. Mikie вызывает его
+ * в конце кадра — по факту готовности выходим из кадрового цикла (эталон
+ * pico-retro lynx_host.cpp: exit по lynx_frame_ready, а не только счётчик). */
 static UBYTE *lynx_display_get(ULONG objref)
 {
     (void)objref;
+    g_lynx_frame_ready = 1;
     return (UBYTE *)g_lynx_fb;
 }
 
-/* Кнопки платформы -> биты Handy. */
+/* Кнопки платформы -> биты Handy. Ввод через слой emu_io (ясдро не знает
+ * про PCF8574/USB/SEGA): emu_input_poll сводит все источники к PAD_*. */
 static uint32_t lynx_buttons_from_platform(void)
 {
-    uint32_t b = pcf8574_read();
+    struct emu_input in;
+    emu_input_poll(&in);
+    uint16_t b = in.pads[0];
     uint32_t h = 0;
-    if (b & BTN_UP)     h |= LB_UP;
-    if (b & BTN_DOWN)   h |= LB_DOWN;
-    if (b & BTN_LEFT)   h |= LB_LEFT;
-    if (b & BTN_RIGHT)  h |= LB_RIGHT;
-    if (b & BTN_A)      h |= LB_A;
-    if (b & BTN_B)      h |= LB_B;
-    if (b & BTN_START)  h |= LB_OPT1;    /* Option 1 */
-    if (b & BTN_SELECT) h |= LB_OPT2;    /* Option 2 */
+    if (b & PAD_UP)     h |= LB_UP;
+    if (b & PAD_DOWN)   h |= LB_DOWN;
+    if (b & PAD_LEFT)   h |= LB_LEFT;
+    if (b & PAD_RIGHT)  h |= LB_RIGHT;
+    if (b & PAD_A)      h |= LB_A;
+    if (b & PAD_B)      h |= LB_B;
+    if (b & PAD_START)  h |= LB_OPT1;    /* Option 1 */
+    if (b & PAD_SELECT) h |= LB_OPT2;    /* Option 2 */
     return h;
 }
 
-/* Вывод кадра: портрет 160x102 поворачиваем на 90° (куда — лево/право
- * зависит от картриджа; по умолчанию LEFT, как в эталоне для «EXCLUSIVE
- * ROTATE» большинства игр). Масштаб x3 -> 306x480, по центру. Пиксель
- * 32bpp Handy = 0x00RRGGBB = формат fb (XRGB8888). */
+/* Вывод кадра: буфер RGB565 160x102 (как в эталоне pico-retro), поворот на
+ * 90° и масштаб x3. Пиксель 565 -> XRGB8888 для нашего fb. */
 static void lynx_blit_frame(void)
 {
     uint32_t *fbp = (uint32_t *)fb;
-    const uint32_t *src = (const uint32_t *)g_lynx_fb;
+    const uint16_t *src = g_lynx_fb;
     const int S = 3;
     const int ow = LYNX_H * S;   /* 306 */
     const int oh = LYNX_W * S;   /* 480 */
@@ -100,11 +107,14 @@ static void lynx_blit_frame(void)
         for (int x = 0; x < FB_W; x++) row[x] = 0x00000000u;
     }
 
-    /* Поворот против часовой: пиксель (x,y) источника -> цель (y, W-1-x).
-     * Каждый пиксель размножаем в квадрат SxS. */
+    /* Поворот против часовой: (x,y) источника -> (y, W-1-x). RGB565->888. */
     for (int y = 0; y < LYNX_H; y++) {
         for (int x = 0; x < LYNX_W; x++) {
-            uint32_t c = src[(uint32_t)y * LYNX_W + (uint32_t)x];
+            uint16_t p = src[(uint32_t)y * LYNX_W + (uint32_t)x];
+            uint32_t r = (uint32_t)((p >> 11) & 0x1F) << 3;
+            uint32_t g = (uint32_t)((p >> 5)  & 0x3F) << 2;
+            uint32_t b = (uint32_t)(p & 0x1F) << 3;
+            uint32_t c = (r << 16) | (g << 8) | b;
             int tx0 = ox + y * S;
             int ty0 = oy + (LYNX_W - 1 - x) * S;
             for (int dy = 0; dy < S; dy++) {
@@ -125,29 +135,63 @@ static int lynx_core_run(const struct emu_run *run)
                         (const UBYTE *)run->rom_addr,
                         (ULONG)run->rom_size,
                         NULL,
-                        true,
+                        false,          /* как в эталоне pico-retro: свой ROM-загрузчик */
                         NULL);
-    if (!g_sys) return EMU_ERR_MEM;
+    if (!g_sys) {
+        uart_print("lynx: new CSystem fail (mem?)\r\n");
+        return EMU_ERR_MEM;
+    }
 
-    /* Дисплей: оригинальный 160x102, 32bpp, поворот LEFT (портрет). */
-    g_sys->mMikie->DisplaySetAttributes(MIKIE_ROTATE_L,
-                                        MIKIE_PIXEL_FORMAT_32BPP,
-                                        LYNX_W * 4,
+    /* Звук: в Handy gAudioEnabled по умолчанию FALSE — без TRUE Mikie::Update
+       не обновляет аудио (эталон pico-retro lynx_host.cpp ставит его явно). */
+    gAudioEnabled = TRUE;
+
+    /* Дисплей: оригинальный 160x102, RGB565, без поворота (эталон). */
+    g_sys->mMikie->DisplaySetAttributes(MIKIE_NO_ROTATE,
+                                        MIKIE_PIXEL_FORMAT_16BPP_565,
+                                        LYNX_W * 2,
                                         lynx_display_get, 0);
 
     uart_print("lynx: run\r\n");
+    uart_flush();
 
     /* Запустить кольцо DMA; CPU1 через почту будет писать в него. */
-    i2s_start();
+    uart_print("lynx: i2s_start...\r\n");
+    uart_flush();
+    emu_audio_start();
+    uart_print("lynx: loop enter\r\n");
+    uart_flush();
 
+    uint32_t dbg_frame = 0;
     for (;;) {
-        if (emu_check_exit()) break;
+        if (emu_input_exit_hold(EMU_EXIT_HOLD_MS)) break;
         g_sys->SetButtonData(lynx_buttons_from_platform());
 
-        /* Один кадр. */
+        if (dbg_frame < 3) {
+            uart_print("lynx: frame ");
+            uart_print_int((int)dbg_frame);
+            uart_print(" cycle=");
+            uart_print_hex(gSystemCycleCount);
+            uart_print("\r\n");
+            uart_flush();
+            dbg_frame++;
+        }
+
+        /* Один кадр. Выходим по готовности кадра (callback) ИЛИ по счётчику цикла —
+   как в эталоне pico-retro lynx_run_frame. Защита от «замка»: если ни то, ни
+   другое не наступило за 300 мс реального времени — прерываем (меню снова
+   живое), вместо вечного повисания. */
+        g_lynx_frame_ready = 0;
         ULONG start = gSystemCycleCount;
-        while ((ULONG)(gSystemCycleCount - start) < CYCLES_PER_FRAME)
+        uint32_t fstart = micros();
+        while ((ULONG)(gSystemCycleCount - start) < CYCLES_PER_FRAME) {
             g_sys->Update();
+            if (g_lynx_frame_ready) break;
+            if ((uint32_t)(micros() - fstart) > 300000u) {
+                uart_print("lynx: frame lock, abort\r\n");
+                goto out;
+            }
+        }
 
         /* Кадр -> экран. */
         lynx_blit_frame();
@@ -156,15 +200,27 @@ static int lynx_core_run(const struct emu_run *run)
          * (кадры = pointer/2). Куски на CPU1 -> i2s. */
         g_sys->FetchAudioSamples();
         if (gAudioBufferPointer >= 2) {
+            if (g_last_audio_sent) {
+                /* Рукопожатие: не перезаписывать gAudioBuffer, пока CPU1 ещё
+                   читает прошлый кусок (без этого — data race CPU0/CPU1, треск).
+                   Ждём, пока audio_done догонит количество отправленных кусков. */
+                struct mailbox *mb = mb_get();
+                while (mb->audio_done < g_last_audio_sent) {
+                    __asm volatile("wfe" ::: "memory");
+                    __asm volatile("dmb" ::: "memory");
+                }
+            }
             mb_send(MB_MSG_AUDIO_DATA,
                     (uint32_t)(uintptr_t)(const void *)gAudioBuffer,
                     gAudioBufferPointer >> 1);
+            g_last_audio_sent++;
             gAudioBufferPointer = 0;
         }
     }
 
+out:   /* выход по сторожу кадра или штатный выход (долгое START) */
     uart_print("lynx: exit\r\n");
-    i2s_stop();
+    emu_audio_stop();
     delete g_sys;
     g_sys = 0;
     return EMU_OK;
@@ -177,6 +233,9 @@ extern "C" void lynx_register(void);
 static void lynx_register_impl(void)
 {
     if (g_lynx_registered) return;
+    /* Регистрируем ядро по реальному индексу системы "lynx" в systems[].
+       Если системы нет в реестре — не регистрируем (захардкоженный индекс
+       был бы привязкой к порядку списка и ломал эмулятор). */
     for (int i = 0; i < NUM_SYSTEMS; i++) {
         if (strcmp(systems[i].id, "lynx") == 0) {
             emulator_register_core((uint32_t)i, lynx_core_run);
@@ -184,9 +243,7 @@ static void lynx_register_impl(void)
             return;
         }
     }
-    /* На всякий случай — индекс 1 (порядок: gameboy, lynx). */
-    emulator_register_core(1u, lynx_core_run);
-    g_lynx_registered = 1;
+    g_lynx_registered = 1;   /* системы нет — нечего регистрировать */
 }
 
 /* Регистрация ядра вызывается из C (retro_menu.c) — без манглинга. */

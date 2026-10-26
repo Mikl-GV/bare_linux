@@ -12,7 +12,13 @@
    приоритеты/таргеты на CPU0, включить группы 0 и 1 (IRQ). */
 void gic_init(void);
 
-/* Разрешить конкретное SPI-прерывание n (в группе 1) на CPU0. */
+/* Разрешить/запретить конкретное SPI-прерывание n (в группе 1) на CPU0. */
 void gic_enable_irq(uint32_t n);
+void gic_disable_irq(uint32_t n);
+
+/* Прочитать текущий IRQ из CPU-интерфейса (GICC_IAR) и подтвердить
+   окончание обработки (GICC_EOIR). Вызываются диспетчером (irq.c). */
+uint32_t gic_ack(void);
+void     gic_eoi(uint32_t irq);
 
 #endif /* GIC_H */

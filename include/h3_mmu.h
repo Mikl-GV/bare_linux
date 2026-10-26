@@ -17,4 +17,14 @@ void mmu_mark_uncached(uint32_t addr);
    данные из DRAM (платформа H3 не кэш-когерентна для DMA). */
 void dcc_clean_range(uint32_t addr, uint32_t len);
 
+/* Полная синхронизация для DMA: L1 (clean+invalidate by MVA) и L2C-310
+ * (clean+invalidate by PA). На H3 cache_clean сбрасывает строку только в L2,
+ * а DMA-мастер читает DRAM напрямую — без L2-операции он видит устаревшие
+ * ED/TD/буферы. Использовать вместо dcc_clean_range перед передачей DMA. */
+void dma_clean_range(uint32_t addr, uint32_t len);
+
+/* Инвалидация после записи DMA (L2, затем L1), чтобы CPU не читал
+ * устаревшие строки вместо свежих данных из DRAM. */
+void dma_inval_range(uint32_t addr, uint32_t len);
+
 #endif /* H3_MMU_H */

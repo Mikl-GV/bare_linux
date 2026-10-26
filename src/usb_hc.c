@@ -7,13 +7,12 @@
 #include "uart.h"
 #include "sys.h"
 
-/* USB host-контроллер H3: полный подъём с нуля (FEL+SPL — наследовать
- * нечего). Пути:
+/* USB host-контроллер H3: полный подъём с нуля (такты/PHY/порты — свои,
+ * независимо от U-Boot; проверено на стенде). Пути:
  *   - PHY1 (0x01C1B000/400): HS-флешка — EHCI (control/bulk через
  *     async-список qH/qTD);
  *   - PHY2 (0x01C1C000/400): клавиатура (LS/FS) — OHCI.
- * Порядок: OHCI обоих портов (такт/PHY/root port), затем EHCI PHY1.
- */
+ * Порядок: OHCI обоих портов, затем EHCI PHY1. */
 
 /* Текущие базы выбранной шины (устанавливаются usb_select_bus). */
 static uint32_t usb_ehci_base = USB_EHCI_BASE1;
@@ -65,10 +64,22 @@ static inline void     ehci_wr(uint32_t off, uint32_t v) { *ehci_reg(off) = v; }
 /* Запустить async-цепочку qTD (определение ниже). */
 static int ehci_run_chain(struct ehci_qh *qh, struct ehci_qtd *t, int n);
 
-/* Сброс EHCI: USBCMD.HCReset=1, ждать сброса. */
+/* Сброс EHCI. ВАЖНО: HCRESET допустим ТОЛЬКО когда HC остановлен.
+ * U-Boot оставляет EHCI запущенным (RS=1, cmd=0x00080B01 в дампе) — запись
+ * HCRESET «на лету» игнорируется (спека: HCHalted=1 обязателен), бит 1 не
+ * снимается и bсё падает в reset fail, а HS-флешка уходит компаньону OHCI,
+ * где bulk не работает. Последовательность: RS=0 -> ждать HCHalted (STS
+ * bit12) -> HCRESET=1 -> ждать снятия (HC сброшен). Возвращает 0 при успехе. */
 static int usb_ehci_hc_reset(void)
 {
-    EHCI_CMDW(EHCI_CMDR() | (1u << 1));   /* HCReset */
+    /* 1. Остановить: RS=0. */
+    EHCI_CMDW(EHCI_CMDR() & ~(1u << 0));
+    __asm volatile("dsb" ::: "memory");
+    for (uint32_t t = 0; t < 0xFFFFFu; t++)
+        if (EHCI_STSR() & (1u << 12)) break;   /* HCHalted */
+    /* 2. HCRESET (теперь законно). Ждём снятия бита. */
+    EHCI_CMDW(1u << 1);
+    __asm volatile("dsb" ::: "memory");
     for (uint32_t t = 0; t < 0xFFFFFu; t++)
         if (!(EHCI_CMDR() & (1u << 1))) return 0;
     return -1;
@@ -98,18 +109,9 @@ static int usb_ehci_init_bus(int bus)
     EHCI_CMDW(0);             /* RS=0, clean */
     __asm volatile("dsb" ::: "memory");
 
-    /* SIDDQ PHY1 (pmu1+0x10 bit1) — снять, иначе PHY в powerdown и порт
-       рапортует не то. Passby (0x701) уже выставлен в usb_port_hw_init
-       (usb_ohci.c), здесь только SIDDQ. */
-    {
-        volatile uint32_t *phy1_ctl = (volatile uint32_t *)(USB_PMU1_BASE + 0x10);
-        *phy1_ctl &= ~USB_PHY_CTL_SIDDQ;   /* SIDDQ = 0 */
-        __asm volatile("dsb" ::: "memory");
-        udelay(1000);
-        USB_LOG("ehci: phy1_ctl=0x");
-        USB_LOG_HEX(*phy1_ctl);
-        USB_LOG("\r\n");
-    }
+    /* SIDDQ для PHY1 снимается в usb_port_hw_init (usb_ohci.c) ПЕРВЫМ,
+       до сброса тактов/PHY и до port reset — по эталону mainline
+       sun4i_usb_phy_init. Здесь повторный SIDDQ-clear не нужен. */
 
     EHCI_CMDW(1u << 0);       /* RS=1 */
     __asm volatile("dsb" ::: "memory");
@@ -534,12 +536,45 @@ static int usb_ohci_enum_common(uint32_t base, uint8_t *cfg, uint32_t cfg_size,
     return 0;
 }
 
+/* Endpoint'ы активного накопителя — нужны BOT Reset Recovery вне старта. */
+static uint8_t g_msd_ep_in, g_msd_ep_out;
+
+/* BOT Reset Recovery: GET_MAX_LUN (может не поддерживаться), Bulk-Only Reset
+ * (0xFF) — сбрасывает BOT-состояние и toggle, CLEAR_FEATURE(HALT) на оба
+ * bulk-EP (wIndex — номер EP с битом направления). Нужен и при старте (после
+ * прошлого Stall VBUS не пропадает), и когда короткий приём блока оставил в
+ * трубе остаток данных: следующий CSW получает DataOverrun и канал десинкается. */
+void usb_msd_bot_recover(void)
+{
+    uint8_t s[8];
+    uint8_t lun = 0;
+
+    if (!g_msd_via_ohci || !g_msd_ep_in || !g_msd_ep_out) return;
+
+    /* Аппаратный сброс контроллера (HCR) ПЕРЕД recovery НЕ делаем: на этом H3
+       HCR останавливает фрейм-таймер HC насовсем (лог WU.1.179: fr=5843
+       заморожен, сбо__й уже «с первой попытки», раньше fr рос). HCR уместен
+       только при переинициализации порта, а не между передачами. BOT Reset
+       Recovery — команды на УСТРОЙСТВО (control): они восстанавливают toggle
+       и состояние BOT сами по себе; если HC залип на control-списке, его
+       сбросит пере-инициализация порта (usb_ohci_claim_port). */
+    s[0]=0xA1; s[1]=0xFE; s[2]=0; s[3]=0; s[4]=0; s[5]=0; s[6]=1; s[7]=0;
+    usb_ohci_ctrl_transfer(g_msd_ohci_base, 1, s, 8, &lun, 1, 1, 1000);
+    s[0]=0x21; s[1]=0xFF; s[2]=0; s[3]=0; s[4]=0; s[5]=0; s[6]=0; s[7]=0;
+    usb_ohci_ctrl_transfer(g_msd_ohci_base, 1, s, 8, 0, 0, 0, 1000);
+    for (int i = 0; i < 2; i++) {
+        uint8_t idx = i ? (uint8_t)(g_msd_ep_in | 0x80) : g_msd_ep_out;
+        s[0]=0x02; s[1]=0x01; s[2]=0; s[3]=0; s[4]=idx; s[5]=0; s[6]=0; s[7]=0;
+        usb_ohci_ctrl_transfer(g_msd_ohci_base, 1, s, 8, 0, 0, 0, 1000);
+    }
+    usb_ohci_bulk_toggle_reset(g_msd_ohci_base);   /* ClearFeature сбрасывает toggle */
+}
+
 /* MSD на найденном порту: BOT recovery + проверка команд носителя. */
 static int usb_ohci_msd_start(uint32_t base, struct usb_msd_dev *dev)
 {
     static uint8_t inq[36] USB_UNCACHED;
     static uint8_t mbr[512] USB_UNCACHED;
-    uint8_t s[8];
 
     g_msd_via_ohci = 1;
     g_msd_ohci_base = base;
@@ -552,22 +587,9 @@ static int usb_ohci_msd_start(uint32_t base, struct usb_msd_dev *dev)
         return -1;
     }
 
-    /* BOT recovery: GET_MAX_LUN (может не поддерживаться), Bulk-Only Reset
-       (0xFF) — сбрасывает BOT-состояние и toggle, CLEAR_FEATURE(HALT) на
-       оба bulk-EP (wIndex — номер EP с битом направления). Устройство может
-       остаться в BOT-ошибке после прошлого Stall: VBUS при перезагрузке SoC
-       не пропадает. */
-    s[0]=0xA1; s[1]=0xFE; s[2]=0; s[3]=0; s[4]=0; s[5]=0; s[6]=1; s[7]=0;
-    uint8_t lun = 0;
-    usb_ohci_ctrl_transfer(base, 1, s, 8, &lun, 1, 1, 1000);
-    s[0]=0x21; s[1]=0xFF; s[2]=0; s[3]=0; s[4]=0; s[5]=0; s[6]=0; s[7]=0;
-    usb_ohci_ctrl_transfer(base, 1, s, 8, 0, 0, 0, 1000);
-    for (int i = 0; i < 2; i++) {
-        uint8_t idx = i ? (uint8_t)(dev->ep_in | 0x80) : dev->ep_out;
-        s[0]=0x02; s[1]=0x01; s[2]=0; s[3]=0; s[4]=idx; s[5]=0; s[6]=0; s[7]=0;
-        usb_ohci_ctrl_transfer(base, 1, s, 8, 0, 0, 0, 1000);
-    }
-    usb_ohci_bulk_toggle_reset(base);   /* ClearFeature сбрасывает toggle */
+    g_msd_ep_in  = dev->ep_in;
+    g_msd_ep_out = dev->ep_out;
+    usb_msd_bot_recover();
     uart_print("usb-ohci: BOT recovery done\r\n");
 
     /* INQUIRY — проверка, что bulk-канал и команды живы. */
@@ -654,8 +676,106 @@ static int usb_ohci_claim_port(int port)
     return 0;
 }
 
+/* Принудительная реинициализация флешки (пункт меню «USB reinit»). Меню
+ * старых/нестабильных накопителей могли «пропасть» с шины посередине чтения
+ * (DeviceNotResponding) — повторный подъём порта+enum+MSD возвращает их без
+ * перезагрузки платы. Возвращает 0 при успехе (накопитель активирован). */
+int usb_hc_reinit_flash(void)
+{
+    g_msd_via_ohci = 0;   /* снять признак активного MSD перед переподъёмом */
+    if (usb_ohci_claim_port(1) != 1) {
+        uart_print("usb: reinit flash failed\r\n");
+        return -1;
+    }
+    uart_print("usb: reinit flash ok\r\n");
+    return 0;
+}
+
+/* Снимок USB-состояния, оставленного U-Boot: печатается ДО любых наших
+ * действий. По нему видно, что унаследовано (HCFS/списки/HCCA/PHY), чтобы
+ * не гадать, а либо переиспользовать, либо корректно перехватить. */
+static void usb_dump_inherited_state(void)
+{
+    static const uint32_t ohci_bases[2] = { USB_OHCI_BASE1, USB_OHCI_BASE2 };
+    static const uint32_t ehci_bases[2] = { USB_EHCI_BASE1, USB_EHCI_BASE2 };
+    static const uint32_t pmu_bases[2]  = { USB_PMU1_BASE,  USB_PMU2_BASE  };
+
+    uart_print("usb: --- U-Boot state ---\r\n");
+    /* MMU/кэш: решает вопрос, почему .coherent ведёт себя как кэшируемая
+       (l1=0xFFFFFFFF). SCTLR bit0 = MMU on, bit2 = D-cache on,
+       bit12 = I-cache on. TTBR0 — база L1-таблицы. */
+    {
+        uint32_t sctlr, ttbr0;
+        __asm volatile("mrc p15, 0, %0, c1, c0, 0" : "=r"(sctlr));
+        __asm volatile("mrc p15, 0, %0, c2, c0, 0" : "=r"(ttbr0));
+        uart_print("usb: mmu sctlr=0x");
+        uart_print_hex(sctlr);
+        uart_print(" M=");
+        uart_print_int((int)(sctlr & 1u));
+        uart_print(" C=");
+        uart_print_int((int)((sctlr >> 2) & 1u));
+        uart_print(" I=");
+        uart_print_int((int)((sctlr >> 12) & 1u));
+        uart_print(" ttbr0=0x");
+        uart_print_hex(ttbr0);
+        uart_print("\r\n");
+    }
+    for (int i = 0; i < 2; i++) {
+        volatile uint32_t *o = (volatile uint32_t *)(uintptr_t)ohci_bases[i];
+        uart_print("usb: ohci");
+        uart_print_int(i + 1);
+        uart_print(" rev=0x");  uart_print_hex(o[0]);
+        uart_print(" ctl=0x");  uart_print_hex(o[1]);
+        uart_print(" cmd=0x");  uart_print_hex(o[2]);
+        uart_print(" isr=0x");  uart_print_hex(o[3]);
+        uart_print("\r\n");
+        uart_print("usb:  ohci");
+        uart_print_int(i + 1);
+        uart_print(" hcca=0x"); uart_print_hex(o[6]);
+        uart_print(" ch=0x");   uart_print_hex(o[8]);
+        uart_print(" cc=0x");   uart_print_hex(o[9]);
+        uart_print(" bh=0x");   uart_print_hex(o[10]);
+        uart_print(" bc=0x");   uart_print_hex(o[11]);
+        uart_print(" dh=0x");   uart_print_hex(o[12]);
+        uart_print("\r\n");
+        uart_print("usb:  ohci");
+        uart_print_int(i + 1);
+        uart_print(" fmi=0x");  uart_print_hex(o[13]);
+        uart_print(" fmnum=");  uart_print_int((int)(o[15] & 0xFFFF));
+        uart_print(" rhs=0x");  uart_print_hex(o[20]);
+        uart_print(" p1=0x");   uart_print_hex(o[21]);
+        uart_print(" p2=0x");   uart_print_hex(o[22]);
+        uart_print("\r\n");
+
+        volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)pmu_bases[i];
+        uart_print("usb:  phy");
+        uart_print_int(i + 1);
+        uart_print(" ctl0=0x"); uart_print_hex(p[0]);
+        uart_print(" 0x10=0x"); uart_print_hex(p[4]);
+        uart_print(" 0x20=0x"); uart_print_hex(p[8]);
+        uart_print(" 0x24=0x"); uart_print_hex(p[9]);
+        uart_print("\r\n");
+    }
+    for (int i = 0; i < 2; i++) {
+        volatile uint8_t *b = (volatile uint8_t *)(uintptr_t)ehci_bases[i];
+        uint32_t ops = (uint32_t)(uintptr_t)b + b[0];
+        volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)ops;
+        uart_print("usb: ehci");
+        uart_print_int(i + 1);
+        uart_print(" caplen=0x"); uart_print_hex(b[0]);
+        uart_print(" hcs=0x");    uart_print_hex(*(volatile uint32_t *)(uintptr_t)((uint32_t)(uintptr_t)b + 8));
+        uart_print(" cmd=0x");    uart_print_hex(r[0]);
+        uart_print(" sts=0x");    uart_print_hex(r[1]);
+        uart_print(" async=0x");  uart_print_hex(r[6]);
+        uart_print(" cfg=0x");    uart_print_hex(*(volatile uint32_t *)(uintptr_t)(ops + 0x40));
+        uart_print(" psc=0x");    uart_print_hex(*(volatile uint32_t *)(uintptr_t)(ops + 0x44));
+        uart_print("\r\n");
+    }
+}
+
 int usb_hc_init(void)
 {
+    usb_dump_inherited_state();
     uart_print("usb: hc init (ohci 2 ports)\r\n");
 
     /* Сначала OHCI-init обоих портов: он включает такты и PHY

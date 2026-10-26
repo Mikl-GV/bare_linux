@@ -1577,11 +1577,13 @@ void h3_wifi_rf_iqk(void)
         /* e94/e9c/eac ДО триггера — убедиться, что они обновляются
            движком, а не висят на дефолте. */
         {
-            uint32_t d;
+            uint32_t d = 0, e9c = 0, eac = 0;
             h3_sdc_read_wlan_reg32(0x0E94, &d);
-WLOG("  iqk: pre e94=0x"); WLOG_HEX(d);
-            WLOG(" e9c=0x"); WLOG_HEX(d);
-            WLOG(" eac=0x"); WLOG_HEX(d);
+            h3_sdc_read_wlan_reg32(0x0E9C, &e9c);
+            h3_sdc_read_wlan_reg32(0x0EAC, &eac);
+            WLOG("  iqk: pre e94=0x"); WLOG_HEX(d);
+            WLOG(" e9c=0x"); WLOG_HEX(e9c);
+            WLOG(" eac=0x"); WLOG_HEX(eac);
             WLOG("\r\n");
         }
         /* Сброс 0xE48 (rIQK_AGC_Pts) перед триггером — дефолт 0xFB000000
@@ -3159,15 +3161,17 @@ h3_sdc_write_wlan_reg32(0x0440, 0x000FFFF1u);
                 WLOG_INT((int)((hmfr >> bx) & 1));
             WLOG(")");
         }
-        h3_sdc_read_wlan_reg32((8u << 13) | 0x0284, &d);
+        /* W.757: адрес регистра ходим уже сдвинутым (функция read_wlan_reg*
+        сама применяет (8<<13)|reg), поэтому сюда передаём голый offset. */
+        h3_sdc_read_wlan_reg32(0x0284, &d);
         WLOG(" rxpkt=0x");
         WLOG_HEX(d);
-        h3_sdc_read_wlan_reg8((8u << 13) | 0x0286, &num);
+        h3_sdc_read_wlan_reg8(0x0286, &num);
         WLOG(" req=");
         WLOG_INT((int)((num >> 3) & 1));
         WLOG(" dr=0x");
         WLOG_HEX((uint32_t)num);
-        h3_sdc_read_wlan_reg8((8u << 13) | 0x0287, &num);
+        h3_sdc_read_wlan_reg8(0x0287, &num);
         WLOG(" pkt=0x");
         WLOG_HEX((uint32_t)num);
         {
@@ -4549,13 +4553,11 @@ uint32_t total = (40u + p + 7u) & ~7u;   /* W.762: round 8, как драйве�
        его как одиночный, а очередь после этого вставала. */
     int use_hiq = 0;
     int fp = -1;
-    if (!use_hiq) {
-        /* сначала LOQ (data/BE) — эталонный путь */
-        for (int t = 0; t < 200; t++) {
-            fp = h3_wifi_tx_free_pages_loq();
-            if (fp >= pg_needed) break;
-            udelay(1000);
-        }
+    /* Сначала LOQ (data/BE) — эталонный путь (HIQ не используется). */
+    for (int t = 0; t < 200; t++) {
+        fp = h3_wifi_tx_free_pages_loq();
+        if (fp >= pg_needed) break;
+        udelay(1000);
     }
     if (fp < pg_needed) {
         use_hiq = 1;
@@ -5187,7 +5189,7 @@ int h3_wifi_join_ap(void)
            как AuthResp/AssocResp из неверного окна → плавающий rc=-4/-6.
            Выгребаем до конца (rxlen=0), не печатая содержимое. */
         {
-            uint8_t flush_buf[0x4000 + 512];
+            static uint8_t flush_buf[0x4000 + 512];   /* 16 КБ — не на стеке */
             int drained = 0;
             for (int it = 0; it < 32; it++) {
                 uint32_t fa = 0;
@@ -5257,7 +5259,7 @@ int h3_wifi_join_ap(void)
 
     /* Шаг 2: ждать AuthResp (fc 0xB0, seq=2, status=0) от целевого BSSID. */
     {
-        uint8_t rxbuf[0x4000 + 512];
+        static uint8_t rxbuf[0x4000 + 512];   /* 16 КБ — не на стеке */
         uint32_t acc = 0;
         int tries;
         int got_auth = 0;
@@ -5352,7 +5354,7 @@ int h3_wifi_join_ap(void)
 
     /* Шаг 4: ждать AssocResp (fc 0x10, status на +26 после 3addr + cap2) от BSSID. */
     {
-        uint8_t rxbuf[0x4000 + 512];
+        static uint8_t rxbuf[0x4000 + 512];   /* 16 КБ — не на стеке */
         uint32_t acc = 0;
         int tries;
         int got_assoc = 0;
@@ -5525,7 +5527,7 @@ int h3_wifi_join_ap(void)
         for (int k = 0; k < 4; k++) { nst.ip[k]=0; nst.net[k]=0; nst.mask[k]=0; nst.gw[k]=0; }
         nst.have = 0;
         net_dhcp_reset();   /* W.594: сброс DHCP-состояния на новом join */
-        uint8_t rxbuf[0x4000 + 512];
+        static uint8_t rxbuf[0x4000 + 512];   /* 16 КБ — не на стеке */
         uint32_t acc = 0;
         /* W.675+W.678: waited_ms — миллисекундный счётчик цикла DHCP.
            W.675 переименовал `waited`, но пауза оставалась udelay(200) →
@@ -6349,7 +6351,7 @@ int h3_wifi_rx_poll(void)
         st.gw[k] = join_target.gw[k];
     }
     st.have = 1;
-    uint8_t rxbuf[0x4000 + 512];
+    static uint8_t rxbuf[0x4000 + 512];   /* 16 КБ — не на стеке */
     uint32_t acc = 0;
     int handled = 0;
     /* W.758 [корень «не всё забираем из эфира»]: за ОДИН вызов poll читаем

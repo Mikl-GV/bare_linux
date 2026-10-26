@@ -13,8 +13,24 @@ void pcf8574_init(void)
 
 uint32_t pcf8574_read(void)
 {
+    return pcf8574_read_ex(0);
+}
+
+uint32_t pcf8574_read_ex(uint8_t *raw)
+{
     uint8_t v = 0xFF;
-    if (i2cbb_read(PCF8574_ADDR, &v, 1) != 0)
-        return 0;   /* ошибка чтения - считаем все отпущенными */
+    if (i2cbb_read(PCF8574_ADDR, &v, 1) != 0) {
+        if (raw) *raw = 0xFF;          /* ошибка чтения — как «всё отпущено» */
+        return 0;
+    }
+    if (raw) *raw = v;
     return (uint32_t)(~v) & 0xFFu;
+}
+
+int pcf8574_probe(uint8_t *raw)
+{
+    uint8_t v = 0xFF;
+    int rc = i2cbb_read(PCF8574_ADDR, &v, 1);
+    if (raw) *raw = v;
+    return rc;      /* 0 = чип ответил ACK */
 }

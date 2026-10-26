@@ -105,6 +105,18 @@ static int      g_run;
 static int      g_amp_on;        /* усилитель открыт */
 static uint32_t g_sr = I2S_SR_DEFAULT;
 
+/* Уровень громкости (0..100, шаг 5, по умолчанию 10). Применяется в
+   i2s_write масштабированием сэмплов — общий для теста и эмуляторов. */
+static volatile uint32_t g_volume = 10;
+
+void i2s_set_volume(uint32_t p)
+{
+    if (p > 100) p = 100;
+    g_volume = p;
+}
+
+uint32_t i2s_get_volume(void) { return g_volume; }
+
 /* Таблица синуса на 256 точек (int16) — для тестового тона. */
 static const int16_t sin_tab[256] = {
      0,804,1607,2410,3211,4011,4807,5601,6392,7179,7961,8739,9511,10278,11038,11792,
@@ -148,8 +160,14 @@ static int pll_audio_program(unsigned fs)
     else return -1;
 
     H3_CCU_PLL_AUDIO_PAT  = pat;
-    H3_CCU_PLL_AUDIO_CTRL = (1u << 31) | (1u << 24)
-                          | ((uint32_t)(n - 1) << 8) | (uint32_t)(m - 1);
+    /* RMW: меняем SDM_ENABLE(24), EN(31) и делители N[15:8]/M[7:0], сохраняя
+       прочие поля. EN(31) ставим ЯВНО — на свежем старте (FEL) бит не выставлен,
+       и RMW без него оставил бы PLL выключенной (I2S FAIL). */
+    uint32_t ac = H3_CCU_PLL_AUDIO_CTRL;
+    ac |= (1u << 31);                                    /* EN */
+    ac &= ~((0x7Fu) << 8) & ~(0xFFu << 0);               /* N[15:8]=0, M[7:0]=0 */
+    ac |= (1u << 24) | ((uint32_t)(n - 1) << 8) | (uint32_t)(m - 1);
+    H3_CCU_PLL_AUDIO_CTRL = ac;
 
     /* Ждать LOCK (bit28). */
     for (i = 0; i < 100; i++) {
@@ -401,12 +419,21 @@ int i2s_write(const int16_t *pcm, unsigned frames)
     if (frames > space) frames = space;
     if (frames == 0) return 0;
 
+    /* Масштаб громкости: g_volume (0..100) -> множитель 0..32768. Применяем
+       к каждому сэмплу до записи в DMA-кольцо. */
+    const uint32_t vs = g_volume * 327u;   /* 32768/100 ≈ 327 */
     uint32_t first = (uint32_t)(g_wr % RING_FRAMES);
     for (unsigned i = 0; i < frames; i++) {
         uint32_t idx = ((first + i) % RING_FRAMES) * 2u;
         /* Отсчёт — в старших 16 битах слова FIFO (TXIM=0). */
-        g_ring[idx]      = (uint32_t)(uint16_t)pcm[2u * i]      << 16;
-        g_ring[idx + 1u] = (uint32_t)(uint16_t)pcm[2u * i + 1u] << 16;
+        int32_t l = (int32_t)pcm[2u * i] * (int32_t)vs / 32768;
+        int32_t r = (int32_t)pcm[2u * i + 1u] * (int32_t)vs / 32768;
+        if (l >  32767) l =  32767;
+        if (l < -32768) l = -32768;
+        if (r >  32767) r =  32767;
+        if (r < -32768) r = -32768;
+        g_ring[idx]      = (uint32_t)(uint16_t)l << 16;
+        g_ring[idx + 1u] = (uint32_t)(uint16_t)r << 16;
     }
     __asm volatile("dsb" ::: "memory");
     ring_clean(first, frames);

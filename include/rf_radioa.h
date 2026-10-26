@@ -1,3 +1,6 @@
+#ifndef RF_RADIOA_H
+#define RF_RADIOA_H
+
 /* RF RadioA таблица из Array_MP_8188F_RadioA (halhwimg8188f_rf.c).
  * Пары {offset, data}. Запись через LSSI: write_wlan_reg32(0x824, (offset<<20)|(data&0xFFFFF)).
  * Условные записи (0x80000000/0x40000000/0xA0000000/0xB0000000) пропущены. */
@@ -140,3 +143,5 @@ static const uint32_t rf_radioa[] = {
     0x000, 0x00033D95,
 };
 /* всего пар: 136 */
+
+#endif /* RF_RADIOA_H */

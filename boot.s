@@ -25,7 +25,7 @@ _vectors:
     ldr pc, =_hang         /* 0x0C Prefetch Abort */
     ldr pc, =_hang         /* 0x10 Data Abort */
     nop                    /* 0x14 reserved */
-    ldr pc, =_hang         /* 0x18 IRQ */
+    ldr pc, =irq_entry     /* 0x18 IRQ — диспетчер (см. раздел IRQ-обработки ниже) */
     ldr pc, =_hang         /* 0x1C FIQ */
 
 /* ===== Точка входа ===== */
@@ -54,6 +54,14 @@ _start:
     ldr r0, =_vectors
     mcr p15, 0, r0, c12, c0, 0
     dsb
+    isb
+
+    /* SCTLR.V = 0. При V=1 (так оставляет U-Boot SPL, в отличие от полного
+       U-Boot) исключения уходят на 0xFFFF0000 (BootROM), и VBAR игнорируется —
+       первое же IRQ вешает CPU. Снимаем бит сами, не полагаясь на загрузчик. */
+    mrc p15, 0, r0, c1, c0, 0
+    bic r0, r0, #(1 << 13)
+    mcr p15, 0, r0, c1, c0, 0
     isb
 
     /* VFP/NEON включить */
@@ -115,9 +123,42 @@ ldr r0, =_coherent_start
 4:
     bl kmain
 
-/* ===== Заглушка ===== */
+/* ===== Заглушка (неиспользуемые/неизвестные исключения) ===== */
 .section .text
 .global _hang
 _hang:
     b _hang
+
+/* ===== IRQ-обработчик (диспетчер) =====
+ *
+ * Вход: IRQ-режим, IRQ запрещено (CPSR.I=1), LR_irq = адрес возврата в
+ * прерванный код + 4, поэтому первым делом LR -= 4.
+ *
+ * Контекст и возврат — на ОДНОМ (IRQ) стеке, sp_irq = 0x5FF03000:
+ *   srsdb sp!, #0x12   ; sp_irq -= 8
+ *                      ; [sp_irq]   = LR_irq  (адрес возврата)
+ *                      ; [sp_irq+4] = SPSR_irq (CPSR прерванного кода)
+ * SRS кладёт LR по МЛАДШЕМУ адресу, SPSR по старшему — ровно тот порядок,
+ * которого ждёт парная инструкция RFE (PC <- [sp], CPSR <- [sp+4]).
+ *
+ * Возврат: rfeia sp! — PC <- LR_irq, CPSR <- SPSR_irq (режим прерванного).
+ *
+ * Всё выполняется в IRQ-режиме: переключения в SVC нет. Вложенность
+ * невозможна — I-бит выставлен аппаратно при входе в исключение.
+ */
+.section .text
+.global irq_entry
+irq_entry:
+    sub lr, lr, #4               /* адрес возврата в прерванный код */
+    srsdb sp!, #0x12             /* [sp]=LR_irq, [sp+4]=SPSR_irq */
+
+    push {r0-r3, r12, lr}        /* рабочие регистры на sp_irq (6 слов —
+                                  * сохраняет 8-байтное выравнивание стека) */
+
+    bl irq_c_dispatch            /* GICC_IAR -> handler -> GICC_EOIR */
+
+    pop {r0-r3, r12, lr}         /* sp снова указывает на [LR][SPSR] */
+
+    rfeia sp!                    /* PC <- LR_irq, CPSR <- SPSR_irq */
+
 .end

@@ -14,7 +14,7 @@
  * Каталоги: 8.3 + LFN (порядок LFN-фрагментов на диске); чтение файлов —
  * цепочка кластеров через FAT, PIO-чтение секторов. */
 
-#define FAT_MAX_ENTRIES 128
+#define FAT_MAX_ENTRIES 512
 #define FAT_NAME_LEN    128
 
 typedef struct {
@@ -73,7 +73,20 @@ typedef int (*fat_blk_write_t)(uint32_t lba, const void *buf);
 /* Установить источник секторов (NULL = вернуть к SD). */
 void fat_set_block_source(fat_blk_read_t rd, fat_blk_write_t wr);
 
+/* Хук «восстановить источник»: вызывается blk_read после 3 неудачных повторов
+ * чита custom (USB) источника, затем чтение повторяется ещё раз. Позволяет
+ * поднять флешку после короткого приёма/десинка BOT, не трогая драйвер FAT.
+ * NULL = без хука. */
+typedef int (*fat_reinit_t)(void);
+void fat_set_reinit_hook(fat_reinit_t fn);
+
 /* 1, если источник секторов переопределён (не SD, напр. USB-флешка). */
 int fat_block_source_active(void);
+
+/* Хук прогресса чтения файла: вызывается после каждого прочитанного блока.
+ * cb(done, total) — прочитано байт из total. Используется загрузчиком ROM
+ * для полосы прогресса при блокирующем чтении. NULL = без хука. */
+typedef void (*fat_progress_t)(uint32_t done, uint32_t total);
+void fat_set_progress_hook(fat_progress_t cb);
 
 #endif /* FAT_H */

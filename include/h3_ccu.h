@@ -10,6 +10,19 @@
 #define H3_CCU_PLL_AUDIO_CTRL  (*(volatile uint32_t *)(H3_CCU_BASE + 0x008))
 #define H3_CCU_PLL_AUDIO_PAT   (*(volatile uint32_t *)(H3_CCU_BASE + 0x284))
 
+/* ==== Тактирование ядра: PLL1/CPUX (0x000) и CPU/AXI (0x050) ====
+ * PLL1 = 24 МГц * N * K / (M * P); поля как в U-Boot clock_sun6i.h:
+ *   M = ((reg >> 0) & 3) + 1, K = ((reg >> 4) & 3) + 1,
+ *   N = ((reg >> 8) & 0x1F) + 1, P = (reg >> 16) & 3.
+ * Бит31 — включение, бит28 — lock (только чтение).
+ * CPU_AXI: [1:0] AXI_DIV (0=/1, 1=/2, 2=/3, 3=/4),
+ *          [9:8] ATB_DIV (0=/1, 1=/2, 2=/4),
+ *          [17:16] источник: 1 = OSC24M, 2 = PLL1.
+ * Частоту ядра настраивает ЗАГРУЗЧИК (U-Boot), прошивка только читает
+ * эти регистры для диагностики (src/sys.c cpu_clk_init). */
+#define H3_CCU_PLL_CPUX      (*(volatile uint32_t *)(H3_CCU_BASE + 0x000))
+#define H3_CCU_CPU_AXI       (*(volatile uint32_t *)(H3_CCU_BASE + 0x050))
+
 #define H3_CCU_GATING0      (*(volatile uint32_t *)(H3_CCU_BASE + 0x060))
 #define H3_CCU_GATING2      (*(volatile uint32_t *)(H3_CCU_BASE + 0x068))
 #define H3_CCU_GATING3      (*(volatile uint32_t *)(H3_CCU_BASE + 0x06C))

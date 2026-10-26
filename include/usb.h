@@ -13,10 +13,10 @@
  * В даташите/докah 0x01C1B000 часто называют «EHCI1»; в проекте используем
  * нейтрально «PHY1/PHY2», чтобы не спорить с нумерацией.
  *
- * Подъём с нуля (при FEL+SPL U-Boot USB не инициализирует — наследовать
- * нечего): CCU gate/reset (BUS_CLK_GATING0/RST0: PHY1 биты 25/29, PHY2
- * 26/30), CCU USB_CLK_CFG (0x0CC: bitN = reset PHY N, bit(8+N) = clock PHY N,
- * bit(16+N) = clock OHCI N), сброс OHCI, root port reset, затем enumeration.
+ * Подъём с нуля (независимо от U-Boot): CCU gate/reset (BUS_CLK_GATING0/RST0:
+ * PHY1 биты 25/29, PHY2 26/30), CCU USB_CLK_CFG (0x0CC: bitN = reset PHY N,
+ * bit(8+N) = clock PHY N, bit(16+N) = clock OHCI N), сброс OHCI, root port
+ * reset, затем enumeration.
  * SIDDQ (analog powerdown) живёт НЕ в CCU, а в pmuN+0x10 (0x01C1B810 /
  * 0x01C1C810) bit1 — сбрасывается в 0. Passby (AHB burst/ULPI bypass),
  * биты 10/9/8/0 = 0x701 — в pmuN (0x01C1B800 / 0x01C1C800). */
@@ -134,9 +134,14 @@ int usb_ehci_ctrl(const uint8_t *setup, const uint8_t *out_data, uint32_t out_le
 int usb_bulk_out(uint8_t ep, uint16_t mps, const uint8_t *data, uint32_t len);
 int usb_bulk_in(uint8_t ep, uint16_t mps, uint8_t *data, uint32_t len);
 
-/* Инициализировать USB host (полный подъём с нуля). Приведёт обе шины в
- * RUN; вернёт число найденных устройств (enumeration корневых портов). */
+/* Инициализировать USB host (полный подъём с нуля — такты/PHY/порты свои).
+ * Приведёт обе шины в RUN; вернёт число найденных устройств. */
 int usb_hc_init(void);
+
+/* Пере-инициализировать USB-флешку (пункт меню «USB reinit»): повторный
+ * подъём порта 1 (reset + enum + MSD) и активация накопителя без перезагрузки.
+ * 0 при успехе, -1 если устройство не принято. */
+int usb_hc_reinit_flash(void);
 
 /* Хелперы: текущие базы выбранной шины (устанавливаются usb_hc_init). */
 void usb_select_bus(int bus);

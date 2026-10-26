@@ -20,12 +20,18 @@ static volatile char uart_buf[UART_BUF_SIZE];
 
 void uart_init(void)
 {
+    /* U-Boot уже настроил UART0 (115200 8N1, PA4 TX, такт/reset из DTS).
+       Повторно включаем такт/reset ТОЛЬКО если их нет (запуск без U-Boot:
+       старый FEL-путь spl+write+exe). PA4 донастраиваем всегда — дёшево
+       и не мешает (U-Boot оставляет его в mux 2). */
     set_pin_mode(PORTA, 4, 2);   /* PA4 = UART0 TX (F2) */
 
-    H3_CCU_GATING3 |= (1u << 16);   /* такт UART0 */
-    H3_CCU_RST4    |= (1u << 16);   /* снять reset UART0 */
-    volatile uint32_t n = 1000;
-    while (n--) {}
+    if (!(H3_CCU_GATING3 & (1u << 16))) {
+        H3_CCU_GATING3 |= (1u << 16);   /* такт UART0 */
+        H3_CCU_RST4    |= (1u << 16);   /* снять reset UART0 */
+        volatile uint32_t n = 1000;
+        while (n--) {}
+    }
     uart_wr = 0;
     uart_rd = 0;
 }
@@ -50,6 +56,16 @@ void uart_flush(void)
         sent++;
     }
     uart_rd = rd;
+}
+
+/* Полный слив кольцевого буфера. uart_flush отдаёт порцию, ограниченную
+   свободным местом FIFO, поэтому для диагностических маркеров (особенно
+   перед местом возможного зависания) нужно крутить слив до опустошения.
+   Ограничение по счётчику — чтобы не встать навсегда при мёртвом UART. */
+void uart_flush_all(void)
+{
+    for (uint32_t guard = 0; guard < 200000u && uart_rd != uart_wr; guard++)
+        uart_flush();
 }
 
 void uart_putc_buffered(char c)

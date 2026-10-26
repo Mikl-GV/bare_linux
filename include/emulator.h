@@ -52,8 +52,13 @@ int emulator_run(uint32_t sys_id, const char *rom_path, uint32_t rom_size);
 int emu_load_rom(const char *path, uint32_t *out_addr, uint32_t *out_size);
 
 /* INTERNAL: зарегистрировать ядро для id системы. Вызывается слоем при
- * линковке (weak-таблица внутри emulator.c). */
+ * линковке (weak-таблица внутри emulator.c). После регистрации система
+ * считается «реализованной», и меню подсвечивает её пункт как доступный. */
 void emulator_register_core(uint32_t sys_id, emu_core_fn fn);
+
+/* Внутренний флаг «ядро реализовано» для пунктов меню. НЕ вызывать из
+ * прикладного кода — меню читает его через emulator_core_ready(). */
+int emulator_core_registered(uint32_t sys_id);
 
 /* Проверка «пользователь хочет выйти»: долгое нажатие START (~3 с).
  * Ядро вызывает в своём главном цикле (каждую итерацию). Возвращает 1,

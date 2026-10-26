@@ -1,3 +1,6 @@
+#ifndef BB_PHY_REG_H
+#define BB_PHY_REG_H
+
 /* BB PHY_REG таблица из Array_MP_8188F_PHY_REG (halhwimg8188f_bb.c).
  * Пары {addr, value}; условные записи (0x80000400/0xA0000000/0xB0000000) — это
  * маркеры условий IF/ELSE для выбора пути/1T, НЕ регистры. Их пропускаем.
@@ -296,3 +299,5 @@ static const uint32_t bb_agc_tab[] = {
     0xC50, 0x69553420,
 };
 /* всего пар: 67 */
+
+#endif /* BB_PHY_REG_H */

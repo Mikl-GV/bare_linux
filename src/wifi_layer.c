@@ -153,6 +153,11 @@ int wifi_layer_start(void)
                     /* Этап 5: читаем eFuse (заводской MAC); если пуст — задаём
                        программно (как драйвер 8189fs) и пишем в REG_MACID. */
                     uint8_t mac[6];
+                    uint32_t seed = micros();
+                    mac[0] = 0x02; mac[1] = 0x11; mac[2] = 0x22;
+                    mac[3] = (uint8_t)(seed >> 16);
+                    mac[4] = (uint8_t)(seed >> 8);
+                    mac[5] = (uint8_t)(seed);
                     int erc = h3_wifi_efuse_read_mac(mac);
                     uart_print("  efuse rc=");
                     uart_print_int(erc);

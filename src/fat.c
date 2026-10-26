@@ -41,14 +41,32 @@ static uint32_t g_part_lba;     /* LBA начала FAT-раздела */
    USB-накопитель через fat_set_block_source (см. fat.h). */
 static fat_blk_read_t  g_blk_rd = 0;
 static fat_blk_write_t g_blk_wr = 0;
+static fat_reinit_t    g_reinit_fn = 0;   /* хук восстановления источника */
+
+/* Хук прогресса чтения файла (полоса в загрузчике ROM). */
+static fat_progress_t g_prog_cb = 0;
+void fat_set_progress_hook(fat_progress_t cb) { g_prog_cb = cb; }
 
 /* Источник по умолчанию — SD. Кастомный (USB-флешка) ставится
  * fat_set_block_source. Рекурсия здесь недопустима: забытый вызов blk_read
  * самого себя вешал FAT при отсутствии кастомного источника (W.9xx). */
+/* Чтение сектора с повтором: одиночный сбой источника (короткий приём в BOT
+   на USB) иначе молча обрезал листинг каталога — read_dir возвращал count. */
 static int blk_read(uint32_t lba, void *buf)
 {
-    if (g_blk_rd) return g_blk_rd(lba, buf);
-    return h3_sdc0_read_sector(lba, buf);
+    for (int i = 0; i < 3; i++) {
+        int rc = g_blk_rd ? g_blk_rd(lba, buf) : h3_sdc0_read_sector(lba, buf);
+        if (rc == 0) return 0;
+    }
+    if (g_blk_rd && g_reinit_fn) {
+        /* Источник (USB-флешка) трижды не отдал сектор — десинк BOT/короткий
+           приём. Восстанавливаем источник и пробуем ещё раз. */
+        g_reinit_fn();
+        for (int i = 0; i < 3; i++) {
+            if (g_blk_rd(lba, buf) == 0) return 0;
+        }
+    }
+    return -1;
 }
 
 static int blk_write(uint32_t lba, const void *buf)
@@ -63,6 +81,11 @@ void fat_set_block_source(fat_blk_read_t rd, fat_blk_write_t wr)
     g_blk_wr = wr;
 }
 
+void fat_set_reinit_hook(fat_reinit_t fn)
+{
+    g_reinit_fn = fn;
+}
+
 int fat_block_source_active(void)
 {
     return g_blk_rd != 0;
@@ -73,6 +96,11 @@ static uint32_t le32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t le64(const uint8_t *p)
+{
+    return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
 }
 
 static void set_le16(uint8_t *p, uint32_t v)
@@ -161,6 +189,7 @@ static uint32_t read_chain(uint32_t cl, uint32_t offset, uint8_t *buf, uint32_t 
             done += n; want -= n;
             in_sec = 0;
             sec_off++;
+            if (g_prog_cb) g_prog_cb(done, len);
         }
         cl = fat_next_cluster(cl);
         skip = 0;
@@ -251,6 +280,25 @@ static int parse_dir_entry(const uint8_t *e, fat_entry_t *out, char *lfn, int *l
     return 1;
 }
 
+/* Причина остановки листинга — одной строкой и один раз за загрузку, иначе
+ * браузер, опрашивающий каталог в цикле, заливает UART (корень с несколькими
+ * записями печатался 60+ раз). */
+static void dir_stop(const char *why, int count, uint32_t lba, uint8_t b0)
+{
+    static int shown;
+    if (shown || count >= 8) return;
+    shown = 1;
+    uart_print("dir: stop=");
+    uart_print((char *)why);
+    uart_print(" n=");
+    uart_print_int(count);
+    uart_print(" lba=");
+    uart_print_int((int)lba);
+    uart_print(" b0=0x");
+    uart_print_hex(b0);
+    uart_print("\r\n");
+}
+
 static int read_dir(uint32_t cl, fat_entry_t *out, int max)
 {
     /* FAT не инициализирована (нет карты / сбой fat_init) — не делим на 0
@@ -266,11 +314,17 @@ static int read_dir(uint32_t cl, fat_entry_t *out, int max)
     while (cl && cl < 0x0FFFFFF8u && guard++ < clim) {
         uint32_t sec = cluster_to_sector(cl);
         for (uint32_t s = 0; s < g_sec_per_cluster; s++) {
-            if (blk_read(sec + s, g_sector) < 0) return count;
+            if (blk_read(sec + s, g_sector) < 0) {
+                dir_stop("read", count, sec + s, 0);
+                return count;
+            }
             for (int i = 0; i < 512; i += 32) {
                 const uint8_t *e = g_sector + i;
                 int r = parse_dir_entry(e, &out[count], lfn, &lfn_len);
-                if (r < 0) return count;
+                if (r < 0) {
+                    dir_stop("end", count, sec + s, e[0]);
+                    return count;
+                }
                 if (r > 0) {
                     if (out[count].name[0] == '.' &&
                         (out[count].name[1] == 0 ||
@@ -350,24 +404,28 @@ static int path_lookup(const char *path, fat_entry_t *out)
  * ROOT_CLU!=0. Возвращает 0 при успехе. */
 static int fat_setup_vol(uint32_t lba)
 {
-    if (blk_read(lba, g_sector) < 0) return -1;
-    if (le16(g_sector + 510) != 0xAA55) return -1;
-    if (le16(g_sector + 11) != 512) return -1;
+    if (blk_read(lba, g_sector) < 0) { uart_print("tsv: read fail\r\n"); return -1; }
+    if (le16(g_sector + 510) != 0xAA55) { uart_print("tsv: no AA55\r\n"); return -1; }
+    if (le16(g_sector + 11) != 512) { uart_print("tsv: bps!=512\r\n"); return -1; }
     uint8_t spc = g_sector[13];
-    if (spc == 0 || (spc & (spc - 1)) != 0) return -1;   /* степень двойки */
-    if (le16(g_sector + 22) != 0) return -1;             /* FAT16-поле != 0 -> не FAT32 */
+    if (spc == 0 || (spc & (spc - 1)) != 0) { uart_print("tsv: bad spc\r\n"); return -1; }
+    if (le16(g_sector + 22) != 0) { uart_print("tsv: fat16\r\n"); return -1; }
     uint32_t root_clu = le32(g_sector + 44);
-    if (root_clu == 0) return -1;
+    if (root_clu == 0) { uart_print("tsv: root_clu 0\r\n"); return -1; }
 
     uint32_t reserved   = le16(g_sector + 14);
     uint32_t num_fats   = g_sector[16];
     uint32_t fat_size   = le32(g_sector + 36);
     uint32_t total_sectors = le32(g_sector + 32);
     if (total_sectors == 0) total_sectors = le16(g_sector + 19);
-    if (num_fats == 0 || fat_size == 0 || fat_size == 0xFFFFFFFFu) return -1;
+    if (num_fats == 0 || fat_size == 0 || fat_size == 0xFFFFFFFFu) {
+        uart_print("tsv: bad fats\r\n"); return -1;
+    }
 
     uint32_t data_start = lba + reserved + num_fats * fat_size;
-    if (data_start >= total_sectors) return -1;
+    if (data_start >= total_sectors) {
+        uart_print("tsv: data_start>=total\r\n"); return -1;
+    }
 
     g_part_lba        = lba;
     g_sec_per_cluster = spc;
@@ -732,29 +790,123 @@ int fat_selftest_write(void)
     return 0;
 }
 
+/* USB-диагностика (fat_init) собирается в статический буфер и печатается
+   ТОЛЬКО при сбое монтирования. При успехе — одна короткая строка. */
+static char g_fat_dbg[512];
+static int  g_fat_dbg_len;
+static void dbg_putc(char c) { if (g_fat_dbg_len < (int)sizeof(g_fat_dbg) - 1) g_fat_dbg[g_fat_dbg_len++] = c; }
+static void dbg_str(const char *s) { while (*s) dbg_putc(*s++); }
+static void dbg_num(uint32_t v) { char t[12]; int i = 0; do { t[i++] = "0123456789"[v % 10]; v /= 10; } while (v && i < 12); while (i) dbg_putc(t[--i]); }
+static void dbg_hex(uint32_t v) { const char *h = "0123456789ABCDEF"; dbg_putc('0'); dbg_putc('x'); for (int sh = 28; sh >= 0; sh -= 4) dbg_putc(h[(v >> sh) & 0xF]); }
+static void dbg_end(void) { g_fat_dbg[g_fat_dbg_len] = 0; if (g_fat_dbg_len) { uart_print(g_fat_dbg); uart_print("\r\n"); } g_fat_dbg_len = 0; }
+
 int fat_init(void)
 {
+    g_fat_dbg_len = 0;
     /* Собрать FAT32-разделы из MBR (типы 0x0B/0x0C; FAT16 не поддерживаем). */
     enum { MAX_PART = 4 };
     uint32_t plt_start[MAX_PART];
     int part_count = 0;
-    if (blk_read(0, g_sector) < 0) return -1;
+    if (blk_read(0, g_sector) < 0) { dbg_str("mbr: read0 fail"); dbg_end(); return -1; }
+    /* Диагностика: детали MBR/GPT/BPB копим в буфер, выводим при ошибке. */
     for (int n = 0; n < 4; n++) {
         int off = 446 + n * 16;
         uint8_t type = g_sector[off + 4];
+        uint32_t slba = le32(g_sector + off + 8);
+        uint32_t ssiz = le32(g_sector + off + 12);
+        dbg_str("mbr: p"); dbg_num(n);
+        dbg_str(" type="); dbg_hex(type);
+        dbg_str(" lba="); dbg_num(slba);
+        dbg_str(" sz="); dbg_num(ssiz);
+        dbg_putc(';');
         if (type == 0x0B || type == 0x0C) {
-            uint32_t lba = le32(g_sector + off + 8);
-            if (lba != 0 && part_count < MAX_PART)
-                plt_start[part_count++] = lba;
+            if (slba != 0 && part_count < MAX_PART)
+                plt_start[part_count++] = slba;
+        } else if (type == 0xEE && n == 0) {
+            /* GPT (protective MBR): реальные разделы — в GPT. Заголовок на
+               LBA 1, таблица разделов на PartitionEntryLBA (поле 72),
+               обычно LBA 2. Каждая запись 128 байт: FirstLBA = le64(off 32),
+               тип раздела — GUID в первые 16 байт записи (Basic Data =
+               EBD0A0A2-B9E5-4433-87C0-68B6B72699C7, байты младшие-вперёд).
+               Читаем и сканируем записи, берём FAT-раздел с диагностикой. */
+            {
+                int r1 = blk_read(1, g_sector);
+                uart_print("gpt: rd1=");
+                uart_print_int(r1);
+                uart_print("\r\n");
+                if (r1 < 0) continue;
+                uart_print("gpt: sig8=0x");
+                uart_print_hex((uint32_t)le64(g_sector + 8));
+                uart_print(" hi=0x");
+                uart_print_hex((uint32_t)(le64(g_sector + 8) >> 32));
+                uart_print("\r\n");
+            }
+            if (blk_read(1, g_sector) >= 0 &&
+                le64(g_sector + 8) == 0x5452415020494645ull) {
+                uint64_t pe_lba = le64(g_sector + 72);
+                uint32_t nent  = (uint32_t)le32(g_sector + 80);
+                uint32_t esize = (uint32_t)le32(g_sector + 84);
+                if (pe_lba == 0) pe_lba = 2;
+                if (nent > 128) nent = 128;
+                if (esize == 0) esize = 128;
+                uart_print("gpt: pe_lba=");
+                uart_print_int((int)pe_lba);
+                uart_print(" n=");
+                uart_print_int((int)nent);
+                uart_print(" esz=");
+                uart_print_int((int)esize);
+                uart_print("\r\n");
+                for (uint32_t e = 0; e < nent && part_count < MAX_PART; e++) {
+                    uint64_t rec_lba = pe_lba + (uint64_t)e * esize / 512;
+                    uint32_t rec_off = (esize * e) % 512;
+                    /* Одна запись может пересекать границу сектора — читаем
+                       сектор записи (fallback: если off+128>512, читаем по 1). */
+                    if (blk_read((uint32_t)rec_lba, g_sector) < 0) break;
+                    /* Тип Basic Data (FAT): EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+                       записывается младшим индийским байтом-в-первом. */
+                    static const uint8_t basic_data[16] = {
+                        0xA2,0xA0,0xD0,0xEB, 0xE5,0xB9, 0x33,0x44,
+                        0x87,0xC0, 0x68,0xB6,0xB7,0x26,0x99,0xC7
+                    };
+                    int same = 1;
+                    for (int b = 0; b < 16; b++)
+                        if (g_sector[rec_off + b] != basic_data[b]) { same = 0; break; }
+                    uint64_t flba = le64(g_sector + rec_off + 32);
+                    uart_print("gpt: rec");
+                    uart_print_int((int)e);
+                    uart_print(" type=");
+                    uart_print_int(same);
+                    uart_print(" lba=");
+                    uart_print_int((int)flba);
+                    uart_print("\r\n");
+                    if (same && flba && flba < (1ULL << 40)) {
+                        plt_start[part_count++] = (uint32_t)flba;
+                        break;
+                    }
+                }
+            }
         }
     }
-    if (part_count == 0) return -1;
+    uart_print("fat: parts=");
+    uart_print_int(part_count);
+    uart_print("\r\n");
+    if (part_count == 0) {
+        /* Superfloppy: FAT32-том прямо в LBA 0, MBR-таблица разделов пуста
+           (типично для флешек, отформатированных как «супер-флоппи»). BPB в
+           LBA 0 распознаётся тем же fat_setup_vol. */
+        if (fat_setup_vol(0) != 0) return -1;
+        uart_print("fat: superfloppy (no MBR part table)\r\n");
+        return 0;
+    }
 
     /* Сначала ищем раздел с /roms, иначе первый валидный FAT32. */
     uint32_t part_lba = 0;
     int found_roms = -1, found_valid = -1;
     for (int pi = 0; pi < part_count; pi++) {
-        if (fat_setup_vol(plt_start[pi]) != 0) continue;
+        uart_print("fat: try part lba=");
+        uart_print_int((int)plt_start[pi]);
+        if (fat_setup_vol(plt_start[pi]) != 0) { uart_print(" fail\r\n"); continue; }
+        uart_print(" ok\r\n");
         if (found_valid < 0) found_valid = pi;
         if (part_has_roms()) { found_roms = pi; break; }
     }
@@ -808,5 +960,9 @@ int fat_read_file(const fat_entry_t *f, uint32_t offset, uint8_t *buf, uint32_t 
     if (!f) return -1;
     if (offset >= f->size) return 0;
     if (len > f->size - offset) len = f->size - offset;
-    return (int)read_chain(f->first_cluster, offset, buf, len);
+    int got = (int)read_chain(f->first_cluster, offset, buf, len);
+    /* Короткое чтение (сбой носителя / конец цепочки раньше размера) —
+       отдаём как ошибку, чтобы вызывающий не принял частичные данные за полные. */
+    if (got < (int)len) return -1;
+    return got;
 }

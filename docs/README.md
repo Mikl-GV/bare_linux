@@ -215,9 +215,12 @@
 - **Тулчейн**: `arm-none-eabi-gcc` (AArch32, `-mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard`).
   Путь по умолчанию в Makefile: `C:/ARM/gcc-arm-none-eabi-15.2.1/bin`.
 - **make**: MSYS2 (`C:/msys64/usr/bin/make.exe`) — добавить в PATH.
-- **FEL**: `tools/fel/src/sunxi-tools/sunxi-fel.exe` (собран в проекте;
-  нужна UCRT-версия `libusb-1.0.dll` из `C:/msys64/ucrt64/bin`).
-- **SPL для FEL**: `tools/fel/spl/spl.bin` (U-Boot SPL 2025.01 H3, init DRAM).
+- **FEL**: `tools/fel/bin/sunxi-fel.exe` (собран в проекте; исходники —
+  `tools/fel/src/sunxi-tools/`; нужна UCRT-версия `libusb-1.0.dll`
+  из `C:/msys64/ucrt64/bin`).
+- **SPL/U-Boot для FEL**: `tools/u-boot/u-boot-sunxi-with-spl.bin` (U-Boot v2025.01,
+  поднимает такты/DRAM/периферию). `tools/fel/spl/spl.bin` — legacy SPL (только DRAM,
+  для старого пути `spl+write+exe`).
 - **JTAG** (опционально): OpenOCD `C:/msys64/ucrt64/bin/openocd.exe` +
   адаптер JTAGprobe (CMSIS-DAP, Raspberry Pi Pico).
 
@@ -235,27 +238,32 @@ make bin          # соберёт h3_bare.elf и h3_bare.bin (образ на 0
 - Сборка многопоточная при желании: `make -j8 bin`.
 - Версия прошивки (`FW vWU.MAJOR.MINOR`, сборки с WU.1.000) авто-инкрементируется
   при сборке (`tools/scripts/bump_version.sh`), выводится по UART и на экран.
-- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (bin ~113 КБ).
+- Артефакты: `h3_bare.elf`, `h3_bare.bin` — в корне проекта (`h3_bare.elf` ~1.2 МБ,
+  включает слой Atari Lynx; `.bin` — целевой образ для `go 0x40000000`).
 
 ## Заливка
 
-### Через FEL (SPL) — основная для разработки
+### Через FEL + U-Boot v2025.01 — основная для разработки
 
+Штатный способ: `sunxi-fel uboot` грузит наш U-Boot (`tools/u-boot/`
+`u-boot-sunxi-with-spl.bin`), который поднимает такты/DRAM/питание, MMC,
+USB и запускает прошивку из ОЗУ по `0x40000000` (без SD/USB для запуска):
 ```sh
-FEL=tools/fel/src/sunxi-tools/sunxi-fel.exe
-SPL=tools/fel/spl/spl.bin
+FEL=tools/fel/bin/sunxi-fel.exe
+UBOOT=tools/u-boot/u-boot-sunxi-with-spl.bin
 BIN=h3_bare.bin
 
-"$FEL" writel 0x01C20800 0x00003333   # PA0-3 в JTAG (function 3), ДО spl
-"$FEL" spl "$SPL"                     # init DRAM
-"$FEL" write 0x40000000 "$BIN"        # записать прошивку
-"$FEL" exe 0x40000000                 # запустить
+"$FEL" uboot "$UBOOT" write 0x40000000 "$BIN"   # u-boot + прошивка в RAM
 ```
+После `go` прошивка наследует такты (1008 МГц), MMU/TTBR, UART0, MMC0/MMC1,
+USB PHY — и не переинициализирует их повторно (см. DEVELOPER-GUIDE).
 
 ### Через SD + U-Boot
 
-`h3_bare.bin` на FAT-разделе карты; `/boot.scr` грузит его на `0x40000000`
-и выполняет `go 0x40000000`.
+`h3_bare.bin` на FAT-разделе карты; U-Boot на offset 8 КиБ (или `make sd`):
+```
+if fatload mmc 0 0x40000000 h3_bare.bin; then go 0x40000000; fi
+```
 
 ### Отладка
 
@@ -268,17 +276,26 @@ BIN=h3_bare.bin
 ## Структура проекта
 
 ```
-src/           исходники (main, uart, sys, h3_mmu, h3_dma, i2s, h3_sdc, ...)
-include/       заголовки; bb_phy_reg.h / rf_radioa.h — таблицы BB/RF (8188F)
-tools/         sunxi-fel (SPL+инструмент), JTAG (config+прошивка Pico),
-               wifi/ (референсный Linux-драйвер rtl8189fs + справка),
-               scripts/ (bump_version.sh)
-ref/           эталон: распакованный образ Lakka 2.3.1 (ref/Lakka-...image,
-               НЕ коммитится)
+src/           исходники: ядро (main, uart, sys, h3_mmu, h3_dma, i2s, gic, irq,
+               mailbox, mem), дисплей (display, h3_de2, h3_lcd, h3_hdmi, dw_hdmi),
+               периферия (pcf8574, sega_pad, h3_i2c_bb), storage (fat, h3_sdc0),
+               USB host (usb_hc, usb_ohci, usb_msd, usb_kbd), WiFi (h3_sdc,
+               wifi_layer, wifi_net, wpa_crypto), слой эмулятора (emulator,
+               emu_io, libc_min, retro_menu) и сами ядра: lynx/, blip/, gameboy/,
+               gameboy_host.cpp
+include/       заголовки; bb_phy_reg.h / rf_radioa.h — таблицы BB/RF (8188F),
+               systems.h (реестр систем), usb_*, fat.h, emulator.h, i2s.h ...
+tools/         sunxi-fel (bin+src+SPL), u-boot (u-boot-sunxi-with-spl.bin),
+               JTAG (config+прошивка Pico), wifi/ (референсный драйвер + справка),
+               scripts/ (bump_version.sh), ref/
+ref/           эталон: распакованный образ Lakka 2.3.1, allwinner-bare-metal
+               (НЕ коммитится, в .gitignore)
+resources/     входные данные: emulation_h3*.xlsx (реестр систем), образы/биосы
 boot.s         стартовый код (векторы, MMU, L1)
 linker.ld      линкер-скрипт (код на 0x40000000)
-fw_nic.bin     прошивка RTL8189FTV (инкапсулирована в образ)
-Makefile       сборка (MSYS2 make, arm-none-eabi-gcc)
+fw_nic.bin     прошивка RTL8189FTV (инкапсулирована в образ, src/fw_blob.S)
+fw_blob.S      .incbin "fw_nic.bin"
+Makefile       сборка (MSYS2 make, arm-none-eabi-gcc, многопоточно -j)
 ```
 
 ## Документация
@@ -291,6 +308,7 @@ Makefile       сборка (MSYS2 make, arm-none-eabi-gcc)
 | `LAKKA-ETALON.md` | Эталонные замеры живой Lakka 2.3.1 (шина, регистры, CAM, TX) для сверки. |
 | `NEXT-QUESTIONS.md` | Актуальное состояние и ближайшие шаги (DHCP ACK, WebDAV, эмуляторы). |
 | `HISTORY.md` | Хроника этапов проекта и ключевых вех. |
+| `AUDIT.md` (в корне) | Сквозной аудит проекта (2026-10-25): статусы правок по слоям, сверка с даташитом. |
 
 ## Git / точки восстановления
 

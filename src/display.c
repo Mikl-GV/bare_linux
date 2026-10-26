@@ -83,6 +83,8 @@ void fb_rect(int x0, int y0, int x1, int y1, uint32_t color)
 void fb_text(int x, int y, const char *s, uint32_t color, uint32_t bg)
 {
     uint32_t pitch_w = fb_pitch / 4;
+    /* Отсечь позиции за пределами кадра (иначе выход за буфер fb[]). */
+    if (x >= FB_W || y >= FB_H) return;
     while (*s) {
         const uint8_t *glyph;
         int ch;

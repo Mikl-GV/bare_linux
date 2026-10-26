@@ -24,6 +24,7 @@ void mb_init(void)
     m->flag_cpu1 = 0;
     m->wridx = 0;
     m->rdidx = 0;
+    m->audio_done = 0;
     __asm volatile("dsb" ::: "memory");
 }
 

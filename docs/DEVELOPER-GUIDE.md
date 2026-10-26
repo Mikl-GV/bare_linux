@@ -6,7 +6,8 @@
 ## 0. Версионирование
 
 - Версия прошивки: `include/version.h` (`FW_VERSION_STR`), авто-инкремент при каждой
-  сборке (`tools/scripts/bump_version.sh`). Формат `W.<номер>`.
+  сборке (`tools/scripts/bump_version.sh`). Формат `WU.<major>.<minor>` (major — этап,
+  сейчас 1 — эмуляторы; minor с ведущими нулями до 3 знаков).
 - Выводится по UART при старте и на экран (нижний правый угол).
 
 ## 1. Требования к окружению
@@ -14,9 +15,10 @@
 - **Тулчейн**: `arm-none-eabi-gcc` (AArch32, `-mcpu=cortex-a7 -mfpu=neon -mfloat-abi=hard`).
   Путь по умолчанию: `C:/ARM/gcc-arm-none-eabi-15.2.1/bin`.
 - **make**: MSYS2 (`C:/msys64/usr/bin/make.exe`) — добавить в PATH.
-- **FEL**: `tools/fel/src/sunxi-tools/sunxi-fel.exe` + `tools/fel/spl/spl.bin`
-  (U-Boot SPL 2025.01 H3). Нужна UCRT-версия `libusb-1.0.dll` из
-  `C:/msys64/ucrt64/bin` (если не в PATH — падает 0xC0000135).
+- **FEL**: `tools/fel/bin/sunxi-fel.exe` + цельный
+  `tools/u-boot/u-boot-sunxi-with-spl.bin` (U-Boot v2025.01, поднимает такты/DRAM/периферию).
+  Нужна UCRT-версия `libusb-1.0.dll` из `C:/msys64/ucrt64/bin` (если не в PATH —
+  падает 0xC0000135).
 - **JTAG**: OpenOCD `C:/msys64/ucrt64/bin/openocd.exe` + JTAGprobe (CMSIS-DAP,
   Raspberry Pi Pico), конфиг `tools/jtag/h3_pico_jtag.cfg` (IDCODE DAP 0x5ba00477).
 
@@ -28,7 +30,7 @@ Windows. Всё нужное для проекта — в папке проек�
 ```sh
 export PATH="/c/msys64/usr/bin:/c/msys64/ucrt64/bin:$PATH"
 cd E:/Giga_1/Bare_linux
-make clean && make bin     # h3_bare.elf + h3_bare.bin (~113 КБ, грузится на 0x40000000)
+make clean && make bin     # h3_bare.elf + h3_bare.bin (~1.2 МБ, грузится на 0x40000000)
 ```
 
 Правило: после правки любого `.h` — `make clean && make bin` (начисто, не полагаться
@@ -36,29 +38,30 @@ make clean && make bin     # h3_bare.elf + h3_bare.bin (~113 КБ, грузит�
 
 ## 3. Заливка
 
-### Через FEL (SPL) — основная для разработки
+### Через FEL + U-Boot — основная для разработки
 
 ```sh
-FEL=tools/fel/src/sunxi-tools/sunxi-fel.exe
-SPL=tools/fel/spl/spl.bin
+FEL=tools/fel/bin/sunxi-fel.exe
+UBOOT=tools/u-boot/u-boot-sunxi-with-spl.bin
 BIN=h3_bare.bin
 
-"$FEL" writel 0x01C20800 0x00003333   # 1) PA0-3 в JTAG (function 3), ДО spl
-"$FEL" spl "$SPL"                     # 2) SPL (инит DRAM)
-"$FEL" write 0x40000000 "$BIN"        # 3) записать прошивку
-"$FEL" exe 0x40000000                 # 4) запустить
+"$FEL" uboot "$UBOOT" write 0x40000000 "$BIN"   # U-Boot + прошивка в RAM
 ```
+Порядок важен: `uboot` поднимает DRAM/такты/периферию и переносит U-Boot proper,
+`write` кладёт прошивку по 0x40000000; дальше bootcmd делает `go 0x40000000`.
+Полное описание — в `tools/u-boot/UBOOT.md`.
 
 ### Через SD + U-Boot
 
-- `h3_bare.bin` на FAT-разделе; `/boot.scr` грузит на `0x40000000` и выполняет `go 0x40000000`.
+- `h3_bare.bin` на FAT-разделе; `u-boot-sunxi-with-spl.bin` на offset 8 КиБ
+  (`dd … bs=1k seek=8`), bootcmd: `fatload mmc 0 0x40000000 h3_bare.bin; go …`.
 - Лог: `## Starting application at 0x40000000`.
 
 ## 4. Архитектура (модули)
 
 | Модуль | Файл | Роль |
 |---|---|---|
-| Старт | `src/boot.s` | векторы, PSVC, JTAG PA0-3, BSS/.coherent, стек, `kmain` |
+| Старт | `boot.s` | векторы, PSVC, JTAG PA0-3, BSS/.coherent, стек, `kmain` |
 | Главный | `src/main.c` | `kmain()`: инициализация, меню, главный цикл |
 | UART | `src/uart.c` | UART0 115200 8N1, кольцевой буфер 4096 + `uart_flush()` |
 | Порты | `src/ports.c` | PIO: mode/data/pull, LED PL10, `gpio_init` |
@@ -80,20 +83,38 @@ BIN=h3_bare.bin
 | SMP | `src/h3_smp.c` | подъём CPU1..3 (трамплин SRAM A1, R_CPUCFG/PSCI) |
 | Ретро-меню | `src/retro_menu.c` | список систем → браузер ромов /roms/<система> → запуск (заглушка); Settings/Help/About, Transfer, Sound |
 | Реестр систем | `include/systems.h` | таблица систем (id/имя/папка/группа/статус/builtin) из emulation_h3_v2.xlsx |
+| Память/куча | `src/mem.c` + `include/mem.h` | куча + ROM-зона эмуляторов (`mem_rom_reserve`/`mem_alloc`) |
+| IRQ | `src/irq.c` + `include/irq.h` | таблица обработчиков GIC-прерываний (160 линий) + `irq_global_enable` |
+| Слой эмулятора | `src/emu_io.c` + `src/emu_io.h` | единый снимок кнопок (PAD_*) + звук `emu_audio_push` для host-ядер |
+| USB-клавиатура | `src/usb_kbd.c` + `src/usb_kbd.h` | interrupt-IN (OHCI), отчёты клавиш, автоповтор |
 
 ### Точка входа и порядок `kmain()`
 
+Загрузка: штатно через U-Boot v2025.01 (`tools/u-boot`, FEL `sunxi-fel uboot …
+write 0x40000000 h3_bare.bin` или SD). U-Boot поднимает такты CPU/питание
+(1008 МГц, DRAM 672 МГц), MMU/TTBR, UART0, MMC0/MMC1, USB PHY/EHCI/OHCI;
+прошивка это наследует и НЕ переинициализирует повторно (см. boot.s —
+MMU не трогаем; uart/sdc/usb — с fallback-проверкой). Свои PLL — DE/VIDEO/
+AUDIO — прошивка настраивает сама.
+
 ```c
-secure_unlock();      // SMTA/DMA non-secure
-h3_smp_boot(0);       // поднять CPU1..3 (трамплин SRAM A1, R_CPUCFG/PSCI)
-gic_init();           // GIC dist+cpu, группы 0/1
-sys_timer_init();     // HSTMR
-gpio_init();          // APB0 gate порта L
-uart_init();          // UART0 115200 (PA4)
+uart_init();          // UART0: fallback-проверка (U-Boot уже настроил)
+secure_unlock();      // SMTA/DMA non-secure (U-Boot оставляет Secure!)
+sys_timer_init();     // HSTMR (таймер ДО SMP/CPU-такта)
+cpu_clk_init();       // диагностика тактов (частоту ставит U-Boot)
+mb_init();            // почта CPU0<->CPU1 (uncached)
+mem_init(0);          // куча + ROM-зона эмуляторов
+h3_smp_boot(...);     // поднять CPU1 (звук), CPU2/3 потушены
+gic_init();           // GIC dist+cpu, группы 0/1 (U-Boot GIC не трогает)
+sys_tick_init();      // периодный тик Timer0 (IRQ 50)
+irq_global_enable();  // глобально снять I-бит ТОЛЬКО после готового тика
+gpio_init();          // APB0 gate порта L (U-Boot PIO уже настроил)
 set_led(1);           // PL10
-display_init();       // DE2/TCON1/HDMI 1024x600 (свой FB .fb_hdmi)
+display_init();       // DE2/TCON1/HDMI 1024x600 (свой FB .fb_hdmi, свои PLL)
 i2cbb_init(PORTG,9, PORTG,8); pcf8574_init();   // кнопки
-i2s_init();           // I2S0 → MAX98357A
+sega_pad_init();      // Sega-геймпад (PCF8574@0x20)
+i2s_init();           // I2S0 → MAX98357A (PLL_AUDIO свой — U-Boot его не включает)
+usb_hc_init();        // USB host (такты/PHY наследуем от U-Boot)
 retro_menu_run();     // главное ретро-меню (внутри wifi_layer_poll + кнопки)
 // WiFi — по требованию из Settings→Transfer (wifi_layer_start), не при старте
 ```
@@ -197,8 +218,8 @@ seq данных в TX-дескрипторе).
   reset PHY N, bit(8+N) = clock PHY N, bit(16+N) = clock OHCI N), SIDDQ
   снят НЕ в CCU, а в pmuN+0x10 (0x01C1B810/0x01C1C810) bit1, passby 0x701
   — в pmuN (0x01C1B800/0x01C1C800).
-- **OHCI-путь** (эталон `ref/pico-retro-new-gen-usb/usb_ohci.c`): init без
-  HCR (fminterval=0x2edf+fsmps, periodstart, lsperiod=0x628), root port
+- **OHCI-путь** (паттерн pico-retro `usb_ohci.c`, кода эталона в `ref/` нет):
+  init без HCR (fminterval=0x2edf+fsmps, periodstart, lsperiod=0x628), root port
   PPS→PRS, ожидание CCS/PES, per-port пулы ED/TD/HCCA. Порт работает:
   `DEVICE on OHCI(idx)`, `port after reset=0x103` (CCS+PES).
 - **Клавиатура (PHY2) — РАБОТАЕТ**: `usb_kbd.c/h` (enum: GET_DESC→

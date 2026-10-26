@@ -170,11 +170,9 @@ pkt[p++] = 0x63; pkt[p++] = 0x82; pkt[p++] = 0x53; pkt[p++] = 0x63;  /* cookie *
         pseudo[10] = (uint8_t)(ulen >> 8); pseudo[11] = (uint8_t)ulen;
         for (int i = 0; i < 12; i += 2)
             acc += (uint32_t)((pseudo[i] << 8) | pseudo[i+1]);
-        for (int i = 20; i < (int)p; i += 2) {
-            uint16_t w = (uint16_t)((pkt[i] << 8) | pkt[i+1]);
-            acc += (uint32_t)w;
-        }
-        if (p & 1) acc += (uint32_t)(pkt[p-1] << 8);
+        for (int i = 20; i + 1 < (int)p; i += 2)
+            acc += (uint32_t)((pkt[i] << 8) | pkt[i + 1]);
+        if ((p & 1) && p > 20) acc += (uint32_t)(pkt[p - 1] << 8);
         while (acc >> 16) acc = (acc & 0xFFFF) + (acc >> 16);
         uint16_t uc = (uint16_t)~acc;
         if (uc == 0) uc = 0xFFFF;

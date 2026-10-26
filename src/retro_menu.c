@@ -15,6 +15,7 @@
 #include "emulator.h"
 #include "usb_kbd.h"
 #include "usb_msd.h"
+#include "usb.h"
 #include "sega_pad.h"
 
 /* Флаг «WiFi-слой активен» (пишет wifi_layer) — значок в шапке меню. */
@@ -87,9 +88,6 @@ static int g_sd_ok = 0;              /* 0=SD не инициализирован
 /* Наличие папки системы на SD (индекс системного idx). Заполняется в
    sd_init_menu после посева. Нужно для цвета/доступности пункта. */
 static uint8_t g_sys_has_dir[NUM_SYSTEMS];
-/* Эмулятор системы реализован (0 = ещё нет). Пока все 0 — по мере
-   написания ядер поднимаем флаг; пункт белеет только при папке+эмуляторе. */
-static uint8_t g_sys_emu[NUM_SYSTEMS];
 static uint32_t g_prev = 0;
 
 static int sys_max_rows(void)
@@ -173,7 +171,7 @@ static void render_systems(void)
             int i = g_rows[r].idx;
             /* Белый только если папка системы есть на SD И эмулятор реализован.
                Иначе — серый (пункт не готов к запуску). */
-            int playable = g_sys_has_dir[i] && g_sys_emu[i];
+            int playable = g_sys_has_dir[i] && emulator_core_registered((uint32_t)i);
             uint32_t clr = playable
                          ? (sel ? 0x00FFFF00 : 0x00FFFFFF)
                          : (sel ? 0x00888800 : 0x00666666);
@@ -234,9 +232,17 @@ static void load_browser(void)
     for (const char *s = dir; *s && pl < (int)sizeof(path) - 1; s++) path[pl++] = *s;
     path[pl] = 0;
 
+    uart_print("browser: enter ");
+    uart_print(path);
+    uart_print("\r\n");
+    uart_flush();
     fat_entry_t *list = fat_scratch();
     int n = fat_list(path, list, FAT_MAX_ENTRIES);
     if (n < 0) n = 0;
+    uart_print("browser: n=");
+    uart_print_int(n);
+    uart_print("\r\n");
+    uart_flush();
     /* сортировка по имени */
     for (int i = 0; i < n - 1; i++)
         for (int j = i + 1; j < n; j++)
@@ -350,18 +356,34 @@ static void render_settings_help(void)
     fb_text(8, 24, g_screen == RU_SETTINGS ? "Settings" : g_screen == RU_HELP ? "Help" : "About",
             0x00FFFFFF, 0x00336699);
     if (g_screen == RU_SETTINGS) {
-        static const char *items[4] = {
+        static const char *items[6] = {
             "Transfer (WiFi to SD)",
             "Sound test",
             "Storage test (write/delete)",
-            "Sega pad test"
+            "Sega pad test",
+            "USB reinit (flash drive)",
+            "Volume"
         };
         int y = 140;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             int sel = (i == g_settings_sel);
             uint32_t clr = sel ? 0x00FFFF00 : 0x00FFFFFF;
             if (sel) fill_row(y, 0x00181818);
-            fb_text(70, y, items[i], clr, sel ? 0x00181818 : 0x000D1A33);
+            if (i == 5) {
+                /* "Volume: 10%" (правильное трёхзначное число без libc). */
+                char buf[14];
+                int v = (int)i2s_get_volume();
+                const char *pre = "Volume: ";
+                int k = 0;
+                while (pre[k]) { buf[k] = pre[k]; k++; }
+                if (v >= 100) { buf[k++] = '1'; buf[k++] = '0'; buf[k++] = '0'; }
+                else if (v >= 10) { buf[k++] = (char)('0' + v / 10); buf[k++] = (char)('0' + v % 10); }
+                else { buf[k++] = (char)('0' + v); }
+                buf[k++] = '%'; buf[k] = 0;
+                fb_text(70, y, buf, clr, sel ? 0x00181818 : 0x000D1A33);
+            } else {
+                fb_text(70, y, items[i], clr, sel ? 0x00181818 : 0x000D1A33);
+            }
             y += ROW_H;
         }
         if (g_store_test_rc != STORE_TEST_NOT_RUN) {
@@ -371,7 +393,7 @@ static void render_settings_help(void)
                 fb_text(70, y + 8, "Storage: FAIL (see UART log)", 0x00FF4040, 0x000D1A33);
             }
         }
-        fb_text(60, 250, "A=open/run  B=back", 0x00A0C0D0, 0x000D1A33);
+        fb_text(60, 140 + 6 * ROW_H + 24, "A=open/run  B=back", 0x00A0C0D0, 0x000D1A33);
     } else if (g_screen == RU_HELP) {
         fb_text(60, 140, "SD structure (static, no card read):", 0x00FFFFFF, 0x000D1A33);
         fb_text(60, 170, "/  (roms partition, SD)", 0x00A0C0D0, 0x000D1A33);
@@ -572,23 +594,12 @@ static uint32_t g_repeat_at_ms  = 0;    /* когда следующий пов�
 
 static uint32_t wait_btn(void)
 {
-    uint32_t btns = pcf8574_read();
+    uint8_t raw = 0xFF;
+    uint32_t btns = pcf8574_read_ex(&raw);
+    (void)raw;
 
-    /* Sega-джойстик (драйвер 1 к 1): опрашиваем и подмешиваем к кнопкам.
-       Маппинг: крестовина -> стрелки, A/B -> A/B, Mode -> Select,
-       Start -> Start. X/Y/Z/C в меню пока не мапим (по решению владельца). */
-    uint16_t pad = sega_pad_scan();
-    if (pad) {
-        if (pad & 0x01) btns |= BTN_UP;
-        if (pad & 0x02) btns |= BTN_DOWN;
-        if (pad & 0x04) btns |= BTN_LEFT;
-        if (pad & 0x08) btns |= BTN_RIGHT;
-        if (pad & 0x10) btns |= BTN_A;
-        if (pad & 0x20) btns |= BTN_B;
-        if (pad & 0x80) btns |= BTN_START;
-        if (pad & 0x800) btns |= BTN_SELECT;   /* Mode */
-    }
-
+    /* Sega-джойстик НЕ мапится в меню/программе (решение владельца): его
+       опрос остаётся только на экране теста (render_padtest). */
     uint32_t pressed = btns & ~g_prev;
     g_prev = btns;
     uint32_t now = micros() / 1000;
@@ -655,6 +666,9 @@ static void sd_init_menu(void)
            SD при её наличии. */
         if (usb_msd_active()) {
             fat_set_block_source(usb_msd_block_read, usb_msd_block_write);
+            /* Авто-восстановление: при сбое чтения (десинк BOT флешки)
+               blk_read сам переподнимет накопитель через этот хук. */
+            fat_set_reinit_hook(usb_hc_reinit_flash);
             uart_print("fat: init (USB source)...\r\n");
             if (fat_init() == 0) {
                 g_sd_ok = 1;   /* носитель есть (флешка) */
@@ -722,7 +736,7 @@ void retro_menu_run(void)
                         только на время опроса карты (токены в h3_sdc0.c) */
     set_led(1);
 
-    for (;;) {
+for (;;) {
         /* IP мог прийти асинхронно (DHCP в wifi_layer_poll) — перерисуем
            экран Transfer без нажатия кнопки. */
         if (g_screen == RU_TRANSFER) {
@@ -743,23 +757,26 @@ void retro_menu_run(void)
 
         led_heartbeat();   /* мигание PL10 — индикатор жизни процессора */
         uint32_t p = wait_btn();
-        if (p == 0) {
+        if (!p) {
             wifi_layer_poll();
             udelay(10000);
-            continue;
         }
         if (g_screen == RU_SYSTEMS) {
             if (p & BTN_UP) {
                 int next = g_sel;
-                do { next = (next + g_row_count - 1) % g_row_count; } while (g_rows[next].type == RT_GROUP);
+                int guard = 0;
+                do { next = (next + g_row_count - 1) % g_row_count; }
+                while (g_rows[next].type == RT_GROUP && ++guard < g_row_count);
                 g_sel = next;
                 dirty = 1;
             } else if (p & BTN_DOWN) {
                 int next = g_sel;
-                do { next = (next + 1) % g_row_count; } while (g_rows[next].type == RT_GROUP);
+                int guard = 0;
+                do { next = (next + 1) % g_row_count; }
+                while (g_rows[next].type == RT_GROUP && ++guard < g_row_count);
                 g_sel = next;
                 dirty = 1;
-            } else if (p & BTN_A) {
+            } else if (p & (BTN_A | BTN_START)) {
                 int r = g_sel;
                 if (g_rows[r].type == RT_SYS) {
                     g_sys = g_rows[r].idx;
@@ -778,8 +795,6 @@ void retro_menu_run(void)
                     g_screen = RU_ABOUT;
                 }
                 dirty = 1;
-            } else if (p & BTN_START) {
-                return;                 /* выход из меню */
             }
         } else if (g_screen == RU_BUILTIN) {
             if (p & BTN_UP)   { g_placeholder_sel = 0; dirty = 1; }
@@ -862,7 +877,9 @@ void retro_menu_run(void)
                         rompath[k++] = *s;
                     rompath[k] = 0;
                     extern void lynx_register(void);
+                    extern void gameboy_register(void);
                     lynx_register();   /* слои регистрируют свои ядра при запуске */
+                    gameboy_register();
                     int erc = emulator_run(g_sys, rompath, list[g_browser_sel].size);
                     if (erc != EMU_OK) {
                         /* ядро не реализовано или ошибка загрузки — короткий
@@ -883,10 +900,22 @@ void retro_menu_run(void)
                 dirty = 1;
             }
         } else if (g_screen == RU_SETTINGS) {
-            /* 0 = Transfer, 1 = Sound test, 2 = Storage test, 3 = Sega pad test */
-            if (p & BTN_DOWN) { g_settings_sel = (g_settings_sel + 1) % 4; dirty = 1; }
-            else if (p & BTN_UP) { g_settings_sel = (g_settings_sel + 3) % 4; dirty = 1; }
-            else if (p & BTN_A) {
+            /* 0=Transfer, 1=Sound, 2=Storage, 3=Pad test, 4=USB reinit, 5=Volume */
+            if (p & BTN_DOWN) { g_settings_sel = (g_settings_sel + 1) % 6; dirty = 1; }
+            else if (p & BTN_UP) { g_settings_sel = (g_settings_sel + 5) % 6; dirty = 1; }
+            else if (p & BTN_LEFT) {
+                if (g_settings_sel == 5) {
+                    uint32_t v = i2s_get_volume();
+                    i2s_set_volume(v >= 5 ? v - 5 : 0);   /* шаг 5%, минимум 0 */
+                    dirty = 1;
+                }
+            } else if (p & BTN_RIGHT) {
+                if (g_settings_sel == 5) {
+                    uint32_t v = i2s_get_volume();
+                    i2s_set_volume(v + 5 > 100 ? 100 : v + 5);   /* шаг 5%, максимум 100 */
+                    dirty = 1;
+                }
+            } else if (p & BTN_A) {
                 if (g_settings_sel == 0) {
                     g_screen = RU_TRANSFER;
                 } else if (g_settings_sel == 1) {
@@ -898,9 +927,19 @@ void retro_menu_run(void)
                     uart_print("fat: selftest write rc=");
                     uart_print_int(g_store_test_rc);
                     uart_print("\r\n");
-                } else {
+                } else if (g_settings_sel == 3) {
                     g_screen = RU_PADTEST;
+                } else if (g_settings_sel == 4) {
+                    /* 4: переподнять флешку и вернуть источник FAT на неё. */
+                    uart_print("usb: reinit requested\r\n");
+                    if (usb_hc_reinit_flash() == 0 &&
+                        usb_msd_active()) {
+                        fat_set_block_source(usb_msd_block_read, usb_msd_block_write);
+                        fat_set_reinit_hook(usb_hc_reinit_flash);
+                        uart_print("usb: flash fat source restored\r\n");
+                    }
                 }
+                /* 5 (Volume): A бездействует — меняется влево/вправо. */
                 dirty = 1;
             } else if (p & BTN_B) {
                 g_screen = RU_SYSTEMS;

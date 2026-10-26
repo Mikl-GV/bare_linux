@@ -100,9 +100,9 @@ int usb_msd_init(struct usb_msd_dev *dev, const uint8_t *cfg, uint32_t cfg_len)
 
 /* Выполнить CBW и прочитать CSW. data==0/data_len==0 — передача без данных.
  * Возвращает 0 при успехе. */
-static int usb_msd_cmd(struct usb_msd_dev *dev, const uint8_t *cdb, uint8_t cb_len,
-                       uint32_t dir_in, uint32_t xlen,
-                       uint8_t *data, uint32_t data_len)
+static int usb_msd_cmd_once(struct usb_msd_dev *dev, const uint8_t *cdb, uint8_t cb_len,
+                            uint32_t dir_in, uint32_t xlen,
+                            uint8_t *data, uint32_t data_len)
 {
     if (!dev) return -1;
     g_cbw.signature         = USB_MSD_CBW_SIG;
@@ -166,6 +166,21 @@ static int usb_msd_cmd(struct usb_msd_dev *dev, const uint8_t *cdb, uint8_t cb_l
         return -5;
     }
     return 0;
+}
+
+/* Обёртка: при обрыве фазы (данные/CSW) один раз восстанавливаем BOT-канал и
+ * повторяем команду — короткий приём блока оставляет остаток в трубе, и без
+ * сброса следующий CBW висит до таймаута. */
+static int usb_msd_cmd(struct usb_msd_dev *dev, const uint8_t *cdb, uint8_t cb_len,
+                       uint32_t dir_in, uint32_t xlen,
+                       uint8_t *data, uint32_t data_len)
+{
+    int rc = usb_msd_cmd_once(dev, cdb, cb_len, dir_in, xlen, data, data_len);
+    if (rc == -3 || rc == -4) {
+        usb_msd_bot_recover();
+        rc = usb_msd_cmd_once(dev, cdb, cb_len, dir_in, xlen, data, data_len);
+    }
+    return rc;
 }
 
 /* READ(10): count блоков по dev->block_size c lba в data (блоки по 512:
@@ -265,10 +280,31 @@ int usb_msd_block_read(uint32_t lba, void *buf)
     if (ratio == 0) ratio = 1;
     uint32_t dlba = lba / ratio;
     uint32_t off  = (lba % ratio) * 512;
-    if (usb_msd_read10(&g_dev_s, dlba, 1, g_bounce) != 0) return -1;
-    uint8_t *d = (uint8_t *)buf;
-    for (uint32_t i = 0; i < 512; i++) d[i] = g_bounce[off + i];
-    return 0;
+    /* 1) Лёгкая стадия: разовый short IN (got<512) добиваем повтором с
+       BOT-recovery (control на УСТРОЙСТВО, toggle) — для разовой накладки. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int rc = usb_msd_read10(&g_dev_s, dlba, 1, g_bounce);
+        if (rc == 0) {
+            uint8_t *d = (uint8_t *)buf;
+            for (uint32_t i = 0; i < 512; i++) d[i] = g_bounce[off + i];
+            return 0;
+        }
+        usb_msd_bot_recover();
+        udelay(50000);
+    }
+    /* 2) Жёсткая стадия: лёгкий recovery не помог — сбился ВЕСЬ OHCI
+       (индикатор флешки не мигает = HC не подаёт токены, устройство
+       отвалилось; мягкий recovery его не оживляет). Полный переenum порта:
+       HCR + port reset + enum флешки заново. После него одна попытка. */
+    if (usb_hc_reinit_flash() == 0) {
+        int rc = usb_msd_read10(&g_dev_s, dlba, 1, g_bounce);
+        if (rc == 0) {
+            uint8_t *d = (uint8_t *)buf;
+            for (uint32_t i = 0; i < 512; i++) d[i] = g_bounce[off + i];
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int usb_msd_block_write(uint32_t lba, const void *buf)

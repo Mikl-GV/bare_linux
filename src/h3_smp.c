@@ -99,6 +99,14 @@ static int h3_secondary_start(int cpu, void (*entry)(void))
 /* Общий цикл вторичного ядра. */
 static void cpuN_loop(void)
 {
+    /* Первой инструкцией — «живой» magic в SRAM-почту: core0 ждёт его при
+       старте и иначе печатает «not alive» (ядро при этом уже работает). */
+    /* Первой инструкцией — «живой» magic в SRAM-почту: core0 ждёт его при
+       старте и иначе печатает «not alive» (ядро при этом уже работает).
+       Через asm, чтобы GCC не ругался -Warray-bounds на доступ к 0x20. */
+    __asm volatile("str %0, [%1]" :: "r"(H3_CPU_MAGIC), "r"(H3_CPU_MAIL_ADDR) : "memory");
+    __asm volatile("dsb" ::: "memory");
+
     for (;;) {
         __asm volatile("wfi" ::: "memory");
     }

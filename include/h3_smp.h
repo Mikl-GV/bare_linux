@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+/* SRAM-почта связи core0<->secondary: адрес и «живой» magic, который ЯДРО
+ * ДОЛЖНО записать своей первой инструкцией (иначе core0 ждёт его 20 с и
+ * печатает «not alive», хотя ядро уже работает). */
+#define H3_CPU_MAIL_ADDR  0x00000020u
+#define H3_CPU_MAGIC      0x13579BDFu
+
 /* Запуск вторичных ядер Cortex-A7 (CPU1..CPU3) Allwinner H3.
  *
  * Способ (проверен на H3 bare-metal, см. pico-retro h3_smp.c):

@@ -88,6 +88,10 @@ int usb_msd_read_capacity(struct usb_msd_dev *dev,
  * хранится внутри; вызывающий может передать стековый dev). Вызывается
  * после полного enumeration + SET_CONFIGURATION. */
 int usb_msd_activate(struct usb_msd_dev *dev);
+
+/* BOT Reset Recovery: сбросить состояние и toggle bulk-труб после Stall или
+ * десинка (короткий приём блока оставил в трубке остаток данных). */
+void usb_msd_bot_recover(void);
 int usb_msd_active(void);
 
 /* Блочные обёртки для FAT (fat_set_block_source): читать/писать сектор с

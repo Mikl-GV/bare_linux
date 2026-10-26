@@ -40,6 +40,9 @@ struct mailbox {
     volatile uint32_t flag_cpu1;   /* 0/1: CPU1 ответил/ждёт */
     volatile uint32_t wridx;       /* писать сюда (CPU0) */
     volatile uint32_t rdidx;       /* читать отсюда (CPU1) */
+    volatile uint32_t audio_done;  /* счётчик: CPU1 скопировал аудиобуфер
+                                      из MB_MSG_AUDIO_DATA (рукопожатие: CPU0 ждёт
+                                      его перед следующей перезаписью буфера) */
     struct {
         volatile uint32_t cmd;
         volatile uint32_t param;

@@ -49,6 +49,12 @@ int usb_ohci_bulk_out(uint32_t base, uint8_t addr, uint8_t ep,
 int usb_ohci_bulk_in(uint32_t base, uint8_t addr, uint8_t ep,
                      uint8_t *data, uint32_t len, uint16_t mps);
 
+/* Аппаратный сброс контроллера (HcCommandStatus.HCR) + возврат в Operational
+ * с переустановкой CLE/BLE и кадровой базы. Снимает «заевшие» current-ED
+ * (ctrlcur/bulkcur застревали на чужом адресе и списки не опустошались);
+ * root port при этом не сбрасывается — устройство остаётся подключено. */
+void usb_ohci_hc_reset(uint32_t base);
+
 /* Сбросить программные toggle bulk-эндпоинтов порта (после BOT Reset). */
 void usb_ohci_bulk_toggle_reset(uint32_t base);
 

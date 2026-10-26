@@ -3,6 +3,7 @@
 
 #include "h3.h"
 #include "h3_ccu.h"
+#include "h3_display.h"
 #include "display_timing.h"
 #include "dw_hdmi.h"
 #include "uart.h"
@@ -214,12 +215,10 @@ static void hdmi_pll_set(uint32_t clk_khz)
         }
     }
 
-    clock_set_pll_video_factors(best_m, best_n);
+    /* Не нашлось (m,n) для этой частоты — не трогаем PLL (иначе запишется
+       N=0/M=0 и такт уйдёт в некорректный диапазон). */
+    if (best_m && best_n) clock_set_pll_video_factors(best_m, best_n);
 }
-
-void h3_lcdc_init(void);
-void h3_lcdc_tcon1_mode_set(const struct display_timing *mode);
-void h3_lcdc_enable(void);
 
 static void hdmi_lcdc_init(const struct display_timing *edid)
 {
